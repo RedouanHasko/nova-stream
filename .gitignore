@@ -1,0 +1,97 @@
+# Common
+node_modules/
+dist/
+build/
+.env
+.env.*
+*.local
+*.log
+.DS_Store
+*.sqlite
+*.db
+*.db-journal
+*.sqlite3
+*.sqlite-journal
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Backend
+backend/logs/
+backend/uploads/
+backend/db/*.sqlite
+backend/db/*.db
+backend/db/*.db-journal
+backend/db/*.sqlite3
+backend/db/*.sqlite-journal
+backend/prisma/
+backend/.whatsapp-auth/
+backend/.whatsapp-rate-log.json
+backend/whatsapp-session*
+backend/whatsapp-qr*
+backend/whatsapp-temp/
+
+# Player
+player/.nova-api-cache.json
+
+# Ignore OS junk
+Thumbs.db
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore test outputs
+coverage/
+
+# Ignore temp
+TEMP_DASH/
+
+# Ignore database dumps
+*.sql
+*.dump
+
+# Ignore proxy/test files
+player/test-proxy.js
+
+# Ignore frontend build
+frontend/dist/
+frontend-landing/dist/
+frontend-panel/dist/
+
+# Ignore sensitive files
+cookiejar.txt
+
+# Ignore Prisma output
+backend/prisma_out.txt
+
+# Ignore payment setup
+backend/PAYMENT_GATEWAY_SETUP.md
+
+# Ignore all test-proxy files
+player/app/applet/test-proxy*
+player/app/applet/src/test-proxy*
+
+# Ignore all .env files in all folders
+**/.env*
+
+# Ignore all .cache, .tmp, .bak, .pid, .sock, .coverage, .tgz
+**/*.cache
+**/*.tmp
+**/*.bak
+**/*.pid
+**/*.sock
+**/.coverage
+**/*.tgz
+
+# Ignore all metadata.json files
+**/metadata.json
+
+# Ignore all package-lock.json files
+**/package-lock.json
+
+# Ignore all .DS_Store and Thumbs.db
+**/.DS_Store
+**/Thumbs.db
