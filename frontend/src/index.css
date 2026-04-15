@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: var(--background);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --breakpoint-xs: 480px;
+}
+
+:root {
+  --background: #f9fafb;
+  --card: #ffffff;
+  --foreground: #111827;
+  --muted-foreground: #6b7280;
+  --border: #e5e7eb;
+  --input: #f3f4f6;
+  --ring: rgba(0, 0, 0, 0.1);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #0a0a0a;
+  --card: #141414;
+  --foreground: #ffffff;
+  --muted-foreground: #9ca3af;
+  --border: #1f2937;
+  --input: rgba(255, 255, 255, 0.05);
+  --ring: rgba(255, 255, 255, 0.2);
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground transition-colors duration-300;
+  }
+
+  input[type="number"] {
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
+
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    margin: 0;
+    -webkit-appearance: none;
+  }
+
+  /* Fix for select options contrast in dark mode */
+  select option {
+    @apply bg-card text-foreground;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+.grecaptcha-badge {
+  visibility: hidden;
+}

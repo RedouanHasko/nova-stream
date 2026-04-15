@@ -1,0 +1,73 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Sora", ui-sans-serif, system-ui, sans-serif;
+  --color-brand: #e11d48;
+  --color-brand-soft: #fb7185;
+  --animate-scan: scan 2s linear infinite;
+
+  @keyframes scan {
+    from {
+      transform: translateY(-100%);
+    }
+    to {
+      transform: translateY(200%);
+    }
+  }
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    background: #050506;
+  }
+
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(
+        1200px 600px at 10% -10%,
+        rgba(225, 29, 72, 0.14),
+        transparent 50%
+      ),
+      radial-gradient(
+        800px 500px at 100% 20%,
+        rgba(59, 130, 246, 0.08),
+        transparent 55%
+      ),
+      linear-gradient(180deg, #08080b 0%, #050506 55%, #07070a 100%);
+    color: #f3f4f6;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+
+  ::selection {
+    background: rgba(225, 29, 72, 0.32);
+    color: #ffe4e6;
+  }
+}
+
+@layer utilities {
+  .glass-surface {
+    background: linear-gradient(
+      140deg,
+      rgba(255, 255, 255, 0.1),
+      rgba(255, 255, 255, 0.03)
+    );
+    backdrop-filter: blur(14px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .section-grid {
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+}

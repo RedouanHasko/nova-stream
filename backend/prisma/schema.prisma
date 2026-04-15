@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String?
+  phone     String?
+  password  String
+  role      String   @default("subreseller")
+  resellerId Int?
+  reseller   Reseller? @relation("ResellerUsers", fields: [resellerId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  transactionsSent CreditTransaction[] @relation("sentByUser")
+  notificationSetting NotificationSetting?
+  notifications Notification[]
+  phoneVerificationCodes PhoneVerificationCode[]
+
+  @@index([resellerId])
+  @@index([role])
+}
+
+
+model Reseller {
+  id        Int       @id @default(autoincrement())
+  code      String    @unique
+  name      String
+  email     String    @unique
+  phone     String?
+  parentId  Int?
+  parent    Reseller? @relation("SubResellers", fields: [parentId], references: [id])
+  subs      Reseller[] @relation("SubResellers")
+  users     User[]    @relation("ResellerUsers")
+  credits   Float     @default(0)
+  status    String @default("ACTIVE")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  fromTransactions CreditTransaction[] @relation("fromReseller")
+  toTransactions   CreditTransaction[] @relation("toReseller")
+  devices   Device[]
+  playlists Playlist[]
+
+  @@index([parentId])
+  @@index([status])
+}
+
+
+model CreditTransaction {
+  id             Int                @id @default(autoincrement())
+  type           String
+  status         String
+  amount         Float
+  fromResellerId Int?
+  fromReseller   Reseller?          @relation("fromReseller", fields: [fromResellerId], references: [id])
+  toResellerId   Int?
+  toReseller     Reseller?          @relation("toReseller", fields: [toResellerId], references: [id])
+  fromBeforeBalance Float?
+  fromAfterBalance  Float?
+  toBeforeBalance   Float?
+  toAfterBalance    Float?
+  performedById  Int?
+  performedBy    User?              @relation("sentByUser", fields: [performedById], references: [id])
+  notes          String?
+  createdAt      DateTime           @default(now())
+  processedAt    DateTime?
+
+  @@index([fromResellerId])
+  @@index([toResellerId])
+  @@index([performedById])
+  @@index([type, status])
+  @@index([createdAt])
+}
+
+
+model Device {
+  id              Int             @id @default(autoincrement())
+  mac             String          @unique
+  deviceKey       String?         @unique
+  ownerResellerId Int?
+  owner           Reseller?       @relation(fields: [ownerResellerId], references: [id])
+  domainUrl       String?
+  status          String    @default("ACTIVE")
+  activatedApps   ActivatedApp[]
+  playlists       DevicePlaylist[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([ownerResellerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+
+model ActivatedApp {
+  id            Int         @id @default(autoincrement())
+  device        Device      @relation(fields: [deviceId], references: [id])
+  deviceId      Int
+  applicationId Int
+  application   Application @relation(fields: [applicationId], references: [id])
+  appName       String // Cached name
+  duration      String?     @default("1_year")
+  expiresAt     DateTime?
+  status        String      @default("ACTIVE")
+  activatedAt   DateTime    @default(now())
+
+  @@index([deviceId])
+  @@index([applicationId])
+  @@index([status, activatedAt])
+}
+
+model Application {
+  id          Int            @id @default(autoincrement())
+  name        String         @unique
+  logoUrl     String?
+  description String?
+  downloadUrl String?
+  status      String         @default("ACTIVE")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  activations ActivatedApp[]
+}
+
+model Playlist {
+  id              Int             @id @default(autoincrement())
+  ownerResellerId Int?
+  owner           Reseller?       @relation(fields: [ownerResellerId], references: [id])
+  name            String
+  url             String?
+  content         String?
+  type            String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  devicePlaylists DevicePlaylist[]
+
+  @@index([ownerResellerId])
+}
+
+
+model DevicePlaylist {
+  id        Int      @id @default(autoincrement())
+  device    Device   @relation(fields: [deviceId], references: [id])
+  deviceId  Int
+  playlist  Playlist @relation(fields: [playlistId], references: [id])
+  playlistId Int
+  addedAt   DateTime @default(now())
+
+  @@index([deviceId])
+  @@index([playlistId])
+}
+
+model PricingPlan {
+  id        Int      @id @default(autoincrement())
+  name      String
+  price     Float
+  credits   Int      @default(0)
+  currency  String   @default("USD")
+  features  String?
+  planType  String   @default("CREDIT_RECHARGE")
+  duration  String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ApiIntegration {
+  id        Int      @id @default(autoincrement())
+  name      String
+  provider  String
+  apiKey    String?
+  webhookUrl String?
+  config    Json?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SystemSetting {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model NotificationSetting {
+  id           Int      @id @default(autoincrement())
+  userId       Int?
+  user         User?    @relation(fields: [userId], references: [id])
+  emailEnabled Boolean  @default(true)
+  smsEnabled   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model Notification {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  type      String   @default("INFO")
+  title     String
+  message   String
+  link      String?
+  read      Boolean  @default(false)
+  data      Json?
+  createdAt DateTime @default(now())
+  readAt    DateTime?
+
+  @@index([userId, read])
+  @@index([userId, createdAt])
+}
+
+model PhoneVerificationCode {
+  id         Int      @id @default(autoincrement())
+  userId     Int?
+  user       User?    @relation(fields: [userId], references: [id])
+  purpose    String
+  email      String?
+  phone      String
+  codeHash   String
+  attempts   Int      @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, purpose, createdAt])
+  @@index([email, phone, purpose])
+  @@index([phone, purpose, consumedAt])
+}
+
+model ParentChangeRequest {
+  id          Int      @id @default(autoincrement())
+  resellerId  Int
+  reseller    Reseller @relation(fields: [resellerId], references: [id])
+  newParentId Int
+  newParent   Reseller @relation("NewParent", fields: [newParentId], references: [id])
+  status      String @default("PENDING")
+  reason      String?
+  createdAt   DateTime @default(now())
+  processedAt DateTime?
+
+  @@index([resellerId])
+  @@index([newParentId])
+  @@index([status])
+}
+
+

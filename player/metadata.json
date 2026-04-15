@@ -1,0 +1,5 @@
+{
+  "name": "Remix: NOVA PLAYER",
+  "description": "A high-performance IPTV player with a polished TV-optimized interface, featuring Live TV, Movies, and Series categories.",
+  "requestFramePermissions": ["geolocation"]
+}
