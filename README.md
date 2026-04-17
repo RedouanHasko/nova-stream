@@ -3,13 +3,14 @@
 This repository contains several sub-projects (backend, frontend, player, and landing/panel frontends). This document explains how to run each folder locally for development and how to build for production.
 
 Prerequisites
+
 - Node.js (recommended >= 18)
 - npm (or yarn/pnpm)
 - Git
 
 Tips
-- Many folders include a `.env.example`. Copy it to `.env` and fill the values before running:
 
+- Many folders include a `.env.example`. Copy it to `.env` and fill the values before running:
   - Unix/macOS: `cp .env.example .env`
   - PowerShell: `Copy-Item .env.example .env`
 
@@ -47,6 +48,7 @@ npm start
 ```
 
 Notes:
+
 - The backend listens on `PORT` (default 5000). Set `PORT` in `.env` if you need a different value.
 - By default development uses a local SQLite DB (configure `DATABASE_URL` in `.env` to change).
 - The embedded WhatsApp gateway is controlled by `WHATSAPP_GATEWAY_AUTOSTART` (set to `false` to disable auto-start).
@@ -71,6 +73,7 @@ npm run preview
 ```
 
 There are also separate frontends:
+
 - `frontend-panel` (admin panel): `cd frontend-panel && npm install && npm run dev`
 - `frontend-landing` (marketing landing): `cd frontend-landing && npm install && npm run dev`
 
@@ -110,6 +113,7 @@ npm run dev:all
 ---
 
 ## Security & housekeeping
+
 - Do not commit `.env` files or local DB files (e.g., `dev.db`). These are ignored by `.gitignore`.
 - If you accidentally commit secrets, remove them from the history (use `git rm --cached <file>` then commit and push, and rotate secrets).
 

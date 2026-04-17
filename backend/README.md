@@ -3,6 +3,7 @@
 This document covers local development steps for the backend service located at `backend`.
 
 Prerequisites
+
 - Node.js (>= 18 recommended)
 - npm
 - (Optional) Prisma CLI (`npx prisma` is used via npm scripts)
@@ -37,17 +38,21 @@ npm start
 ```
 
 Configuration notes
+
 - Default port: `5000`. Override with `PORT` in your `.env` file.
 - Database: The project uses Prisma. In development the default may be a local SQLite DB — set `DATABASE_URL` in `.env` for other databases.
 - WhatsApp gateway: The embedded WhatsApp gateway will auto-start unless `WHATSAPP_GATEWAY_AUTOSTART=false` is set in `.env`.
 
 Uploads and static files
+
 - The `backend/uploads` folder is used to serve static files via `/uploads`.
 
 Security
+
 - Never commit your `.env` or local DB files. These are ignored by `.gitignore`.
 
 Troubleshooting
+
 - If you see `dev.db` or `.env` tracked by git, remove locally and untrack:
 
 ```bash
