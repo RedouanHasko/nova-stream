@@ -1,0 +1,26 @@
+{
+  "url": "<URL-ENCODED-REDIRECT-LOCATION>",
+  "ts": "2026-04-16T21:21:38.753Z",
+  "results": [
+    {
+      "profile": "browser",
+      "error": "Invalid URL",
+      "tookMs": 0
+    },
+    {
+      "profile": "vlc",
+      "error": "Invalid URL",
+      "tookMs": 0
+    },
+    {
+      "profile": "ffmpeg",
+      "error": "Invalid URL",
+      "tookMs": 0
+    },
+    {
+      "profile": "mobile",
+      "error": "Invalid URL",
+      "tookMs": 0
+    }
+  ]
+}

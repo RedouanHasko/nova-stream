@@ -262,7 +262,7 @@ const MiniPlayer = ({
       lastBaseUrlRef.current = baseUrl;
     }
 
-    const proxiedUrl = `${window.location.origin}/api/proxy?url=${encodeURIComponent(url)}`;
+    let proxiedUrl = `${window.location.origin}/api/proxy?url=${encodeURIComponent(url)}`;
 
     const isM3U8 = url.includes(".m3u8") || !url.includes(".ts");
     const isTS =
@@ -363,6 +363,145 @@ const MiniPlayer = ({
       }
     };
 
+    const probePlaylist = async () => {
+      if (!isM3U8) return true;
+      try {
+        const controller = new AbortController();
+        const to = setTimeout(() => controller.abort(), 7000);
+        const resp = await fetch(proxiedUrl, {
+          method: "GET",
+          signal: controller.signal,
+          headers: {
+            Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+          },
+        });
+        clearTimeout(to);
+        if (!resp.ok) {
+          // proceed to try forced/alternate probes below
+        } else {
+          // read only the first chunk to detect playlist signature
+          const reader = resp.body?.getReader();
+          if (reader) {
+            const { value, done } = await reader.read();
+            if (!done && value) {
+              const sig = new TextDecoder().decode(
+                value.slice(0, Math.min(1024, value.length)),
+              );
+              if (
+                sig.startsWith("#EXTM3U") ||
+                /#EXTINF|#EXT-X-STREAM-INF/.test(sig)
+              ) {
+                return true;
+              }
+            }
+            const ct = resp.headers.get("content-type") || "";
+            if (/mpegurl|vnd.apple|application\/x-mpegURL|text\//i.test(ct))
+              return true;
+          } else {
+            const txt = await resp.text();
+            if (
+              txt &&
+              (txt.startsWith("#EXTM3U") ||
+                /#EXTINF|#EXT-X-STREAM-INF/.test(txt))
+            )
+              return true;
+          }
+        }
+
+        // Try forced manifest bypass (server-side ?force=1 to skip type-checks)
+        try {
+          const controller2 = new AbortController();
+          const to2 = setTimeout(() => controller2.abort(), 7000);
+          const forceUrl = `${proxiedUrl}&force=1`;
+          const r2 = await fetch(forceUrl, {
+            method: "GET",
+            signal: controller2.signal,
+            headers: {
+              Accept:
+                "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+            },
+          });
+          clearTimeout(to2);
+          if (r2.ok) {
+            const reader2 = r2.body?.getReader();
+            if (reader2) {
+              const { value: v2, done: d2 } = await reader2.read();
+              if (!d2 && v2) {
+                const sig2 = new TextDecoder().decode(
+                  v2.slice(0, Math.min(1024, v2.length)),
+                );
+                if (
+                  sig2.startsWith("#EXTM3U") ||
+                  /#EXTINF|#EXT-X-STREAM-INF/.test(sig2)
+                ) {
+                  proxiedUrl = forceUrl;
+                  return true;
+                }
+              }
+            }
+            const txt2 = await r2.text();
+            if (
+              txt2 &&
+              (txt2.startsWith("#EXTM3U") ||
+                /#EXTINF|#EXT-X-STREAM-INF/.test(txt2))
+            ) {
+              proxiedUrl = forceUrl;
+              return true;
+            }
+          }
+        } catch (ee) {
+          /* ignore forced probe errors */
+        }
+
+        // Try TS fallback (replace .m3u8 with .ts) and set proxiedUrl so tryMpegts will use it
+        try {
+          const tsUrl = url.replace(/\.m3u8(\?.*)?$/i, ".ts");
+          if (tsUrl && tsUrl !== url) {
+            const proxiedTs = `${window.location.origin}/api/proxy?url=${encodeURIComponent(tsUrl)}&force=1`;
+            const r3 = await fetch(proxiedTs, {
+              method: "GET",
+              headers: { Range: "bytes=0-8191" },
+            });
+            if (r3.ok) {
+              const ct3 = r3.headers.get("content-type") || "";
+              const len3 =
+                parseInt(r3.headers.get("content-length") || "0", 10) || 0;
+              if (/video|mpeg|ts|octet-stream/i.test(ct3) || len3 > 0) {
+                proxiedUrl = proxiedTs;
+                return false; // tell caller to skip HLS and fallback to TS
+              }
+            }
+          }
+        } catch (ee) {
+          /* ignore ts probe errors */
+        }
+
+        // Final: request server-side diagnostic probe to gather headers/snapshot
+        try {
+          fetch(
+            `${window.location.origin}/api/proxy-test?url=${encodeURIComponent(
+              url,
+            )}`,
+          )
+            .then((r) => r.json())
+            .then((d) => {
+              console.log("proxy-test:", d);
+              toast.error(
+                "Stream appears blocked; diagnostics logged to console",
+              );
+            })
+            .catch(() => {});
+        } catch (ee) {
+          /* noop */
+        }
+
+        return false;
+      } catch (e) {
+        console.log("playlist probe error:", e?.message || e);
+        return false;
+      }
+    };
+
     if (isM3U8) {
       if (Hls.isSupported()) {
         if (hlsRef.current) hlsRef.current.destroy();
@@ -405,8 +544,19 @@ const MiniPlayer = ({
         });
 
         hlsRef.current = hls;
-        hls.loadSource(proxiedUrl);
-        hls.attachMedia(video);
+        (async () => {
+          const ok = await probePlaylist();
+          if (!ok) {
+            console.warn(
+              "Playlist probe failed, falling back to MPEG-TS/native for:",
+              url,
+            );
+            tryMpegts();
+            return;
+          }
+          hls.loadSource(proxiedUrl);
+          hls.attachMedia(video);
+        })();
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           setIsLoading(false);
@@ -623,6 +773,8 @@ const MiniPlayer = ({
         style={{ transform: "translateZ(0)", willChange: "transform" }}
         poster={poster || undefined}
         playsInline
+        crossOrigin="anonymous"
+        preload="metadata"
         onPlay={() => {
           setIsPlaying(true);
           setIsBuffering(false);
@@ -1457,6 +1609,9 @@ export default function LiveTV() {
     return filtered;
   }, [streams, searchQuery, activeCategory, favorites.live, settings.liveSort]);
 
+  // Defer rendering of the channel list for UI responsiveness
+  const deferredChannels = useDeferredValue(filteredChannels);
+
   // When categories load and we're still on "all", switch to first real category
   useEffect(() => {
     if (activeCategory === "all" && categories.length > 0) {
@@ -1527,8 +1682,6 @@ export default function LiveTV() {
       window.removeEventListener("tv-remote-key", onTVKey);
     };
   }, [filteredChannels.length, deferredChannels, focusIndex, favorites.live]);
-
-  const deferredChannels = useDeferredValue(filteredChannels);
 
   const buildLiveChannelUrl = useCallback(
     (channel: LiveStream | null) => {

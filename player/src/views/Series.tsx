@@ -43,6 +43,7 @@ export default function Series() {
     isConnected,
     playlistData,
     isFetchingSeries,
+    fetchSeries,
     favorites,
     toggleFavorite,
     settings,
@@ -54,6 +55,10 @@ export default function Series() {
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(50);
+  const [localSeriesStreams, setLocalSeriesStreams] = useState<
+    SeriesStream[] | null
+  >(null);
+  const [isFetchingCategory, setIsFetchingCategory] = useState(false);
   const [selectedSeries, setSelectedSeries] = useState<SeriesStream | null>(
     null,
   );
@@ -99,6 +104,65 @@ export default function Series() {
     return `${s}s`;
   };
   const observerTarget = useRef<HTMLDivElement>(null);
+
+  // If prefetch didn't load Series streams, fetch per-category on demand.
+  useEffect(() => {
+    if (!activePlaylist) return;
+    if (activePlaylist.type !== "xtream") return;
+
+    if ((playlistData.seriesStreams || []).length > 0) {
+      setLocalSeriesStreams(null);
+      return;
+    }
+
+    if (isFetchingSeries) return;
+
+    let cancelled = false;
+
+    const fetchCategory = async (catId: string) => {
+      try {
+        setIsFetchingCategory(true);
+        const streams = await IPTVService.getSeries(
+          activePlaylist.host!,
+          activePlaylist.username!,
+          activePlaylist.password!,
+          catId,
+        );
+        if (!cancelled) setLocalSeriesStreams(streams || []);
+      } catch (err) {
+        console.error("fetchSeries category failed:", err);
+        if (!cancelled) setLocalSeriesStreams([]);
+        toast.error("Failed to load series");
+      } finally {
+        if (!cancelled) setIsFetchingCategory(false);
+      }
+    };
+
+    if (
+      activeCategory &&
+      activeCategory !== "all" &&
+      activeCategory !== "fav"
+    ) {
+      fetchCategory(activeCategory);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const cats = playlistData.seriesCategories || [];
+    if (cats.length > 0) {
+      fetchCategory(cats[0].category_id);
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [
+    activePlaylist?.id,
+    activeCategory,
+    playlistData.seriesCategories?.length,
+    playlistData.seriesStreams?.length,
+    isFetchingSeries,
+  ]);
 
   const deferredSearch = useDeferredValue(searchQuery);
   const deferredCategory = useDeferredValue(activeCategory);
@@ -475,6 +539,15 @@ export default function Series() {
             </div>
           ) : (
             <>
+              {activePlaylist && activePlaylist.type !== "xtream" && (
+                <div className="mb-6 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
+                  <strong>Note:</strong> Series require an Xtream-type playlist
+                  to use the provider Series API. Your current playlist is set
+                  to{" "}
+                  <span className="ml-1 font-bold">{activePlaylist.type}</span>.
+                </div>
+              )}
+
               <div className="flex items-center justify-between mb-8">
                 <div className="relative">
                   <button

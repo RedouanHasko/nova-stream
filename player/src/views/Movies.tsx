@@ -43,6 +43,7 @@ export default function Movies() {
     isConnected,
     playlistData,
     isFetchingVod,
+    fetchVod,
     favorites,
     toggleFavorite,
     settings,
@@ -54,6 +55,10 @@ export default function Movies() {
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(50);
+  const [localVodStreams, setLocalVodStreams] = useState<MovieStream[] | null>(
+    null,
+  );
+  const [isFetchingCategory, setIsFetchingCategory] = useState(false);
   const [selectedMovie, setSelectedMovie] = useState<MovieStream | null>(null);
   const [movieInfo, setMovieInfo] = useState<any>(null);
   const [isLoadingInfo, setIsLoadingInfo] = useState(false);
@@ -67,6 +72,68 @@ export default function Movies() {
     string | null
   >(null);
   const observerTarget = useRef<HTMLDivElement>(null);
+
+  // If prefetch didn't load VOD streams, fetch per-category on demand.
+  useEffect(() => {
+    if (!activePlaylist) return;
+    if (activePlaylist.type !== "xtream") return;
+
+    // Prefetch already filled the full vodStreams — use them.
+    if ((playlistData.vodStreams || []).length > 0) {
+      setLocalVodStreams(null);
+      return;
+    }
+
+    if (isFetchingVod) return;
+
+    let cancelled = false;
+
+    const fetchCategory = async (catId: string) => {
+      try {
+        setIsFetchingCategory(true);
+        const streams = await IPTVService.getVodStreams(
+          activePlaylist.host!,
+          activePlaylist.username!,
+          activePlaylist.password!,
+          catId,
+        );
+        if (!cancelled) setLocalVodStreams(streams || []);
+      } catch (err) {
+        console.error("fetchVod category failed:", err);
+        if (!cancelled) setLocalVodStreams([]);
+        toast.error("Failed to load movies");
+      } finally {
+        if (!cancelled) setIsFetchingCategory(false);
+      }
+    };
+
+    // If user selected a specific category, fetch that category only.
+    if (
+      activeCategory &&
+      activeCategory !== "all" &&
+      activeCategory !== "fav"
+    ) {
+      fetchCategory(activeCategory);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // If 'all' is selected, try fetching the first category to show some items
+    const cats = playlistData.vodCategories || [];
+    if (cats.length > 0) {
+      fetchCategory(cats[0].category_id);
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [
+    activePlaylist?.id,
+    activeCategory,
+    playlistData.vodCategories?.length,
+    playlistData.vodStreams?.length,
+    isFetchingVod,
+  ]);
 
   // Deferred values so filtering never blocks the UI
   const deferredSearch = useDeferredValue(searchQuery);
@@ -89,13 +156,17 @@ export default function Movies() {
   ]);
 
   const movies = useMemo(() => {
-    const allMovies = playlistData.vodStreams || [];
+    const allMovies =
+      playlistData.vodStreams && playlistData.vodStreams.length > 0
+        ? playlistData.vodStreams
+        : localVodStreams || [];
     if (isParentalUnlocked) return allMovies;
     return allMovies.filter(
       (m) => !settings.hiddenCategories.vod.includes(m.category_id),
     );
   }, [
     playlistData.vodStreams,
+    localVodStreams,
     settings.hiddenCategories.vod,
     isParentalUnlocked,
   ]);
@@ -425,6 +496,14 @@ export default function Movies() {
             </div>
           ) : (
             <>
+              {activePlaylist && activePlaylist.type !== "xtream" && (
+                <div className="mb-6 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
+                  <strong>Note:</strong> Movies require an Xtream-type playlist
+                  to use the provider VOD API. Your current playlist is set to
+                  <span className="ml-1 font-bold">{activePlaylist.type}</span>.
+                </div>
+              )}
+
               <div className="flex items-center justify-between mb-8">
                 <div className="relative">
                   <button
@@ -480,7 +559,7 @@ export default function Movies() {
                   </AnimatePresence>
                 </div>
                 <div className="flex items-center gap-3">
-                  {isFetchingVod && (
+                  {(isFetchingVod || isFetchingCategory) && (
                     <Loader2 className="w-4 h-4 animate-spin text-primary" />
                   )}
                   <span className="text-white/40 font-medium">

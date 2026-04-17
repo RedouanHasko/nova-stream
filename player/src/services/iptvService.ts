@@ -340,6 +340,55 @@ export class IPTVService {
       .toLowerCase();
   }
 
+  /**
+   * Normalize server responses that may be arrays or objects keyed by id.
+   * Returns an array of items in a predictable format.
+   */
+  private static normalizeListResponse(data: any): any[] {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+
+    // Some providers wrap results in properties like { streams: [...] }
+    const candidateKeys = [
+      "data",
+      "result",
+      "streams",
+      "channels",
+      "movies",
+      "series",
+      "items",
+    ];
+    for (const k of candidateKeys) {
+      if (Array.isArray(data[k])) return data[k];
+    }
+
+    // Some providers return an object keyed by id: { "123": { ... }, "124": { ... } }
+    if (typeof data === "object") {
+      try {
+        const vals = Object.values(data).filter(
+          (v) => v && typeof v === "object",
+        );
+        if (vals.length > 0) return vals;
+      } catch {
+        return [];
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Return or create a per-server EPG support state entry.
+   * Used to remember whether short/simple/XMLTV EPG endpoints work for a server.
+   */
+  private static getEpgSupportState(host: string, user: string, pass: string) {
+    const key = `${host}:${user}`;
+    if (!this.epgEndpointSupport.has(key)) {
+      this.epgEndpointSupport.set(key, {});
+    }
+    return this.epgEndpointSupport.get(key)!;
+  }
+
   private static async getXmltvEpg(
     host: string,
     user: string,
@@ -520,7 +569,8 @@ export class IPTVService {
     pass: string,
   ): Promise<Category[]> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_categories`;
-    return this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    return this.normalizeListResponse(data) as Category[];
   }
 
   static async getLiveStreams(
@@ -529,7 +579,8 @@ export class IPTVService {
     pass: string,
   ): Promise<LiveStream[]> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams`;
-    return this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    return this.normalizeListResponse(data) as LiveStream[];
   }
 
   static async getVodCategories(
@@ -538,16 +589,21 @@ export class IPTVService {
     pass: string,
   ): Promise<Category[]> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_categories`;
-    return this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    return this.normalizeListResponse(data) as Category[];
   }
 
   static async getVodStreams(
     host: string,
     user: string,
     pass: string,
+    categoryId?: string | number,
   ): Promise<MovieStream[]> {
-    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_streams`;
-    return this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_streams${
+      categoryId ? `&category_id=${encodeURIComponent(String(categoryId))}` : ""
+    }`;
+    const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    return this.normalizeListResponse(data) as MovieStream[];
   }
 
   static async getSeriesCategories(
@@ -556,16 +612,21 @@ export class IPTVService {
     pass: string,
   ): Promise<Category[]> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_series_categories`;
-    return this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_CATEGORIES);
+    return this.normalizeListResponse(data) as Category[];
   }
 
   static async getSeries(
     host: string,
     user: string,
     pass: string,
+    categoryId?: string | number,
   ): Promise<SeriesStream[]> {
-    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_series`;
-    return this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_series${
+      categoryId ? `&category_id=${encodeURIComponent(String(categoryId))}` : ""
+    }`;
+    const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
+    return this.normalizeListResponse(data) as SeriesStream[];
   }
 
   static async getVodInfo(
@@ -665,42 +726,44 @@ export class IPTVService {
     const total = 6;
     let completed = 0;
 
-    const track = async <T>(
-      label: string,
-      fn: () => Promise<T>,
-    ): Promise<T> => {
-      const result = await fn();
-      completed++;
-      onProgress?.(completed, total, label);
-      return result;
+    const wrap = async <T>(label: string, fn: () => Promise<T>) => {
+      try {
+        const value = await fn();
+        completed++;
+        onProgress?.(completed, total, label);
+        return { status: "fulfilled", value } as const;
+      } catch (reason) {
+        completed++;
+        onProgress?.(completed, total, label);
+        return { status: "rejected", reason } as const;
+      }
     };
 
-    // Fire all 6 requests in parallel — the cache layer deduplicates
-    const [
-      liveCategories,
-      liveStreams,
-      vodCategories,
-      vodStreams,
-      seriesCategories,
-      seriesStreams,
-    ] = await Promise.all([
-      track("Live Categories", () => this.getLiveCategories(host, user, pass)),
-      track("Live Channels", () => this.getLiveStreams(host, user, pass)),
-      track("Movie Categories", () => this.getVodCategories(host, user, pass)),
-      track("Movies", () => this.getVodStreams(host, user, pass)),
-      track("Series Categories", () =>
+    const results = await Promise.all([
+      wrap("Live Categories", () => this.getLiveCategories(host, user, pass)),
+      wrap("Live Channels", () => this.getLiveStreams(host, user, pass)),
+      wrap("Movie Categories", () => this.getVodCategories(host, user, pass)),
+      wrap("Movies", () => this.getVodStreams(host, user, pass)),
+      wrap("Series Categories", () =>
         this.getSeriesCategories(host, user, pass),
       ),
-      track("Series", () => this.getSeries(host, user, pass)),
+      wrap("Series", () => this.getSeries(host, user, pass)),
     ]);
 
+    const getVal = <T>(
+      r: { status: string; value?: T } | { status: string; reason?: any },
+    ) =>
+      (r as any).status === "fulfilled"
+        ? (r as any).value
+        : ([] as unknown as T);
+
     return {
-      liveCategories,
-      liveStreams,
-      vodCategories,
-      vodStreams,
-      seriesCategories,
-      seriesStreams,
+      liveCategories: getVal<Category[]>(results[0]),
+      liveStreams: getVal<LiveStream[]>(results[1]),
+      vodCategories: getVal<Category[]>(results[2]),
+      vodStreams: getVal<MovieStream[]>(results[3]),
+      seriesCategories: getVal<Category[]>(results[4]),
+      seriesStreams: getVal<SeriesStream[]>(results[5]),
     };
   }
 

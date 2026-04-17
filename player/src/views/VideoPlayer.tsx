@@ -102,13 +102,63 @@ export default function VideoPlayer() {
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [isPipAvailable, setIsPipAvailable] = useState(false);
   const [activeMenu, setActiveMenu] = useState<
-    "quality" | "audio" | "subtitle" | "aspect" | "speed" | "none"
+    "quality" | "audio" | "subtitle" | "aspect" | "speed" | "settings" | "none"
   >("none");
   const [seekPreview, setSeekPreview] = useState<{
     x: number;
     time: number;
     dataUrl: string | null;
   } | null>(null);
+
+  // Populate tracks from native video element when HLS isn't providing them
+  const populateNativeTracks = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+
+    try {
+      // Text tracks (subtitles)
+      const tt = v.textTracks;
+      if (tt && tt.length > 0) {
+        const subs: { id: number; name: string }[] = [];
+        for (let i = 0; i < tt.length; i++) {
+          const t = tt[i] as any;
+          subs.push({
+            id: i,
+            name: t.label || t.language || `Subtitle ${i + 1}`,
+          });
+        }
+        setSubtitleTracks(subs);
+        const active = Array.from(tt).findIndex(
+          (t: any) => t.mode === "showing",
+        );
+        setCurrentSubtitle(active === -1 ? -1 : active);
+      }
+
+      // Audio tracks (non-standard, best-effort)
+      const at = (v as any).audioTracks as
+        | { length: number; [k: number]: any }
+        | undefined;
+      if (at && at.length > 0) {
+        const auds: { id: number; name: string }[] = [];
+        for (let i = 0; i < at.length; i++) {
+          const a = at[i];
+          auds.push({ id: i, name: a.label || a.language || `Audio ${i + 1}` });
+        }
+        setAudioTracks(auds);
+        let sel = -1;
+        for (let i = 0; i < at.length; i++) {
+          if (at[i].enabled) {
+            sel = i;
+            break;
+          }
+        }
+        if (sel === -1 && at.length > 0) sel = 0;
+        setCurrentAudioTrack(sel);
+      }
+    } catch (e) {
+      /* best-effort only */
+    }
+  }, []);
 
   const proxiedUrl = initialUrl
     ? `${window.location.origin}/api/proxy?url=${encodeURIComponent(initialUrl)}`
@@ -530,6 +580,10 @@ export default function VideoPlayer() {
     const onLoadedMetadata = () => {
       setIsLoading(false);
       if (isFinite(video.duration)) setDuration(video.duration);
+      // Populate native tracks (subtitles/audio) for non-HLS/native HLS playback
+      try {
+        populateNativeTracks();
+      } catch {}
       video.play().catch(() => {});
     };
 
@@ -811,13 +865,49 @@ export default function VideoPlayer() {
   };
 
   const changeAudioTrack = (id: number) => {
-    if (hlsRef.current) hlsRef.current.audioTrack = id;
+    if (hlsRef.current) {
+      try {
+        hlsRef.current.audioTrack = id;
+      } catch {}
+    } else if (videoRef.current && (videoRef.current as any).audioTracks) {
+      try {
+        const at = (videoRef.current as any).audioTracks;
+        for (let i = 0; i < at.length; i++) {
+          at[i].enabled = i === id;
+        }
+      } catch {}
+    } else if (
+      mpegtsRef.current &&
+      typeof mpegtsRef.current.selectAudioTrack === "function"
+    ) {
+      try {
+        mpegtsRef.current.selectAudioTrack(id);
+      } catch {}
+    }
     setCurrentAudioTrack(id);
     setActiveMenu("none");
   };
 
   const changeSubtitle = (id: number) => {
-    if (hlsRef.current) hlsRef.current.subtitleTrack = id;
+    if (hlsRef.current) {
+      try {
+        hlsRef.current.subtitleTrack = id;
+      } catch {}
+    } else if (videoRef.current && videoRef.current.textTracks) {
+      try {
+        const tt = videoRef.current.textTracks;
+        for (let i = 0; i < tt.length; i++) {
+          tt[i].mode = i === id ? "showing" : "disabled";
+        }
+      } catch {}
+    } else if (
+      mpegtsRef.current &&
+      typeof mpegtsRef.current.selectSubtitleTrack === "function"
+    ) {
+      try {
+        mpegtsRef.current.selectSubtitleTrack(id);
+      } catch {}
+    }
     setCurrentSubtitle(id);
     setActiveMenu("none");
   };
@@ -1010,6 +1100,8 @@ export default function VideoPlayer() {
         )}
         style={{ transform: "translateZ(0)", willChange: "transform" }}
         playsInline
+        crossOrigin="anonymous"
+        preload="metadata"
         poster={poster || undefined}
       />
 
@@ -1425,6 +1517,100 @@ export default function VideoPlayer() {
                           {r}
                         </button>
                       ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Settings (aggregated audio / subtitles) */}
+              <div className="relative">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleMenu("settings");
+                  }}
+                  className={cn(
+                    "p-2 rounded-full transition-colors",
+                    activeMenu === "settings"
+                      ? "bg-primary text-white"
+                      : "hover:bg-white/10",
+                  )}
+                  title="Settings"
+                >
+                  <Settings className="w-5 h-5" />
+                </button>
+                <AnimatePresence>
+                  {activeMenu === "settings" && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 8 }}
+                      className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[180px] shadow-2xl z-30"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
+                        Settings
+                      </div>
+                      <div className="px-2 py-1">
+                        <div className="text-[11px] font-bold text-white/60 px-3 py-1">
+                          Audio
+                        </div>
+                        {audioTracks.length > 0 ? (
+                          audioTracks.map((t) => (
+                            <button
+                              key={t.id}
+                              onClick={() => changeAudioTrack(t.id)}
+                              className={cn(
+                                "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
+                                currentAudioTrack === t.id
+                                  ? "bg-primary text-white"
+                                  : "hover:bg-white/10 text-white/80",
+                              )}
+                            >
+                              {t.name}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="text-sm text-white/50 px-3 py-2">
+                            No audio tracks
+                          </div>
+                        )}
+
+                        <div className="text-[11px] font-bold text-white/60 px-3 py-1 mt-2">
+                          Subtitles
+                        </div>
+                        <button
+                          onClick={() => changeSubtitle(-1)}
+                          className={cn(
+                            "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
+                            currentSubtitle === -1
+                              ? "bg-primary text-white"
+                              : "hover:bg-white/10 text-white/80",
+                          )}
+                        >
+                          Off
+                        </button>
+                        {subtitleTracks.length > 0 ? (
+                          subtitleTracks.map((t) => (
+                            <button
+                              key={t.id}
+                              onClick={() => changeSubtitle(t.id)}
+                              className={cn(
+                                "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
+                                currentSubtitle === t.id
+                                  ? "bg-primary text-white"
+                                  : "hover:bg-white/10 text-white/80",
+                              )}
+                            >
+                              {t.name}
+                            </button>
+                          ))
+                        ) : (
+                          <div className="text-sm text-white/50 px-3 py-2">
+                            No subtitles
+                          </div>
+                        )}
+                      </div>
                     </motion.div>
                   )}
                 </AnimatePresence>

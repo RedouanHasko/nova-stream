@@ -206,6 +206,10 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   activePlaylistRef.current = activePlaylist;
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
+  const playlistsRef = useRef(playlists);
+  useEffect(() => {
+    playlistsRef.current = playlists;
+  }, [playlists]);
 
   useEffect(() => {
     // Reset data when active playlist changes
@@ -273,6 +277,9 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       .catch((err) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
         console.error("Failed to prefetch data:", err);
+        toast.error(
+          "Failed to load playlist data. Check connection or credentials.",
+        );
       })
       .finally(() => {
         setIsPrefetching(false);
@@ -398,6 +405,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     };
     const updated = [...playlists, newPlaylist];
     setPlaylists(updated);
+    // Keep ref in sync immediately so follow-up actions can read the new list
+    playlistsRef.current = updated;
     setActiveId(newPlaylist.id);
     localStorage.setItem("nova_playlists", JSON.stringify(updated));
     localStorage.setItem("nova_active_id", newPlaylist.id);
@@ -409,7 +418,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   };
 
   const refreshAccountInfo = async (id: string) => {
-    const playlist = playlists.find((p) => p.id === id);
+    const playlist = playlistsRef.current.find((p) => p.id === id);
     if (
       !playlist ||
       playlist.type !== "xtream" ||
@@ -425,18 +434,21 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         playlist.username,
         playlist.password,
       );
-      const updatedPlaylists = playlists.map((p) =>
-        p.id === id
-          ? {
-              ...p,
-              accountInfo: { user: info.user_info, server: info.server_info },
-            }
-          : p,
-      );
-      setPlaylists(updatedPlaylists);
-      localStorage.setItem("nova_playlists", JSON.stringify(updatedPlaylists));
+      setPlaylists((current) => {
+        const updated = current.map((p) =>
+          p.id === id
+            ? {
+                ...p,
+                accountInfo: { user: info.user_info, server: info.server_info },
+              }
+            : p,
+        );
+        localStorage.setItem("nova_playlists", JSON.stringify(updated));
+        return updated;
+      });
     } catch (error) {
       console.error("Failed to refresh account info:", error);
+      toast.error("Failed to refresh account info");
     }
   };
 

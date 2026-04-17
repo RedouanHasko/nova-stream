@@ -131,16 +131,69 @@ async function startServer() {
     let transientErrorRetries = 0;
     const MAX_TRANSIENT_ERROR_RETRIES = 3; // ECONNRESET / socket hang-up / timeout before any response
 
+    // Helper: detect IP-like hostnames (IPv4 / simple IPv6-ish check)
+    const isIpAddress = (h?: string) =>
+      !!h && (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h) || /[:a-fA-F0-9]/.test(h));
+
+    // Original host (first URL) — used to preserve Host / SNI when upstream redirects to raw IPs
+    let originalHost: string | undefined = undefined;
+    try {
+      originalHost = new URL(targetUrl).hostname;
+    } catch (e) {
+      originalHost = undefined;
+    }
+
+    // Small UA fallback list (tried sequentially on empty upstream responses)
+    const fallbackUAs = [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.170 Safari/537.36",
+      "VLC/3.0.18 LibVLC/3.0.18",
+      "Lavf/58.76.100",
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+    ];
+    let uaFallbackAttempt = 0;
+
     const makeRequest = (currentUrl: string) => {
       try {
         const parsedUrl = new URL(currentUrl);
+        // Prefer the client's User-Agent when available; fall back to VLC UA
+        // Allow small client-driven experiments via query params:
+        // - ?ua=... to override User-Agent
+        // - ?upstreamReferer=... to set an explicit Referer for upstream
+        const clientUa =
+          (req.query.ua as string) ||
+          (uaFallbackAttempt > 0
+            ? fallbackUAs[uaFallbackAttempt - 1]
+            : (req.headers["user-agent"] as string)) ||
+          undefined;
         const headers: any = {
-          "User-Agent": "VLC/3.0.18 LibVLC/3.0.18",
-          Accept: "*/*",
+          "User-Agent": clientUa || "VLC/3.0.18 LibVLC/3.0.18",
+          // Prefer client's Accept header when available (helps m3u8 negotiation)
+          Accept: (req.headers["accept"] as string) || "*/*",
           Connection: "keep-alive",
-          // Ask upstream to gzip — cuts API payload size by 60-80%
+          // Ask upstream to gzip for API calls, but prefer identity for raw stream manifests
           "Accept-Encoding": isApiCall ? "gzip, deflate" : "identity",
         };
+
+        // Forward a few common client headers that some providers check
+        if (req.headers["referer"])
+          headers["Referer"] = req.headers["referer"] as string;
+        if (req.headers["origin"])
+          headers["Origin"] = req.headers["origin"] as string;
+        if (req.headers["accept-language"])
+          headers["Accept-Language"] = req.headers["accept-language"] as string;
+
+        // Allow explicit upstream referer override via query param for experimentation
+        if (req.query.upstreamReferer) {
+          headers["Referer"] = String(req.query.upstreamReferer);
+        }
+
+        // If the requested resource is an M3U8, hint Accept accordingly to encourage proper manifest responses
+        if (currentUrl && (currentUrl as string).includes(".m3u8")) {
+          headers["Accept"] =
+            "application/vnd.apple.mpegurl, application/x-mpegURL, */*";
+          // Keep Accept-Encoding as identity for manifests
+          headers["Accept-Encoding"] = "identity";
+        }
         if (req.headers["range"]) {
           headers["Range"] = req.headers["range"];
         }
@@ -148,7 +201,7 @@ async function startServer() {
           headers["Cookie"] = accumulatedCookies.join("; ");
         }
 
-        const options = {
+        const options: any = {
           hostname: parsedUrl.hostname,
           port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
           path: parsedUrl.pathname + parsedUrl.search,
@@ -158,9 +211,46 @@ async function startServer() {
           timeout: 60000, // Increased timeout to 60 seconds for live streams
         };
 
+        // If upstream redirected to a raw IP but the original request used a hostname,
+        // preserve the original Host header and SNI (servername) so virtual-hosted
+        // backends validate correctly.
+        try {
+          const parsedHost = parsedUrl.hostname;
+          if (
+            originalHost &&
+            !isIpAddress(originalHost) &&
+            isIpAddress(parsedHost)
+          ) {
+            headers["Host"] = originalHost;
+            if (parsedUrl.protocol === "https:")
+              options.servername = originalHost;
+          }
+        } catch (e) {
+          /* ignore host-override errors */
+        }
+
         const proxyReq = (
           parsedUrl.protocol === "https:" ? https : http
         ).request(options, (proxyRes) => {
+          // Log upstream status and headers for non-2xx responses to aid debugging
+          try {
+            const upstreamStatus = proxyRes.statusCode || 0;
+            if (upstreamStatus < 200 || upstreamStatus >= 300) {
+              console.log(
+                `[proxy] upstream ${upstreamStatus} for ${currentUrl}`,
+                {
+                  host: parsedUrl.hostname,
+                  path: parsedUrl.pathname + parsedUrl.search,
+                  contentType: proxyRes.headers["content-type"],
+                  headers: proxyRes.headers,
+                  remoteAddress: proxyRes.socket?.remoteAddress,
+                  remotePort: proxyRes.socket?.remotePort,
+                },
+              );
+            }
+          } catch (e) {
+            /* ignore logging errors */
+          }
           // Accumulate cookies
           if (proxyRes.headers["set-cookie"]) {
             const newCookies = Array.isArray(proxyRes.headers["set-cookie"])
@@ -277,6 +367,23 @@ async function startServer() {
               0,
               Math.min(firstChunk.length, 10),
             );
+            // If upstream returned a non-2xx status, log the first chunk for diagnostics
+            try {
+              const upstreamStatus = proxyRes.statusCode || 0;
+              if (upstreamStatus < 200 || upstreamStatus >= 300) {
+                const preview = firstChunk.toString(
+                  "utf8",
+                  0,
+                  Math.min(firstChunk.length, 1024),
+                );
+                console.log(
+                  `[proxy] upstream non-2xx first bytes for ${currentUrl}:`,
+                  preview,
+                );
+              }
+            } catch (e) {
+              /* ignore logging errors */
+            }
             if (chunkStr.startsWith("#EXTM3U")) {
               isM3U8 = true;
             }
@@ -284,7 +391,8 @@ async function startServer() {
             if (
               !isM3U8 &&
               req.query.url &&
-              (req.query.url as string).includes(".m3u8")
+              (req.query.url as string).includes(".m3u8") &&
+              !(req.query.force === "1" || req.query.bypassTypeCheck === "1")
             ) {
               console.log(
                 "Server returned video stream but client requested M3U8. Aborting to trigger fallback.",
@@ -299,7 +407,8 @@ async function startServer() {
             if (
               isM3U8 &&
               req.query.url &&
-              (req.query.url as string).includes(".ts")
+              (req.query.url as string).includes(".ts") &&
+              !(req.query.force === "1" || req.query.bypassTypeCheck === "1")
             ) {
               console.log(
                 "Server returned M3U8 but client requested TS. Aborting to trigger fallback.",
@@ -392,10 +501,39 @@ async function startServer() {
 
           proxyRes.on("end", () => {
             if (!dataReceived) {
+              console.log(
+                `[proxy] upstream ended without data for ${currentUrl} (status=${proxyRes.statusCode})`,
+                {
+                  headers: proxyRes.headers,
+                  remoteAddress: proxyRes.socket?.remoteAddress,
+                  remotePort: proxyRes.socket?.remotePort,
+                },
+              );
+
+              // If upstream returned nothing, try a User-Agent fallback sequence
+              if (uaFallbackAttempt < fallbackUAs.length) {
+                uaFallbackAttempt++;
+                console.log(
+                  `[proxy] no-data from upstream; retrying with alternative User-Agent (${uaFallbackAttempt}/${fallbackUAs.length}) for ${currentUrl}`,
+                );
+                proxyRes.destroy();
+                setTimeout(() => makeRequest(currentUrl), 400);
+                return;
+              }
+
               if (!res.headersSent) {
-                res.status(proxyRes.statusCode || 500);
-                res.setHeader("Access-Control-Allow-Origin", "*");
-                res.end();
+                // For API calls, return a JSON error to aid client-side diagnostics instead
+                if (isApiCall) {
+                  res.status(502).json({
+                    error: "Upstream ended without data",
+                    upstreamStatus: proxyRes.statusCode || 0,
+                    url: currentUrl,
+                  });
+                } else {
+                  res.status(proxyRes.statusCode || 500);
+                  res.setHeader("Access-Control-Allow-Origin", "*");
+                  res.end();
+                }
               }
               return;
             }
@@ -552,6 +690,127 @@ async function startServer() {
     };
 
     makeRequest(targetUrl);
+  });
+
+  // Diagnostic endpoint: try multiple header profiles against an upstream URL
+  app.get("/api/proxy-test", async (req, res) => {
+    const targetUrl = String(req.query.url || "");
+    if (!targetUrl) return res.status(400).json({ error: "No URL" });
+
+    const profiles = [
+      {
+        name: "browser",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.170 Safari/537.36",
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        },
+      },
+      {
+        name: "vlc",
+        headers: { "User-Agent": "VLC/3.0.18 LibVLC/3.0.18", Accept: "*/*" },
+      },
+      {
+        name: "ffmpeg",
+        headers: { "User-Agent": "Lavf/58.76.100", Accept: "*/*" },
+      },
+      {
+        name: "mobile",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+          Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        },
+      },
+    ];
+
+    const results: any[] = [];
+
+    for (const p of profiles) {
+      const start = Date.now();
+      try {
+        const parsedUrl = new URL(targetUrl);
+        const headers: any = {
+          ...(p.headers || {}),
+          Connection: "keep-alive",
+          "Accept-Encoding": "identity",
+        };
+        if (req.query.upstreamReferer)
+          headers["Referer"] = String(req.query.upstreamReferer);
+        // Attach a best-effort X-Forwarded-For
+        if (req.ip) headers["X-Forwarded-For"] = String(req.ip);
+
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: "GET",
+          headers,
+          agent: parsedUrl.protocol === "https:" ? httpsAgent : httpAgent,
+          timeout: 10000,
+        };
+
+        const proto = parsedUrl.protocol === "https:" ? https : http;
+
+        const probe = await new Promise<any>((resolve, reject) => {
+          const req2 = proto.request(options, (upRes) => {
+            let preview = "";
+            let got = false;
+            upRes.once("data", (chunk: Buffer) => {
+              got = true;
+              try {
+                preview = chunk.toString(
+                  "utf8",
+                  0,
+                  Math.min(chunk.length, 1024),
+                );
+              } catch (e) {
+                preview = "<binary>";
+              }
+              // destroy early — we only need the first bytes for diagnostics
+              upRes.destroy();
+            });
+            upRes.on("close", () => {
+              resolve({
+                status: upRes.statusCode,
+                headers: upRes.headers,
+                preview,
+                remoteAddress: upRes.socket?.remoteAddress,
+                remotePort: upRes.socket?.remotePort,
+                got,
+              });
+            });
+          });
+          req2.on("timeout", () => {
+            req2.destroy();
+            reject(new Error("timeout"));
+          });
+          req2.on("error", (err) => reject(err));
+          req2.end();
+        });
+
+        results.push({ profile: p.name, tookMs: Date.now() - start, ...probe });
+      } catch (err: any) {
+        results.push({
+          profile: p.name,
+          error: String(err.message || err),
+          tookMs: Date.now() - start,
+        });
+      }
+    }
+
+    const out = { url: targetUrl, ts: new Date().toISOString(), results };
+    try {
+      const outPath = path.join(
+        __dirname,
+        `test-output/probe-${Date.now()}.json`,
+      );
+      fs.writeFileSync(outPath, JSON.stringify(out, null, 2));
+    } catch (e) {
+      /* ignore write errors */
+    }
+
+    res.json(out);
   });
 
   // Vite middleware for development
