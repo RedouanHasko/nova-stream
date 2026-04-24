@@ -442,7 +442,6 @@ router.post("/register", registerLimiter, async (req, res) => {
       mode: registerAccess.mode,
     });
     res.json({
-      token,
       user: await buildAuthUser(user),
     });
   } catch (err) {
@@ -543,7 +542,6 @@ router.post("/login", loginLimiter, async (req, res) => {
       role: user.role,
     });
     res.json({
-      token,
       user: await buildAuthUser(user),
     });
   } catch (err) {
@@ -871,7 +869,6 @@ router.post("/dev-login", async (req, res) => {
       role: user.role,
     });
     res.json({
-      token,
       user: await buildAuthUser(user),
     });
   } catch (err) {

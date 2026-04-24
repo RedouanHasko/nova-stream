@@ -15,6 +15,21 @@ export default defineConfig(({ mode }) => {
         "@": path.resolve(__dirname, "."),
       },
     },
+    build: {
+      // Target ES2017 for broad Smart TV WebView compatibility (WebOS 4+, Tizen 4+)
+      target: "es2017",
+      rollupOptions: {
+        output: {
+          // Split heavy libraries into separate chunks for better caching
+          manualChunks: {
+            "vendor-player": ["hls.js", "mpegts.js"],
+            "vendor-ui": ["motion/react", "sonner", "lucide-react"],
+          },
+        },
+      },
+      // Reduce chunk size warnings
+      chunkSizeWarningLimit: 600,
+    },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.

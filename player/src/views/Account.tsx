@@ -9,12 +9,18 @@ import {
   RefreshCw,
   Users,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Logo from "../components/Logo";
 import { motion } from "motion/react";
 import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService } from "../services/iptvService";
 import { toast } from "sonner";
+import {
+  getDeviceIdentity,
+  getDeviceIdentitySummary,
+  type DeviceIdentity,
+} from "../lib/deviceIdentity";
 import { cn } from "../lib/utils";
 import { useT } from "../lib/i18n";
 
@@ -22,6 +28,27 @@ export default function Account() {
   const navigate = useNavigate();
   const { activePlaylist, isConnected, refreshAccountInfo } = usePlaylist();
   const t = useT();
+  const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity | null>(
+    null,
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    getDeviceIdentity()
+      .then((identity) => {
+        if (active) {
+          setDeviceIdentity(identity);
+        }
+      })
+      .catch((error) => {
+        console.error("device identity resolution failed", error);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleRefresh = async () => {
     if (!activePlaylist) return;
@@ -186,9 +213,15 @@ export default function Account() {
             <DetailItem
               icon={Hash}
               label="MAC Address"
-              value="70:c4:4d:58:c5:d8"
+              value={deviceIdentity?.macAddress || "Loading..."}
+              subValue={getDeviceIdentitySummary(deviceIdentity)}
             />
-            <DetailItem icon={Hash} label="Device Key" value="352212" />
+            <DetailItem
+              icon={Hash}
+              label="Device Key"
+              value={deviceIdentity?.deviceKey || "Loading..."}
+              subValue={deviceIdentity?.profile.appVersion || ""}
+            />
           </motion.div>
         </div>
       </div>
@@ -207,6 +240,13 @@ function DetailItem({
   value: string;
   subValue?: string;
 }) {
+  const isUrlValue = /^https?:\/\//i.test(value);
+  const normalizedUrl = isUrlValue
+    ? value
+    : /^([a-z0-9-]+\.)+[a-z]{2,}/i.test(value)
+      ? `https://${value}`
+      : "";
+
   return (
     <div className="bg-white/5 p-6 rounded-2xl border border-white/5 flex items-center gap-6 hover:bg-white/10 transition-colors">
       <div className="p-3 bg-primary/10 rounded-xl">
@@ -214,7 +254,20 @@ function DetailItem({
       </div>
       <div className="flex-1">
         <span className="text-sm text-white/40 block">{label}</span>
-        <span className="text-xl font-bold">{value}</span>
+        {normalizedUrl ? (
+          <a
+            href={normalizedUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-xl font-bold break-all whitespace-normal leading-snug text-primary hover:underline block"
+          >
+            {value}
+          </a>
+        ) : (
+          <span className="text-xl font-bold break-all whitespace-normal leading-snug block">
+            {value}
+          </span>
+        )}
         {subValue && (
           <span className="text-xs text-primary block mt-0.5">{subValue}</span>
         )}

@@ -38,9 +38,35 @@ export function Dashboard() {
   const [searchTerm, setSearchTerm] = useState("");
   const [typeFilter, setTypeFilter] = useState("All");
   const [recentTransactions, setRecentTransactions] = useState<any[]>([]);
+  const [activationDevices, setActivationDevices] = useState<any[]>([]);
   const [chartData, setChartData] = useState<any[]>([]);
   const [computedStats, setComputedStats] = useState<any[] | null>(null);
   const [availableBalance, setAvailableBalance] = useState<number>(0);
+  const [deviceSearchTerm, setDeviceSearchTerm] = useState("");
+  const [deviceStateFilter, setDeviceStateFilter] = useState("All");
+  const [isDownloadingReport, setIsDownloadingReport] = useState(false);
+
+  const handleDownloadReport = async () => {
+    try {
+      setIsDownloadingReport(true);
+      const blob = await api.downloadDashboardReportPdf();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const now = new Date();
+      const fileDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      a.href = url;
+      a.download = `dashboard-report-${fileDate}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Failed to download dashboard report", error);
+      window.alert(t("Failed to download report. Please try again."));
+    } finally {
+      setIsDownloadingReport(false);
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -52,6 +78,9 @@ export function Dashboard() {
 
         const nextTransactions = Array.isArray(summary?.recentTransactions)
           ? summary.recentTransactions
+          : [];
+        const nextActivationDevices = Array.isArray(summary?.activationDevices)
+          ? summary.activationDevices
           : [];
         const nextChartData = Array.isArray(summary?.chartData)
           ? summary.chartData
@@ -159,6 +188,7 @@ export function Dashboard() {
                 ];
 
         setRecentTransactions(nextTransactions);
+        setActivationDevices(nextActivationDevices);
         setChartData(nextChartData);
         setAvailableBalance(availableBalanceVal);
         setComputedStats(computed as any[]);
@@ -166,6 +196,7 @@ export function Dashboard() {
         console.error("Failed to load dashboard summary", error);
         if (!mounted) return;
         setRecentTransactions([]);
+        setActivationDevices([]);
         setChartData([]);
         setAvailableBalance(0);
         setComputedStats(null);
@@ -209,6 +240,60 @@ export function Dashboard() {
       return matchesSearch && matchesType;
     });
   }, [searchTerm, typeFilter, recentTransactions]);
+
+  const filteredActivationDevices = useMemo(() => {
+    return activationDevices.filter((device) => {
+      const searchStr = deviceSearchTerm.toLowerCase();
+      const apps = Array.isArray(device.activations) ? device.activations : [];
+      const matchesSearch =
+        String(device.mac || "")
+          .toLowerCase()
+          .includes(searchStr) ||
+        String(device.deviceKey || "")
+          .toLowerCase()
+          .includes(searchStr) ||
+        String(device.deviceName || "")
+          .toLowerCase()
+          .includes(searchStr) ||
+        String(device.platform || "")
+          .toLowerCase()
+          .includes(searchStr) ||
+        String(device.ownerResellerName || "")
+          .toLowerCase()
+          .includes(searchStr) ||
+        apps.some((activation: any) =>
+          `${activation.appName || ""} ${activation.activationKind || ""} ${activation.status || ""}`
+            .toLowerCase()
+            .includes(searchStr),
+        );
+
+      const matchesState =
+        deviceStateFilter === "All" || device.accessState === deviceStateFilter;
+
+      return matchesSearch && matchesState;
+    });
+  }, [activationDevices, deviceSearchTerm, deviceStateFilter]);
+
+  const getAccessStateClassName = (state: string) => {
+    if (state === "PAID_ACTIVE") {
+      return "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20";
+    }
+    if (state === "TRIAL_ACTIVE") {
+      return "bg-sky-500/10 text-sky-400 ring-sky-500/20";
+    }
+    if (state === "BLOCKED") {
+      return "bg-rose-500/10 text-rose-500 ring-rose-500/20";
+    }
+    return "bg-amber-500/10 text-amber-400 ring-amber-500/20";
+  };
+
+  const formatAccessState = (state: string) => {
+    if (state === "PAID_ACTIVE") return "Paid Active";
+    if (state === "TRIAL_ACTIVE") return "Trial Active";
+    if (state === "BLOCKED") return "Blocked";
+    if (state === "EXPIRED") return "Expired";
+    return "Inactive";
+  };
 
   // Define stats based on role
   const getStats = () => {
@@ -264,10 +349,11 @@ export function Dashboard() {
         </h1>
         <div className="flex gap-2 sm:gap-3">
           <button
-            onClick={() => window.print()}
+            onClick={handleDownloadReport}
+            disabled={isDownloadingReport}
             className="flex-1 sm:flex-none inline-flex items-center justify-center rounded-xl bg-input px-3 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-foreground hover:bg-ring transition-colors"
           >
-            {t("Download Report")}
+            {isDownloadingReport ? t("Generating report...") : t("Download Report")}
           </button>
           <Link
             to="/devices"
@@ -313,12 +399,12 @@ export function Dashboard() {
               >
                 {stat.changeType === "positive" ? (
                   <ArrowUpRight
-                    className="h-4 w-4 flex-shrink-0 self-center text-emerald-500"
+                    className="h-4 w-4 shrink-0 self-center text-emerald-500"
                     aria-hidden="true"
                   />
                 ) : (
                   <ArrowDownRight
-                    className="h-4 w-4 flex-shrink-0 self-center text-rose-500"
+                    className="h-4 w-4 shrink-0 self-center text-rose-500"
                     aria-hidden="true"
                   />
                 )}
@@ -341,10 +427,7 @@ export function Dashboard() {
               : t("My Activations")}{" "}
             {t("Last 6 Months")}
           </h2>
-          <div
-            className="h-[300px] w-full min-h-0 min-w-0"
-            style={{ minWidth: 0, minHeight: 0 }}
-          >
+          <div className="h-75 w-full min-h-0 min-w-0">
             <ResponsiveContainer width="100%" height={300}>
               <AreaChart
                 data={chartData}
@@ -526,6 +609,131 @@ export function Dashboard() {
         </div>
       </motion.div>
 
+      <motion.div
+        variants={itemVariants}
+        className="rounded-2xl bg-card border border-border overflow-hidden transition-colors duration-300"
+      >
+        <div className="border-b border-border px-6 py-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div>
+            <h2 className="text-base font-semibold leading-6 text-foreground">
+              Activated & Trial Devices
+            </h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              All visible devices that currently have trial or paid app activations.
+            </p>
+          </div>
+
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <div className="relative">
+              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                <Search className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+              </div>
+              <input
+                type="text"
+                value={deviceSearchTerm}
+                onChange={(e) => setDeviceSearchTerm(e.target.value)}
+                className="block w-full rounded-xl border-0 bg-input py-1.5 pl-9 pr-3 text-foreground ring-1 ring-inset ring-border placeholder:text-muted-foreground focus:ring-2 focus:ring-inset focus:ring-foreground/20 sm:text-sm sm:leading-6"
+                placeholder="Search MAC, app, platform..."
+              />
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Filter className="h-4 w-4 text-muted-foreground" />
+              <select
+                value={deviceStateFilter}
+                onChange={(e) => setDeviceStateFilter(e.target.value)}
+                title="Filter devices by activation state"
+                aria-label="Filter devices by activation state"
+                className="block rounded-xl border-0 bg-input py-1.5 pl-3 pr-8 text-foreground ring-1 ring-inset ring-border focus:ring-2 focus:ring-inset focus:ring-foreground/20 sm:text-sm sm:leading-6"
+              >
+                <option value="All">All states</option>
+                <option value="PAID_ACTIVE">Paid Active</option>
+                <option value="TRIAL_ACTIVE">Trial Active</option>
+                <option value="EXPIRED">Expired</option>
+                <option value="BLOCKED">Blocked</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-border">
+            <thead className="bg-input">
+              <tr>
+                <th className="py-3.5 pl-6 pr-3 text-left text-sm font-semibold text-muted-foreground">
+                  Device
+                </th>
+                <th className="px-3 py-3.5 text-left text-sm font-semibold text-muted-foreground">
+                  Apps
+                </th>
+                <th className="px-3 py-3.5 text-left text-sm font-semibold text-muted-foreground">
+                  Access
+                </th>
+                <th className="px-3 py-3.5 text-left text-sm font-semibold text-muted-foreground">
+                  Owner
+                </th>
+                <th className="px-3 py-3.5 text-left text-sm font-semibold text-muted-foreground">
+                  Last Activation
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border bg-transparent">
+              {filteredActivationDevices.map((device) => (
+                <tr key={device.deviceId} className="hover:bg-input transition-colors align-top">
+                  <td className="py-4 pl-6 pr-3 text-sm text-foreground min-w-65">
+                    <div className="font-semibold">{device.mac || "—"}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {device.deviceName || device.platform || "Unknown device"}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Key: {device.deviceKey || "—"}
+                    </div>
+                  </td>
+                  <td className="px-3 py-4 text-sm text-muted-foreground min-w-[320px]">
+                    <div className="flex flex-wrap gap-2">
+                      {(device.activations || []).map((activation: any) => (
+                        <span
+                          key={activation.id}
+                          className="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset bg-input text-foreground ring-border"
+                        >
+                          {activation.appName} • {activation.activationKind} • {activation.status}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="px-3 py-4 text-sm text-muted-foreground whitespace-nowrap">
+                    <span
+                      className={`inline-flex items-center rounded-md px-2 py-1 text-xs font-medium ring-1 ring-inset ${getAccessStateClassName(device.accessState)}`}
+                    >
+                      {formatAccessState(device.accessState)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-4 text-sm text-muted-foreground whitespace-nowrap">
+                    {device.ownerResellerName ||
+                      (device.ownerResellerId ? `#${device.ownerResellerId}` : "Direct")}
+                  </td>
+                  <td className="px-3 py-4 text-sm text-muted-foreground whitespace-nowrap">
+                    {device.latestActivationAt
+                      ? new Date(device.latestActivationAt).toLocaleString(locale)
+                      : "—"}
+                  </td>
+                </tr>
+              ))}
+              {filteredActivationDevices.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={5}
+                    className="px-6 py-10 text-center text-sm text-muted-foreground"
+                  >
+                    No activated or trial devices matched this filter.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </motion.div>
+
       {/* Recent Transactions Table */}
       <motion.div
         variants={itemVariants}
@@ -558,6 +766,8 @@ export function Dashboard() {
               <select
                 value={typeFilter}
                 onChange={(e) => setTypeFilter(e.target.value)}
+                title="Filter transactions by type"
+                aria-label="Filter transactions by type"
                 className="block rounded-xl border-0 bg-input py-1.5 pl-3 pr-8 text-foreground ring-1 ring-inset ring-border focus:ring-2 focus:ring-inset focus:ring-foreground/20 sm:text-sm sm:leading-6"
               >
                 <option value="All">{t("All")}</option>

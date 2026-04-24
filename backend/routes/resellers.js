@@ -28,6 +28,15 @@ function normalizePhoneNumber(value) {
   return input.startsWith("+") ? `+${digits}` : digits;
 }
 
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    const first = forwarded.split(",")[0].trim();
+    if (first) return first;
+  }
+  return req.socket?.remoteAddress || req.ip || null;
+}
+
 async function archiveLinkedUsersForReseller(resellerId) {
   if (!resellerId) return;
 
@@ -412,7 +421,47 @@ router.put("/:id", auth, async (req, res) => {
         data.credits = nextCredits;
       }
 
-      const updated = await prisma.reseller.update({ where: { id }, data });
+      if (data.credits === undefined) {
+        const updated = await prisma.reseller.update({ where: { id }, data });
+        return res.json(updated);
+      }
+
+      const ipAddress = getClientIp(req);
+      const updated = await prisma.$transaction(async (tx) => {
+        const current = await tx.reseller.findUnique({ where: { id } });
+        if (!current) throw new Error("NOT_FOUND");
+
+        const beforeCredits = Number(current.credits || 0);
+        const afterCredits = Number(data.credits);
+        const delta = afterCredits - beforeCredits;
+
+        const updatedReseller = await tx.reseller.update({
+          where: { id },
+          data,
+        });
+
+        if (delta !== 0) {
+          await tx.creditTransaction.create({
+            data: {
+              type: delta > 0 ? "TOPUP" : "REVOKE",
+              status: "COMPLETED",
+              amount: Math.abs(delta),
+              fromResellerId: null,
+              toResellerId: id,
+              performedById: req.user.id,
+              notes: `Manual credit adjustment from reseller management (${beforeCredits} -> ${afterCredits})`,
+              ipAddress,
+              fromBeforeBalance: null,
+              fromAfterBalance: null,
+              toBeforeBalance: beforeCredits,
+              toAfterBalance: afterCredits,
+            },
+          });
+        }
+
+        return updatedReseller;
+      });
+
       return res.json(updated);
     }
 
@@ -440,6 +489,9 @@ router.put("/:id", auth, async (req, res) => {
     return res.status(403).json({ error: "Forbidden" });
   } catch (err) {
     console.error(err);
+    if ((err?.message || "") === "NOT_FOUND") {
+      return res.status(404).json({ error: "Not found" });
+    }
     res.status(500).json({ error: "Server error" });
   }
 });

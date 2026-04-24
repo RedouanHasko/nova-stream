@@ -4,7 +4,13 @@ function mapRow(row) {
   if (!row) return null;
 
   const output = { ...row };
-  const boolFields = new Set(["active", "emailEnabled", "smsEnabled", "read"]);
+  const boolFields = new Set([
+    "active",
+    "emailEnabled",
+    "smsEnabled",
+    "read",
+    "trialEnabled",
+  ]);
 
   for (const key of Object.keys(output)) {
     if (boolFields.has(key) && (output[key] === 0 || output[key] === 1)) {

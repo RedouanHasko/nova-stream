@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { ArrowLeft, Loader2, Radio as RadioIcon, Search, Play, Pause, Volume2, Music, SkipBack, SkipForward, VolumeX, Lock, Unlock, Maximize2, Minimize2, Globe, Share2, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
@@ -239,6 +239,40 @@ export default function Radio() {
       setPinInput('');
     }
   };
+
+  // TV remote navigation for Radio
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (!key) return;
+
+      if (key === "back" || key === "backspace") {
+        if (isFullScreenPlayer) {
+          setIsFullScreenPlayer(false);
+        } else if (selectedCountry) {
+          setSelectedCountry(null);
+        } else if (selectedContinent) {
+          setSelectedContinent(null);
+        } else {
+          navigate("/");
+        }
+        return;
+      }
+      if (key === "playpause") {
+        if (currentStation) {
+          if (isPlaying) audioRef.current?.pause();
+          else audioRef.current?.play().catch(() => {});
+        }
+        return;
+      }
+      if (key === "stop") {
+        audioRef.current?.pause();
+        return;
+      }
+    };
+    window.addEventListener("tv-remote-key", handler);
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, [isFullScreenPlayer, selectedCountry, selectedContinent, currentStation, isPlaying, navigate]);
 
   return (
     <div className="flex flex-col h-screen text-white">

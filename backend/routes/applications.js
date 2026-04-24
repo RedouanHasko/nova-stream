@@ -83,11 +83,25 @@ router.get("/", auth, async (req, res) => {
 // Create application (superadmin only)
 router.post("/", auth, requireRole("superadmin"), async (req, res) => {
   try {
-    const { name, logoUrl, description, downloadUrl } = req.body;
+    const {
+      name,
+      logoUrl,
+      description,
+      downloadUrl,
+      trialEnabled,
+      trialDurationDays,
+    } = req.body;
     if (!name) return res.status(400).json({ error: "Name is required" });
 
     const app = await prisma.application.create({
-      data: { name, logoUrl, description, downloadUrl },
+      data: {
+        name,
+        logoUrl,
+        description,
+        downloadUrl,
+        trialEnabled,
+        trialDurationDays,
+      },
     });
     res.json(app);
   } catch (err) {
@@ -100,7 +114,15 @@ router.post("/", auth, requireRole("superadmin"), async (req, res) => {
 router.put("/:id", auth, requireRole("superadmin"), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { name, logoUrl, description, downloadUrl, status } = req.body;
+    const {
+      name,
+      logoUrl,
+      description,
+      downloadUrl,
+      status,
+      trialEnabled,
+      trialDurationDays,
+    } = req.body;
 
     const existing = await prisma.application.findUnique({ where: { id } });
     if (!existing) {
@@ -110,7 +132,15 @@ router.put("/:id", auth, requireRole("superadmin"), async (req, res) => {
     const previousLogoUrl = existing.logoUrl;
     const updated = await prisma.application.update({
       where: { id },
-      data: { name, logoUrl, description, downloadUrl, status },
+      data: {
+        name,
+        logoUrl,
+        description,
+        downloadUrl,
+        status,
+        trialEnabled,
+        trialDurationDays,
+      },
     });
 
     if (previousLogoUrl && previousLogoUrl !== updated.logoUrl) {

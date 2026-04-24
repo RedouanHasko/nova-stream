@@ -55,11 +55,17 @@ const ApplicationsManagement = lazy(() =>
     default: module.ApplicationsManagement,
   })),
 );
+const AuditLogs = lazy(() =>
+  import("./pages/settings/AuditLogs").then((module) => ({
+    default: module.AuditLogs,
+  })),
+);
 const LandingPage = lazy(() =>
   import("./pages/public/LandingPage").then((module) => ({
     default: module.LandingPage,
   })),
 );
+const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
 
 function AppLoadingFallback() {
   return (
@@ -95,8 +101,10 @@ export default function App() {
                     />
                     <Route path="settings" element={<SystemSettings />} />
                     <Route path="apps" element={<ApplicationsManagement />} />
+                    <Route path="audit-logs" element={<AuditLogs />} />
                   </Route>
                 </Route>
+                <Route path="*" element={<NotFoundPage />} />
               </Routes>
             </Suspense>
           </AuthProvider>

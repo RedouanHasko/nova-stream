@@ -1,6 +1,6 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { useSearchParams } from "react-router";
-import { Download, Search, Filter } from "lucide-react";
+import { Download, Search, Filter, X, Eye, MapPin, User, Calendar, CreditCard, ArrowRightLeft } from "lucide-react";
 import { useAuth } from "../../../contexts/AuthContext";
 import { useI18n } from "../../../contexts/I18nContext";
 import { DataViewToggle } from "../../../components/common/DataViewToggle";
@@ -14,6 +14,65 @@ type TranslateFn = (
   key: string,
   params?: Record<string, string | number>,
 ) => string;
+
+function resolveViewerAmount(trx: any, viewer?: any) {
+  const absoluteAmount = Math.abs(Number(trx.amount || 0));
+  const viewerRole = (viewer?.role || "").toString().toLowerCase();
+  const viewerResellerId = Number(
+    viewer?.resellerId || viewer?.reseller?.id || 0,
+  );
+
+  if (viewerRole === "superadmin") {
+    const type = (trx.type || "").toString().toUpperCase();
+    if (["REVOKE", "CREDIT_RETURN"].includes(type)) {
+      return -absoluteAmount;
+    }
+    return absoluteAmount;
+  }
+
+  if (
+    viewerResellerId > 0 &&
+    Number(trx.fromResellerId || 0) === viewerResellerId
+  ) {
+    return -absoluteAmount;
+  }
+
+  if (
+    viewerResellerId > 0 &&
+    Number(trx.toResellerId || 0) === viewerResellerId
+  ) {
+    return absoluteAmount;
+  }
+
+  return Number(trx.amount || 0);
+}
+
+function resolveViewerBalance(trx: any, viewer?: any) {
+  const viewerRole = (viewer?.role || "").toString().toLowerCase();
+  const viewerResellerId = Number(
+    viewer?.resellerId || viewer?.reseller?.id || 0,
+  );
+
+  if (viewerRole === "superadmin") {
+    return trx.toAfterBalance ?? trx.fromAfterBalance ?? "-";
+  }
+
+  if (
+    viewerResellerId > 0 &&
+    Number(trx.fromResellerId || 0) === viewerResellerId
+  ) {
+    return trx.fromAfterBalance ?? trx.toAfterBalance ?? "-";
+  }
+
+  if (
+    viewerResellerId > 0 &&
+    Number(trx.toResellerId || 0) === viewerResellerId
+  ) {
+    return trx.toAfterBalance ?? trx.fromAfterBalance ?? "-";
+  }
+
+  return trx.toAfterBalance ?? trx.fromAfterBalance ?? "-";
+}
 
 function getResellerName(reseller: any, fallbackId?: number | string | null) {
   if (reseller?.name) return reseller.name;
@@ -141,6 +200,23 @@ function buildTransactionDetails(
   }
 }
 
+function StatusBadge({ status }: { status: string }) {
+  const s = (status || "").toUpperCase();
+  const cls =
+    s === "COMPLETED"
+      ? "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20"
+      : s === "PENDING"
+        ? "bg-amber-500/10 text-amber-500 ring-amber-500/20"
+        : s === "REJECTED" || s === "FAILED"
+          ? "bg-rose-500/10 text-rose-500 ring-rose-500/20"
+          : "bg-foreground/10 text-muted-foreground ring-border";
+  return (
+    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${cls}`}>
+      {status}
+    </span>
+  );
+}
+
 export function CreditLogs() {
   const { user } = useAuth();
   const { t, locale } = useI18n();
@@ -155,6 +231,64 @@ export function CreditLogs() {
   const [pageSize] = useState(10);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
+  const [selectedTrx, setSelectedTrx] = useState<any | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  const isAdmin =
+    (user?.role || "").toString().toLowerCase() === "superadmin";
+
+  const openDetail = useCallback(
+    async (trx: any) => {
+      setSelectedTrx(trx);
+      // Enrich with server detail (includes IP + balances not always in list)
+      setDetailLoading(true);
+      try {
+        const detail = await api.getTransactionDetail(trx.raw.id);
+        if (detail) setSelectedTrx((prev: any) => ({ ...prev, raw: detail }));
+      } catch {
+        // use existing data
+      } finally {
+        setDetailLoading(false);
+      }
+    },
+    [],
+  );
+
+  const exportCSV = useCallback(() => {
+    const adminCols = isAdmin ? ["IP Address", "From Before", "From After", "To Before", "To After"] : [];
+    const headers = ["ID", "Date", "Type", "Details", "Note", "Amount", "Balance", "Status", ...adminCols];
+    const rows = transactions.map((trx) => {
+      const raw = trx.raw;
+      const base = [
+        trx.id,
+        trx.date,
+        trx.type,
+        trx.details,
+        trx.note,
+        trx.amount,
+        trx.balance,
+        trx.status,
+      ];
+      if (isAdmin) {
+        base.push(
+          raw.ipAddress || "",
+          raw.fromBeforeBalance ?? "",
+          raw.fromAfterBalance ?? "",
+          raw.toBeforeBalance ?? "",
+          raw.toAfterBalance ?? "",
+        );
+      }
+      return base.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",");
+    });
+    const csv = [headers.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `credit-transactions-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [transactions, isAdmin]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -190,19 +324,23 @@ export function CreditLogs() {
             ? logs.items
             : [];
 
-        const mapped = items.map((trx: any) => ({
-          id: `TRX-${trx.id}`,
-          raw: trx,
-          date: trx.createdAt
-            ? new Date(trx.createdAt).toLocaleString(locale)
-            : "-",
-          type: (trx.type || "").toString().toUpperCase(),
-          amount: Number(trx.amount || 0),
-          details: buildTransactionDetails(trx, user, t),
-          note: formatTransactionNote(trx.notes, trx.type),
-          balance: trx.toAfterBalance ?? trx.fromAfterBalance ?? "-",
-          status: (trx.status || "").toString().toUpperCase(),
-        }));
+        const mapped = items.map((trx: any) => {
+          const signedAmount = resolveViewerAmount(trx, user);
+          return {
+            id: `TRX-${trx.id}`,
+            raw: trx,
+            date: trx.createdAt
+              ? new Date(trx.createdAt).toLocaleString(locale)
+              : "-",
+            type: (trx.type || "").toString().toUpperCase(),
+            amount: signedAmount,
+            absoluteAmount: Math.abs(signedAmount),
+            details: buildTransactionDetails(trx, user, t),
+            note: formatTransactionNote(trx.notes, trx.type),
+            balance: resolveViewerBalance(trx, user),
+            status: (trx.status || "").toString().toUpperCase(),
+          };
+        });
 
         setTransactions(mapped);
         if (Array.isArray(logs)) {
@@ -286,7 +424,9 @@ export function CreditLogs() {
             </select>
           </div>
           <DataViewToggle viewMode={viewMode} onChange={setViewMode} />
-          <button className="inline-flex items-center gap-x-2 rounded-xl bg-foreground/5 px-4 py-2.5 text-sm font-semibold text-foreground shadow-sm ring-1 ring-inset ring-border hover:bg-foreground/10 transition-colors">
+          <button
+            onClick={exportCSV}
+            className="inline-flex items-center gap-x-2 rounded-xl bg-foreground/5 px-4 py-2.5 text-sm font-semibold text-foreground shadow-sm ring-1 ring-inset ring-border hover:bg-foreground/10 transition-colors">
             <Download
               className="-ml-0.5 h-5 w-5 text-muted-foreground"
               aria-hidden="true"
@@ -344,11 +484,22 @@ export function CreditLogs() {
                   >
                     {t("Balance")}
                   </th>
+                  {isAdmin && (
+                    <th
+                      scope="col"
+                      className="px-3 py-4 text-left text-sm font-semibold text-muted-foreground"
+                    >
+                      {t("IP Address")}
+                    </th>
+                  )}
                   <th
                     scope="col"
                     className="px-3 py-4 text-center text-sm font-semibold text-muted-foreground"
                   >
                     {t("Status")}
+                  </th>
+                  <th scope="col" className="px-3 py-4 text-center text-sm font-semibold text-muted-foreground">
+                    {t("Details")}
                   </th>
                 </tr>
               </thead>
@@ -379,25 +530,38 @@ export function CreditLogs() {
                       {trx.note}
                     </td>
                     <td
-                      className={`whitespace-nowrap px-3 py-4 text-sm font-medium text-right ${trx.amount > 0 ? "text-emerald-500" : "text-rose-500"}`}
+                      className={`whitespace-nowrap px-3 py-4 text-sm font-medium text-right ${trx.amount >= 0 ? "text-emerald-500" : "text-rose-500"}`}
                     >
-                      {trx.amount > 0 ? "+" : ""}
-                      {trx.amount}
+                      {trx.amount >= 0 ? "+" : ""}
+                      {trx.absoluteAmount}
                     </td>
                     <td className="whitespace-nowrap px-3 py-4 text-sm text-foreground font-medium text-right">
                       {trx.balance}
                     </td>
+                    {isAdmin && (
+                      <td className="whitespace-nowrap px-3 py-4 text-sm text-muted-foreground font-mono">
+                        {trx.raw.ipAddress || "—"}
+                      </td>
+                    )}
                     <td className="whitespace-nowrap px-3 py-4 text-sm text-center">
-                      <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/20">
-                        {trx.status}
-                      </span>
+                      <StatusBadge status={trx.status} />
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-4 text-center">
+                      <button
+                        onClick={() => openDetail(trx)}
+                        className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/10 transition-colors"
+                        title={t("View details")}
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                        {t("View")}
+                      </button>
                     </td>
                   </tr>
                 ))}
                 {filteredTransactions.length === 0 && (
                   <tr>
                     <td
-                      colSpan={8}
+                      colSpan={isAdmin ? 10 : 9}
                       className="py-8 text-center text-sm text-muted-foreground"
                     >
                       {t("No transactions found matching your filters.")}
@@ -424,9 +588,7 @@ export function CreditLogs() {
                         {trx.id}
                       </div>
                     </div>
-                    <span className="inline-flex items-center rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/20">
-                      {trx.status}
-                    </span>
+                    <StatusBadge status={trx.status} />
                   </div>
 
                   <div className="space-y-2 text-sm">
@@ -448,13 +610,13 @@ export function CreditLogs() {
                       </span>{" "}
                       <span
                         className={
-                          trx.amount > 0
+                          trx.amount >= 0
                             ? "text-emerald-500 font-medium"
                             : "text-rose-500 font-medium"
                         }
                       >
-                        {trx.amount > 0 ? "+" : ""}
-                        {trx.amount}
+                        {trx.amount >= 0 ? "+" : ""}
+                        {trx.absoluteAmount}
                       </span>
                     </div>
                     <div>
@@ -473,6 +635,20 @@ export function CreditLogs() {
                       <div className="text-muted-foreground">{t("Note")}</div>
                       <div className="text-foreground">{trx.note}</div>
                     </div>
+                    {isAdmin && trx.raw.ipAddress && (
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground font-mono">
+                        <MapPin className="h-3 w-3 shrink-0" />
+                        {trx.raw.ipAddress}
+                      </div>
+                    )}
+                    <button
+                      onClick={() => openDetail(trx)}
+                      title={t("View transaction details")}
+                      className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/10 transition-colors"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                      {t("View Details")}
+                    </button>
                   </div>
                 </div>
               ))
@@ -514,6 +690,150 @@ export function CreditLogs() {
           </div>
         </div>
       </div>
+
+      {/* Transaction Detail Slide-over */}
+      {selectedTrx && (
+        <div className="fixed inset-0 z-50 flex justify-end" aria-modal="true" role="dialog">
+          {/* backdrop */}
+          <div
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => setSelectedTrx(null)}
+          />
+          <div className="relative w-full max-w-md bg-card shadow-2xl border-l border-border flex flex-col overflow-y-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-border sticky top-0 bg-card z-10">
+              <div>
+                <h2 className="text-base font-semibold text-foreground">{t("Transaction Details")}</h2>
+                <p className="text-xs text-muted-foreground font-mono mt-0.5">TRX-{selectedTrx.raw.id}</p>
+              </div>
+              <button
+                onClick={() => setSelectedTrx(null)}
+                className="rounded-lg p-1.5 text-muted-foreground hover:text-foreground hover:bg-foreground/10 transition-colors"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {detailLoading && (
+              <div className="px-6 py-3 text-xs text-muted-foreground border-b border-border">
+                {t("Loading full details...")}
+              </div>
+            )}
+
+            <div className="px-6 py-4 space-y-5">
+              {/* Status + Type */}
+              <div className="flex items-center gap-3 flex-wrap">
+                <StatusBadge status={selectedTrx.status} />
+                <span className="inline-flex items-center rounded-full bg-foreground/10 px-2.5 py-1 text-xs font-medium text-foreground ring-1 ring-inset ring-border">
+                  {selectedTrx.type}
+                </span>
+              </div>
+
+              {/* Amount */}
+              <div className="rounded-xl bg-foreground/5 px-5 py-4 text-center">
+                <div className="text-xs text-muted-foreground mb-1">{t("Amount")}</div>
+                <div className={`text-3xl font-bold ${selectedTrx.amount >= 0 ? "text-emerald-500" : "text-rose-500"}`}>
+                  {selectedTrx.amount >= 0 ? "+" : ""}{selectedTrx.absoluteAmount ?? Math.abs(selectedTrx.amount || 0)}
+                </div>
+              </div>
+
+              {/* Parties */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="rounded-xl border border-border px-4 py-3">
+                  <div className="text-xs text-muted-foreground mb-1">{t("From")}</div>
+                  <div className="text-sm font-medium text-foreground truncate">
+                    {getResellerName(selectedTrx.raw.fromReseller, selectedTrx.raw.fromResellerId) || t("Administrator")}
+                  </div>
+                  {isAdmin && selectedTrx.raw.fromBeforeBalance != null && (
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {selectedTrx.raw.fromBeforeBalance} → <span className="text-foreground font-medium">{selectedTrx.raw.fromAfterBalance}</span>
+                    </div>
+                  )}
+                </div>
+                <div className="rounded-xl border border-border px-4 py-3">
+                  <div className="text-xs text-muted-foreground mb-1">{t("To")}</div>
+                  <div className="text-sm font-medium text-foreground truncate">
+                    {getResellerName(selectedTrx.raw.toReseller, selectedTrx.raw.toResellerId) || "—"}
+                  </div>
+                  {isAdmin && selectedTrx.raw.toBeforeBalance != null && (
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {selectedTrx.raw.toBeforeBalance} → <span className="text-foreground font-medium">{selectedTrx.raw.toAfterBalance}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Meta rows */}
+              <dl className="space-y-3">
+                <div className="flex items-start gap-3">
+                  <Calendar className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                  <div>
+                    <dt className="text-xs text-muted-foreground">{t("Created")}</dt>
+                    <dd className="text-sm text-foreground">
+                      {selectedTrx.raw.createdAt ? new Date(selectedTrx.raw.createdAt).toLocaleString(locale) : "—"}
+                    </dd>
+                  </div>
+                </div>
+                {selectedTrx.raw.processedAt && (
+                  <div className="flex items-start gap-3">
+                    <Calendar className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                    <div>
+                      <dt className="text-xs text-muted-foreground">{t("Processed")}</dt>
+                      <dd className="text-sm text-foreground">
+                        {new Date(selectedTrx.raw.processedAt).toLocaleString(locale)}
+                      </dd>
+                    </div>
+                  </div>
+                )}
+                {selectedTrx.raw.performedBy && (
+                  <div className="flex items-start gap-3">
+                    <User className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                    <div>
+                      <dt className="text-xs text-muted-foreground">{t("Performed By")}</dt>
+                      <dd className="text-sm text-foreground">
+                        {getActorName(selectedTrx.raw.performedBy)}
+                      </dd>
+                    </div>
+                  </div>
+                )}
+                {isAdmin && selectedTrx.raw.ipAddress && (
+                  <div className="flex items-start gap-3">
+                    <MapPin className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                    <div>
+                      <dt className="text-xs text-muted-foreground">{t("IP Address")}</dt>
+                      <dd className="text-sm text-foreground font-mono">{selectedTrx.raw.ipAddress}</dd>
+                    </div>
+                  </div>
+                )}
+                {selectedTrx.raw.notes && (
+                  <div className="flex items-start gap-3">
+                    <CreditCard className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                    <div>
+                      <dt className="text-xs text-muted-foreground">{t("Notes")}</dt>
+                      <dd className="text-sm text-foreground">{formatTransactionNote(selectedTrx.raw.notes, selectedTrx.raw.type)}</dd>
+                    </div>
+                  </div>
+                )}
+              </dl>
+
+              {/* Balance audit for non-admins (own side only) */}
+              {!isAdmin && (
+                <div className="rounded-xl border border-border px-5 py-4">
+                  <div className="flex items-center gap-2 mb-2 text-xs font-medium text-muted-foreground">
+                    <ArrowRightLeft className="h-3.5 w-3.5" />
+                    {t("Balance Change")}
+                  </div>
+                  <div className="text-sm text-foreground">
+                    {selectedTrx.balance !== "—"
+                      ? t("Your balance after this transaction: {{bal}}", { bal: selectedTrx.balance })
+                      : "—"}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

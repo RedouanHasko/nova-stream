@@ -658,8 +658,8 @@ export function Header() {
   };
 
   return (
-    <header className="relative z-50 flex h-16 shrink-0 items-center justify-between border-b border-border bg-card px-4 sm:px-6 transition-colors duration-300">
-      <div className="flex flex-1 items-center gap-2 sm:gap-4">
+    <header className="relative z-50 flex h-16 shrink-0 items-center justify-between gap-x-3 border-b border-border bg-card px-4 sm:gap-x-4 sm:px-6 transition-colors duration-300">
+      <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-4">
         <button
           onClick={toggleSidebar}
           className="hidden h-10 w-10 items-center justify-center rounded-xl bg-input text-foreground transition-all duration-300 hover:bg-ring lg:flex"
@@ -680,7 +680,7 @@ export function Header() {
           <Menu className="h-5 w-5" />
         </button>
 
-        <div ref={searchRef} className="relative w-full max-w-xs sm:max-w-xl">
+        <div ref={searchRef} className="relative min-w-0 flex-1 max-w-xs sm:max-w-xl">
           <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
             <Search
               className="h-4 w-4 text-muted-foreground sm:h-5 sm:w-5"
@@ -797,7 +797,7 @@ export function Header() {
         </div>
       </div>
 
-      <div className="flex items-center gap-x-2 sm:gap-x-6">
+      <div className="flex shrink-0 items-center gap-x-3 sm:gap-x-4 lg:gap-x-5">
         {user?.role !== "superadmin" && (
           <div className="hidden items-center gap-2 rounded-full bg-input px-3 py-1 sm:px-4 sm:py-1.5 xs:flex">
             <Coins className="h-3.5 w-3.5 text-yellow-500 sm:h-4 sm:w-4" />

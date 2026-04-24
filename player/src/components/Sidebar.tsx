@@ -21,9 +21,10 @@ const SidebarItem = memo(function SidebarItem({
   return (
     <button
       onClick={onClick}
+      tabIndex={0}
       className={cn(
         "flex items-center justify-between w-full px-4 py-3 text-left transition-all duration-200",
-        "hover:bg-white/5",
+        "hover:bg-white/5 focus-visible:bg-white/10",
         active && "bg-white/10 border-l-4 border-primary",
       )}
     >

@@ -68,6 +68,8 @@ model CreditTransaction {
   performedById  Int?
   performedBy    User?              @relation("sentByUser", fields: [performedById], references: [id])
   notes          String?
+  ipAddress      String?
+  metadata       String?
   createdAt      DateTime           @default(now())
   processedAt    DateTime?
 
@@ -86,6 +88,11 @@ model Device {
   ownerResellerId Int?
   owner           Reseller?       @relation(fields: [ownerResellerId], references: [id])
   domainUrl       String?
+  platform        String?
+  deviceName      String?
+  osVersion       String?
+  identitySource  String?
+  deviceInfo      String?
   status          String    @default("ACTIVE")
   activatedApps   ActivatedApp[]
   playlists       DevicePlaylist[]
@@ -95,6 +102,7 @@ model Device {
   @@index([ownerResellerId])
   @@index([status])
   @@index([createdAt])
+  @@index([platform])
 }
 
 
@@ -105,8 +113,12 @@ model ActivatedApp {
   applicationId Int
   application   Application @relation(fields: [applicationId], references: [id])
   appName       String // Cached name
+  activationKind String     @default("PAID")
   duration      String?     @default("1_year")
   expiresAt     DateTime?
+  trialStartedAt DateTime?
+  trialEndsAt   DateTime?
+  trialConsumedAt DateTime?
   status        String      @default("ACTIVE")
   activatedAt   DateTime    @default(now())
 
@@ -121,6 +133,8 @@ model Application {
   logoUrl     String?
   description String?
   downloadUrl String?
+  trialEnabled Boolean       @default(true)
+  trialDurationDays Int      @default(7)
   status      String         @default("ACTIVE")
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt

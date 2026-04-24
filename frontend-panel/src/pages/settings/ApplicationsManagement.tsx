@@ -15,6 +15,9 @@ export function ApplicationsManagement() {
     logoUrl: "",
     description: "",
     downloadUrl: "",
+    status: "ACTIVE" as "ACTIVE" | "INACTIVE",
+    trialEnabled: true,
+    trialDurationDays: 7,
   });
   const [saveIntent, setSaveIntent] = useState<number | "new" | null>(null);
   const [feedback, setFeedback] = useState<{
@@ -56,7 +59,7 @@ export function ApplicationsManagement() {
     }
     try {
       if (id) {
-        await api.updateApplication(id, formData);
+        await api.updateApplication(id, { ...formData, trialEnabled: formData.trialEnabled, trialDurationDays: Number(formData.trialDurationDays) });
         setFeedback({
           isOpen: true,
           title: "Application updated",
@@ -64,7 +67,7 @@ export function ApplicationsManagement() {
           variant: "success",
         });
       } else {
-        await api.createApplication(formData);
+        await api.createApplication({ ...formData, trialEnabled: formData.trialEnabled, trialDurationDays: Number(formData.trialDurationDays) });
         setFeedback({
           isOpen: true,
           title: "Application created",
@@ -72,7 +75,7 @@ export function ApplicationsManagement() {
           variant: "success",
         });
       }
-      setFormData({ name: "", logoUrl: "", description: "", downloadUrl: "" });
+      setFormData({ name: "", logoUrl: "", description: "", downloadUrl: "", status: "ACTIVE", trialEnabled: true, trialDurationDays: 7 });
       setIsAdding(false);
       setEditingId(null);
       fetchApps();
@@ -149,6 +152,9 @@ export function ApplicationsManagement() {
                 logoUrl: "",
                 description: "",
                 downloadUrl: "",
+                status: "ACTIVE",
+                trialEnabled: true,
+                trialDurationDays: 7,
               });
             }}
             className="inline-flex items-center gap-2 rounded-xl bg-foreground px-4 py-2.5 text-sm font-semibold text-background hover:bg-foreground/90 transition-all"
@@ -232,6 +238,58 @@ export function ApplicationsManagement() {
                 users to the general downloads page.
               </p>
             </div>
+            <div>
+              <label className="block text-sm font-medium mb-2">Status</label>
+              <select
+                title="Application status"
+                value={formData.status}
+                onChange={(e) =>
+                  setFormData({ ...formData, status: e.target.value as "ACTIVE" | "INACTIVE" })
+                }
+                className="w-full rounded-xl border-border bg-input py-2.5 px-4 focus:ring-2 focus:ring-foreground/20 sm:text-sm"
+              >
+                <option value="ACTIVE">Active</option>
+                <option value="INACTIVE">Inactive</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-2">Trial Duration (days)</label>
+              <input
+                type="number"
+                min={1}
+                max={365}
+                value={formData.trialDurationDays}
+                onChange={(e) =>
+                  setFormData({ ...formData, trialDurationDays: Number(e.target.value) })
+                }
+                className="w-full rounded-xl border-border bg-input py-2.5 px-4 focus:ring-2 focus:ring-foreground/20 sm:text-sm"
+                placeholder="7"
+              />
+            </div>
+            <div className="md:col-span-2 flex items-center gap-3">
+              <button
+                aria-label={formData.trialEnabled ? "Disable free trial" : "Enable free trial"}
+                type="button"
+                onClick={() => setFormData({ ...formData, trialEnabled: !formData.trialEnabled })}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none ${
+                  formData.trialEnabled ? "bg-emerald-500" : "bg-foreground/20"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ${
+                    formData.trialEnabled ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+              <span className="text-sm font-medium">
+                Free trial {formData.trialEnabled ? "enabled" : "disabled"}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {formData.trialEnabled
+                  ? `Users can start a ${formData.trialDurationDays}-day free trial on this app.`
+                  : "No free trial will be offered for this app."}
+              </span>
+            </div>
           </div>
           <div className="flex justify-end gap-3">
             <button
@@ -298,7 +356,12 @@ export function ApplicationsManagement() {
                   </p>
                 </div>
               </div>
-              <div className="mt-6 pt-4 border-t border-border flex items-center justify-between">
+              <div className="mt-4 flex flex-wrap gap-2">
+                <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${app.trialEnabled ? "bg-blue-500/10 text-blue-500" : "bg-foreground/5 text-muted-foreground"}`}>
+                  {app.trialEnabled ? `Trial: ${app.trialDurationDays ?? 7}d` : "No trial"}
+                </span>
+              </div>
+              <div className="mt-3 pt-4 border-t border-border flex items-center justify-between">
                 <span
                   className={`text-xs font-medium px-2.5 py-1 rounded-full ${app.status === "ACTIVE" ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500"}`}
                 >
@@ -324,6 +387,9 @@ export function ApplicationsManagement() {
                         logoUrl: app.logoUrl || "",
                         description: app.description || "",
                         downloadUrl: app.downloadUrl || "",
+                        status: app.status || "ACTIVE",
+                        trialEnabled: app.trialEnabled ?? true,
+                        trialDurationDays: app.trialDurationDays ?? 7,
                       });
                       setIsAdding(false);
                       window.scrollTo({ top: 0, behavior: "smooth" });

@@ -11,6 +11,7 @@ import {
   MapPin,
 } from "lucide-react";
 import { motion } from "motion/react";
+import type { TargetAndTransition, Transition } from "motion/react";
 
 interface WeatherData {
   temp: number;
@@ -140,7 +141,7 @@ function getWeatherMeta(code: number): WeatherMeta {
   };
 }
 
-const iconAnimations: Record<WeatherMeta["animation"], object> = {
+const iconAnimations: Record<WeatherMeta["animation"], TargetAndTransition> = {
   spin: { rotate: [0, 360] },
   bounce: { y: [0, -3, 0] },
   pulse: { scale: [1, 1.15, 1] },
@@ -148,7 +149,7 @@ const iconAnimations: Record<WeatherMeta["animation"], object> = {
   none: {},
 };
 
-const iconTransitions: Record<WeatherMeta["animation"], object> = {
+const iconTransitions: Record<WeatherMeta["animation"], Transition> = {
   spin: { duration: 8, repeat: Infinity, ease: "linear" },
   bounce: { duration: 1.2, repeat: Infinity, ease: "easeInOut" },
   pulse: { duration: 2, repeat: Infinity, ease: "easeInOut" },

@@ -26,6 +26,10 @@ export function TransferCreditsModal({
 }: TransferCreditsModalProps) {
   const { user, updateUser } = useAuth();
   const { t } = useI18n();
+  const normalizedRole = (user?.role || "").toString().toLowerCase();
+  const canInitiateTransfer =
+    normalizedRole === "superadmin" || normalizedRole === "reseller";
+  const availableCredits = Number(user?.reseller?.credits || 0);
   const [recipient, setRecipient] = useState(initialRecipient);
   const [recipientOptions, setRecipientOptions] = useState<any[]>([]);
   const [loadingRecipients, setLoadingRecipients] = useState(false);
@@ -79,6 +83,18 @@ export function TransferCreditsModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canInitiateTransfer) {
+      setFeedback({
+        isOpen: true,
+        title: t("Permission denied"),
+        message: t(
+          "Your account is not allowed to initiate direct credit transfers.",
+        ),
+        variant: "error",
+      });
+      return;
+    }
+
     if (!recipient || !amount) {
       setFeedback({
         isOpen: true,
@@ -88,9 +104,35 @@ export function TransferCreditsModal({
       });
       return;
     }
+
+    const numericAmount = Number(amount);
+    if (!Number.isInteger(numericAmount) || numericAmount <= 0) {
+      setFeedback({
+        isOpen: true,
+        title: t("Invalid amount"),
+        message: t("Credits must be a positive whole number."),
+        variant: "info",
+      });
+      return;
+    }
+
+    if (normalizedRole === "reseller" && action === "add") {
+      if (numericAmount > availableCredits) {
+        setFeedback({
+          isOpen: true,
+          title: t("Insufficient credits"),
+          message: t(
+            "You cannot transfer more credits than your current available balance.",
+          ),
+          variant: "error",
+        });
+        return;
+      }
+    }
+
     setLoading(true);
     try {
-      const body = { recipient, amount: Number(amount), action, notes };
+      const body = { recipient, amount: numericAmount, action, notes };
       const res = await api.transferCredits(body);
       console.log("Transfer result", res);
 
@@ -154,6 +196,20 @@ export function TransferCreditsModal({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-5">
+          {!canInitiateTransfer && (
+            <div className="rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-400">
+              {t(
+                "Only super admins and resellers can initiate direct credit transfers.",
+              )}
+            </div>
+          )}
+
+          {normalizedRole === "reseller" && action === "add" && (
+            <div className="rounded-xl border border-border bg-foreground/5 px-4 py-3 text-sm text-muted-foreground">
+              {t("Available balance")}: {availableCredits.toLocaleString()}
+            </div>
+          )}
+
           <div>
             <label className="block text-sm font-medium text-muted-foreground mb-2">
               {t("Action Type")}
@@ -166,6 +222,7 @@ export function TransferCreditsModal({
                   value="add"
                   checked={action === "add"}
                   onChange={() => setAction("add")}
+                  disabled={!canInitiateTransfer}
                   className="text-foreground focus:ring-ring h-4 w-4 bg-input border-border"
                 />
                 <span className="text-sm text-foreground font-medium">
@@ -179,6 +236,7 @@ export function TransferCreditsModal({
                   value="revoke"
                   checked={action === "revoke"}
                   onChange={() => setAction("revoke")}
+                  disabled={!canInitiateTransfer}
                   className="text-rose-500 focus:ring-rose-500/20 h-4 w-4 bg-input border-border"
                 />
                 <span className="text-sm text-foreground font-medium">
@@ -202,7 +260,11 @@ export function TransferCreditsModal({
                 required
                 value={recipient}
                 onChange={(e) => setRecipient(e.target.value)}
-                disabled={loadingRecipients || recipientOptions.length === 0}
+                disabled={
+                  !canInitiateTransfer ||
+                  loadingRecipients ||
+                  recipientOptions.length === 0
+                }
                 aria-label="Select recipient account"
                 title="Select recipient account"
                 className="block w-full appearance-none rounded-xl border-0 bg-input py-2.5 pl-10 pr-3 text-foreground focus:ring-2 focus:ring-inset focus:ring-ring sm:text-sm sm:leading-6 disabled:cursor-not-allowed disabled:opacity-60"
@@ -249,6 +311,7 @@ export function TransferCreditsModal({
                 min="1"
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
+                disabled={!canInitiateTransfer}
                 className="block w-full rounded-xl border-0 bg-input py-2.5 pl-10 text-foreground placeholder:text-muted-foreground focus:ring-2 focus:ring-inset focus:ring-ring sm:text-sm sm:leading-6"
                 placeholder={t("e.g., 100")}
               />
@@ -266,6 +329,7 @@ export function TransferCreditsModal({
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
+                disabled={!canInitiateTransfer}
                 className="block w-full rounded-xl border-0 bg-input py-2.5 pl-10 text-foreground placeholder:text-muted-foreground focus:ring-2 focus:ring-inset focus:ring-ring sm:text-sm sm:leading-6"
                 placeholder={t("Reason for transfer...")}
                 rows={3}
@@ -283,7 +347,13 @@ export function TransferCreditsModal({
             </button>
             <button
               type="submit"
-              disabled={loading}
+              disabled={
+                loading ||
+                !canInitiateTransfer ||
+                (normalizedRole === "reseller" &&
+                  action === "add" &&
+                  Number(amount || 0) > availableCredits)
+              }
               className={`rounded-xl px-4 py-2 text-sm font-medium transition-colors ${
                 action === "add"
                   ? "bg-foreground text-background hover:opacity-90"

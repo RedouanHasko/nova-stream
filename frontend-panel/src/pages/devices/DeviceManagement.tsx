@@ -9,6 +9,7 @@ import { DirectSubscriptions } from "./tabs/DirectSubscriptions";
 import { AddPlaylist } from "./tabs/AddPlaylist";
 import { ResetPlaylist } from "./tabs/ResetPlaylist";
 import { ChangeDomainUrl } from "./tabs/ChangeDomainUrl";
+import { ChangeDeviceKey } from "./tabs/ChangeDeviceKey";
 import {
   MonitorPlay,
   RefreshCcw,
@@ -18,6 +19,7 @@ import {
   RotateCcw,
   Globe,
   UserCheck,
+  KeyRound,
 } from "lucide-react";
 import { motion } from "motion/react";
 import { useI18n } from "../../contexts/I18nContext";
@@ -70,6 +72,12 @@ const allTabs = [
     name: "Change Domain Url",
     icon: Globe,
     roles: ["superadmin"],
+  },
+  {
+    id: "change-key",
+    name: "Change Device Key",
+    icon: KeyRound,
+    roles: ["superadmin", "reseller", "subreseller"],
   },
 ];
 
@@ -175,6 +183,7 @@ export function DeviceManagement() {
           {activeTab === "add-playlist" && <AddPlaylist />}
           {activeTab === "reset-playlist" && <ResetPlaylist />}
           {activeTab === "domain" && <ChangeDomainUrl />}
+          {activeTab === "change-key" && <ChangeDeviceKey />}
         </div>
       </div>
     </motion.div>

@@ -378,8 +378,14 @@ function createCreditTransactionRepository(
   return {
     create: async ({ data }) => {
       const now = new Date().toISOString();
+      const metadata =
+        data.metadata != null
+          ? typeof data.metadata === "string"
+            ? data.metadata
+            : JSON.stringify(data.metadata)
+          : null;
       const id = await runInsert(
-        "INSERT INTO creditTransactions (type, status, amount, fromResellerId, fromBeforeBalance, fromAfterBalance, toResellerId, toBeforeBalance, toAfterBalance, performedById, notes, createdAt, processedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO creditTransactions (type, status, amount, fromResellerId, fromBeforeBalance, fromAfterBalance, toResellerId, toBeforeBalance, toAfterBalance, performedById, notes, ipAddress, metadata, createdAt, processedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.type || null,
           data.status || null,
@@ -392,6 +398,8 @@ function createCreditTransactionRepository(
           data.toAfterBalance !== undefined ? data.toAfterBalance : null,
           data.performedById || null,
           data.notes || null,
+          data.ipAddress || null,
+          metadata,
           now,
           data.processedAt || null,
         ],
@@ -400,7 +408,11 @@ function createCreditTransactionRepository(
         "SELECT * FROM creditTransactions WHERE id = ? LIMIT 1",
         [id],
       );
-      return mapRow(rows[0]);
+      const row = mapRow(rows[0]);
+      if (row && typeof row.metadata === "string") {
+        try { row.metadata = JSON.parse(row.metadata); } catch (_) {}
+      }
+      return row;
     },
 
     findUnique: async ({ where } = {}) => {
@@ -410,7 +422,11 @@ function createCreditTransactionRepository(
           "SELECT * FROM creditTransactions WHERE id = ? LIMIT 1",
           [where.id],
         );
-        return mapRow(rows[0]);
+        const row = mapRow(rows[0]);
+        if (row && typeof row.metadata === "string") {
+          try { row.metadata = JSON.parse(row.metadata); } catch (_) {}
+        }
+        return row;
       }
       return null;
     },
@@ -418,9 +434,22 @@ function createCreditTransactionRepository(
     findMany: async ({ where, orderBy, skip, take } = {}) => {
       const rows = await runQuery("SELECT * FROM creditTransactions");
       const mapped = rows
-        .map(mapRow)
+        .map((r) => {
+          const row = mapRow(r);
+          if (row && typeof row.metadata === "string") {
+            try { row.metadata = JSON.parse(row.metadata); } catch (_) {}
+          }
+          return row;
+        })
         .filter((row) => matchesWhereClause(row, where));
       return applyOrderByAndPagination(mapped, { orderBy, skip, take });
+    },
+
+    count: async ({ where } = {}) => {
+      const rows = await runQuery("SELECT * FROM creditTransactions");
+      return rows
+        .map(mapRow)
+        .filter((row) => matchesWhereClause(row, where)).length;
     },
 
     update: async ({ where, data }) => {
@@ -472,6 +501,20 @@ function createCreditTransactionRepository(
         fields.push("notes = ?");
         params.push(data.notes);
       }
+      if (data.ipAddress !== undefined) {
+        fields.push("ipAddress = ?");
+        params.push(data.ipAddress);
+      }
+      if (data.metadata !== undefined) {
+        fields.push("metadata = ?");
+        params.push(
+          data.metadata == null
+            ? null
+            : typeof data.metadata === "string"
+              ? data.metadata
+              : JSON.stringify(data.metadata),
+        );
+      }
       if (data.processedAt !== undefined) {
         fields.push("processedAt = ?");
         params.push(
@@ -494,7 +537,11 @@ function createCreditTransactionRepository(
         "SELECT * FROM creditTransactions WHERE id = ? LIMIT 1",
         [where.id],
       );
-      return mapRow(rows[0]);
+      const row = mapRow(rows[0]);
+      if (row && typeof row.metadata === "string") {
+        try { row.metadata = JSON.parse(row.metadata); } catch (_) {}
+      }
+      return row;
     },
 
     deleteMany: async ({ where } = {}) => {

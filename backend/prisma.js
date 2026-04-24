@@ -115,6 +115,11 @@ async function init() {
         deviceKey TEXT,
         ownerResellerId INTEGER,
         domainUrl TEXT,
+        platform TEXT,
+        deviceName TEXT,
+        osVersion TEXT,
+        identitySource TEXT,
+        deviceInfo TEXT,
         status TEXT DEFAULT 'ACTIVE',
         createdAt TEXT DEFAULT (datetime('now')),
         updatedAt TEXT DEFAULT (datetime('now'))
@@ -125,8 +130,12 @@ async function init() {
         deviceId INTEGER,
         applicationId INTEGER,
         appName TEXT,
+        activationKind TEXT DEFAULT 'PAID',
         duration TEXT DEFAULT '1_year',
         expiresAt TEXT,
+        trialStartedAt TEXT,
+        trialEndsAt TEXT,
+        trialConsumedAt TEXT,
         status TEXT DEFAULT 'ACTIVE',
         activatedAt TEXT DEFAULT (datetime('now'))
       );
@@ -136,6 +145,9 @@ async function init() {
         name TEXT UNIQUE NOT NULL,
         logoUrl TEXT,
         description TEXT,
+        downloadUrl TEXT,
+        trialEnabled INTEGER DEFAULT 1,
+        trialDurationDays INTEGER DEFAULT 7,
         status TEXT DEFAULT 'ACTIVE',
         createdAt TEXT DEFAULT (datetime('now')),
         updatedAt TEXT DEFAULT (datetime('now'))
@@ -240,9 +252,18 @@ async function init() {
     `);
 
     ensureColumn("devices", "deviceKey", "TEXT");
+  ensureColumn("devices", "platform", "TEXT");
+  ensureColumn("devices", "deviceName", "TEXT");
+  ensureColumn("devices", "osVersion", "TEXT");
+  ensureColumn("devices", "identitySource", "TEXT");
+  ensureColumn("devices", "deviceInfo", "TEXT");
     ensureColumn("activatedApps", "applicationId", "INTEGER");
+    ensureColumn("activatedApps", "activationKind", "TEXT DEFAULT 'PAID'");
     ensureColumn("activatedApps", "duration", "TEXT DEFAULT '1_year'");
     ensureColumn("activatedApps", "expiresAt", "TEXT");
+    ensureColumn("activatedApps", "trialStartedAt", "TEXT");
+    ensureColumn("activatedApps", "trialEndsAt", "TEXT");
+    ensureColumn("activatedApps", "trialConsumedAt", "TEXT");
     ensureColumn("activatedApps", "status", "TEXT DEFAULT 'ACTIVE'");
     ensureColumn("creditTransactions", "fromResellerId", "INTEGER");
     ensureColumn("creditTransactions", "fromBeforeBalance", "REAL");
@@ -258,6 +279,8 @@ async function init() {
     ensureColumn("applications", "logoUrl", "TEXT");
     ensureColumn("applications", "description", "TEXT");
     ensureColumn("applications", "downloadUrl", "TEXT");
+    ensureColumn("applications", "trialEnabled", "INTEGER DEFAULT 1");
+    ensureColumn("applications", "trialDurationDays", "INTEGER DEFAULT 7");
     ensureColumn("applications", "status", "TEXT DEFAULT 'ACTIVE'");
     ensureColumn("applications", "createdAt", "TEXT DEFAULT (datetime('now'))");
     ensureColumn("applications", "updatedAt", "TEXT DEFAULT (datetime('now'))");
@@ -296,6 +319,7 @@ async function init() {
     ensureIndex("devices", "idx_devices_ownerResellerId", "ownerResellerId");
     ensureIndex("devices", "idx_devices_status", "status");
     ensureIndex("devices", "idx_devices_createdAt", "createdAt");
+    ensureIndex("devices", "idx_devices_platform", "platform");
     ensureIndex("activatedApps", "idx_activatedApps_deviceId", "deviceId");
     ensureIndex(
       "activatedApps",
@@ -427,7 +451,7 @@ function mapRow(row) {
   if (!row) return null;
   const out = { ...row };
   // Only convert known boolean-like fields from 0/1 to boolean.
-  const boolFields = new Set(["active", "emailEnabled", "smsEnabled", "read"]);
+  const boolFields = new Set(["active", "emailEnabled", "smsEnabled", "read", "trialEnabled"]);
   for (const k of Object.keys(out)) {
     if (boolFields.has(k) && (out[k] === 0 || out[k] === 1)) {
       out[k] = out[k] === 1;
@@ -1337,12 +1361,17 @@ const adapter = {
     create: async ({ data }) => {
       const nowv = new Date().toISOString();
       const id = await runInsert(
-        "INSERT INTO devices (mac, deviceKey, ownerResellerId, domainUrl, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO devices (mac, deviceKey, ownerResellerId, domainUrl, platform, deviceName, osVersion, identitySource, deviceInfo, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.mac,
           data.deviceKey || null,
           data.ownerResellerId || null,
           data.domainUrl || null,
+          data.platform || null,
+          data.deviceName || null,
+          data.osVersion || null,
+          data.identitySource || null,
+          data.deviceInfo || null,
           data.status || "ACTIVE",
           nowv,
           nowv,
@@ -1395,6 +1424,26 @@ const adapter = {
       if (data.domainUrl !== undefined) {
         fields.push("domainUrl = ?");
         params.push(data.domainUrl);
+      }
+      if (data.platform !== undefined) {
+        fields.push("platform = ?");
+        params.push(data.platform);
+      }
+      if (data.deviceName !== undefined) {
+        fields.push("deviceName = ?");
+        params.push(data.deviceName);
+      }
+      if (data.osVersion !== undefined) {
+        fields.push("osVersion = ?");
+        params.push(data.osVersion);
+      }
+      if (data.identitySource !== undefined) {
+        fields.push("identitySource = ?");
+        params.push(data.identitySource);
+      }
+      if (data.deviceInfo !== undefined) {
+        fields.push("deviceInfo = ?");
+        params.push(data.deviceInfo);
       }
       if (data.status !== undefined) {
         fields.push("status = ?");
@@ -1476,12 +1525,14 @@ const adapter = {
     create: async ({ data }) => {
       const nowv = new Date().toISOString();
       const id = await runInsert(
-        "INSERT INTO applications (name, logoUrl, description, downloadUrl, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO applications (name, logoUrl, description, downloadUrl, trialEnabled, trialDurationDays, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.name,
           data.logoUrl || null,
           data.description || null,
           data.downloadUrl || null,
+          data.trialEnabled === undefined ? 1 : data.trialEnabled ? 1 : 0,
+          data.trialDurationDays ?? 7,
           data.status || "ACTIVE",
           nowv,
           nowv,
@@ -1512,6 +1563,14 @@ const adapter = {
       if (data.downloadUrl !== undefined) {
         fields.push("downloadUrl = ?");
         params.push(data.downloadUrl);
+      }
+      if (data.trialEnabled !== undefined) {
+        fields.push("trialEnabled = ?");
+        params.push(data.trialEnabled ? 1 : 0);
+      }
+      if (data.trialDurationDays !== undefined) {
+        fields.push("trialDurationDays = ?");
+        params.push(data.trialDurationDays);
       }
       if (data.status !== undefined) {
         fields.push("status = ?");
@@ -1544,13 +1603,17 @@ const adapter = {
     create: async ({ data }) => {
       const nowv = new Date().toISOString();
       const id = await runInsert(
-        "INSERT INTO activatedApps (deviceId, applicationId, appName, duration, expiresAt, status, activatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO activatedApps (deviceId, applicationId, appName, activationKind, duration, expiresAt, trialStartedAt, trialEndsAt, trialConsumedAt, status, activatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.deviceId,
           data.applicationId ?? null,
           data.appName,
+          data.activationKind || "PAID",
           data.duration || "1_year",
           data.expiresAt || null,
+          data.trialStartedAt || null,
+          data.trialEndsAt || null,
+          data.trialConsumedAt || null,
           data.status || "ACTIVE",
           data.activatedAt || nowv,
         ],
@@ -1577,6 +1640,10 @@ const adapter = {
         fields.push("appName = ?");
         params.push(data.appName);
       }
+      if (data.activationKind !== undefined) {
+        fields.push("activationKind = ?");
+        params.push(data.activationKind);
+      }
       if (data.duration !== undefined) {
         fields.push("duration = ?");
         params.push(data.duration);
@@ -1584,6 +1651,18 @@ const adapter = {
       if (data.expiresAt !== undefined) {
         fields.push("expiresAt = ?");
         params.push(data.expiresAt);
+      }
+      if (data.trialStartedAt !== undefined) {
+        fields.push("trialStartedAt = ?");
+        params.push(data.trialStartedAt);
+      }
+      if (data.trialEndsAt !== undefined) {
+        fields.push("trialEndsAt = ?");
+        params.push(data.trialEndsAt);
+      }
+      if (data.trialConsumedAt !== undefined) {
+        fields.push("trialConsumedAt = ?");
+        params.push(data.trialConsumedAt);
       }
       if (data.status !== undefined) {
         fields.push("status = ?");

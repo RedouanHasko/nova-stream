@@ -331,12 +331,39 @@ export async function getCreditLogs(params: Record<string, any> = {}) {
   });
 }
 
+export async function getTransactionDetail(id: number) {
+  return request(`/api/credits/transactions/${id}`, { method: "GET" });
+}
+
 export async function getCreditSummary() {
   return request("/api/credits/summary", { method: "GET" });
 }
 
+// Audit Logs (superadmin only)
+export async function getAuditLogs(params: Record<string, any> = {}) {
+  return request(`/api/audit-logs${buildQueryString(params)}`, { method: "GET" });
+}
+
+export async function getAuditLogEvents() {
+  return request("/api/audit-logs/events", { method: "GET" });
+}
+
 export async function getDashboardSummary() {
   return request("/api/dashboard/summary", { method: "GET" });
+}
+
+export async function downloadDashboardReportPdf() {
+  const res = await fetch(`${API_BASE}/api/dashboard/summary/report`, {
+    method: "GET",
+    credentials: "include",
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to download report");
+  }
+
+  return res.blob();
 }
 
 export async function getGlobalSearch(params: Record<string, any> = {}) {
@@ -416,6 +443,13 @@ export async function updateDeviceDomain(mac: string, domainUrl: string) {
   return request("/api/devices/change-domain", {
     method: "POST",
     body: { mac, domainUrl },
+  });
+}
+
+export async function adminChangeDeviceKey(mac: string, newDeviceKey: string) {
+  return request("/api/devices/admin-change-key", {
+    method: "POST",
+    body: { mac, newDeviceKey },
   });
 }
 
@@ -563,6 +597,7 @@ export default {
   // credits
   transferCredits,
   getCreditLogs,
+  getTransactionDetail,
   getCreditSummary,
   getDashboardSummary,
   getGlobalSearch,
@@ -585,6 +620,7 @@ export default {
   createIntegration,
   updateIntegration,
   updateDeviceDomain,
+  adminChangeDeviceKey,
   resetPlaylists,
   switchMac,
   assignPlaylistToDevice,
@@ -602,4 +638,6 @@ export default {
   setToken,
   getToken,
   clearToken,
+  getAuditLogs,
+  getAuditLogEvents,
 };

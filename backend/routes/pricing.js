@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const prisma = require("../db");
+const rateLimit = require("express-rate-limit");
 const { auth, requireRole } = require("../middleware/auth");
 const {
   notifyUsersByRole,
@@ -9,7 +10,8 @@ const {
 const {
   getPaymentConfig,
   createCheckoutSession,
-  verifyCheckoutSession,
+  isManualPaymentTestingEnabled,
+  verifyStripeWebhookEvent,
 } = require("../services/paymentGateway");
 
 const formatCredits = (amount) => Number(amount || 0).toLocaleString();
@@ -23,6 +25,22 @@ const PLAN_TYPES = {
   DIRECT: "DIRECT_ACTIVATION",
   CREDIT: "CREDIT_RECHARGE",
 };
+
+const publicPricingReadLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: Number(process.env.PUBLIC_PRICING_READ_RATE_LIMIT_MAX || 100),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please try again shortly." },
+});
+
+const publicPricingWriteLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: Number(process.env.PUBLIC_PRICING_WRITE_RATE_LIMIT_MAX || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many checkout attempts. Please try again later." },
+});
 
 function inferPlanType(plan = {}) {
   return Number(plan?.credits || 0) > 0 ? PLAN_TYPES.CREDIT : PLAN_TYPES.DIRECT;
@@ -114,6 +132,246 @@ async function safeNotify(callback) {
   } catch (error) {
     console.error("pricing notification error", error);
   }
+}
+
+function parseJsonValue(value, fallback = null) {
+  if (!value || typeof value !== "string") return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function buildPublicTransactionMetadata({
+  customerName,
+  customerEmail,
+  mac,
+  deviceKey,
+  application,
+  plan,
+  duration,
+  gatewaySessionId = null,
+  paymentReference = null,
+  paymentMethod = null,
+  checkoutState = "PENDING",
+  paymentStatus = null,
+  activation = null,
+  device = null,
+}) {
+  return {
+    source: "public_landing_page",
+    customerName: customerName || null,
+    customerEmail: customerEmail || null,
+    mac: normalizeMac(mac),
+    deviceKey: normalizeDeviceKey(deviceKey),
+    applicationId: Number(application?.id || 0) || null,
+    appName: application?.name || null,
+    planId: Number(plan?.id || 0) || null,
+    planName: plan?.name || null,
+    duration: duration || null,
+    gatewaySessionId: gatewaySessionId || null,
+    paymentReference: paymentReference || null,
+    paymentMethod: paymentMethod || null,
+    checkoutState,
+    paymentStatus,
+    deviceId: Number(device?.id || 0) || null,
+    activationId: Number(activation?.id || 0) || null,
+  };
+}
+
+function buildPublicTransactionSummary({
+  plan,
+  application,
+  mac,
+  paymentMethod,
+  checkoutState,
+}) {
+  return [
+    `Public checkout ${checkoutState.toLowerCase()}`,
+    plan?.name ? `plan ${plan.name}` : null,
+    application?.name ? `app ${application.name}` : null,
+    mac ? `mac ${normalizeMac(mac)}` : null,
+    paymentMethod ? `via ${paymentMethod}` : null,
+  ]
+    .filter(Boolean)
+    .join(" • ");
+}
+
+async function createPendingPublicCheckoutTransaction({
+  plan,
+  application,
+  customerName,
+  customerEmail,
+  mac,
+  deviceKey,
+  duration,
+  gatewaySessionId,
+}) {
+  const metadata = buildPublicTransactionMetadata({
+    customerName,
+    customerEmail,
+    mac,
+    deviceKey,
+    application,
+    plan,
+    duration,
+    gatewaySessionId,
+    paymentMethod: "STRIPE_CHECKOUT",
+    checkoutState: "PENDING",
+  });
+
+  return prisma.creditTransaction.create({
+    data: {
+      type: "PUBLIC_PLAN_PURCHASE",
+      status: "PENDING",
+      amount: Number(plan.price || 0),
+      notes: buildPublicTransactionSummary({
+        plan,
+        application,
+        mac,
+        paymentMethod: "STRIPE_CHECKOUT",
+        checkoutState: "PENDING",
+      }),
+      metadata: JSON.stringify(metadata),
+    },
+  });
+}
+
+async function findPublicCheckoutTransaction(sessionId) {
+  if (!sessionId) return null;
+
+  if (typeof prisma.creditTransaction.findFirst === "function") {
+    try {
+      return await prisma.creditTransaction.findFirst({
+        where: {
+          type: "PUBLIC_PLAN_PURCHASE",
+          metadata: { contains: `"gatewaySessionId":"${sessionId}"` },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    } catch (error) {
+      console.warn("findPublicCheckoutTransaction query fallback", error);
+    }
+  }
+
+  const records = await prisma.creditTransaction.findMany({
+    where: { type: "PUBLIC_PLAN_PURCHASE" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  return (Array.isArray(records) ? records : []).find((entry) => {
+    const metadata = parseJsonValue(entry?.metadata, {});
+    return metadata?.gatewaySessionId === sessionId;
+  });
+}
+
+function toCheckoutStatusResponse(transaction, fallbackStatus = "PENDING") {
+  const metadata = parseJsonValue(transaction?.metadata, {});
+  const checkoutState = (
+    metadata?.checkoutState ||
+    transaction?.status ||
+    fallbackStatus
+  )
+    .toString()
+    .toUpperCase();
+
+  return {
+    success: true,
+    mode: checkoutState === "PAID" ? "redirect" : "redirect",
+    provider: "stripe",
+    activated: checkoutState === "PAID",
+    checkoutState,
+    paymentStatus:
+      metadata?.paymentStatus || transaction?.status || fallbackStatus,
+    device: metadata?.deviceId
+      ? { id: metadata.deviceId, mac: metadata.mac }
+      : metadata?.mac
+        ? { mac: metadata.mac }
+        : null,
+    activation: metadata?.activationId
+      ? { id: metadata.activationId, applicationId: metadata.applicationId }
+      : null,
+    customerEmail: metadata?.customerEmail || null,
+    mac: metadata?.mac || null,
+    applicationName: metadata?.appName || null,
+    planName: metadata?.planName || null,
+  };
+}
+
+async function markPublicCheckoutState(sessionId, checkoutState, paymentStatus) {
+  const existing = await findPublicCheckoutTransaction(sessionId);
+  if (!existing) return null;
+
+  const metadata = parseJsonValue(existing.metadata, {});
+  return prisma.creditTransaction.update({
+    where: { id: existing.id },
+    data: {
+      status: checkoutState,
+      notes: buildPublicTransactionSummary({
+        plan: { name: metadata?.planName },
+        application: { name: metadata?.appName },
+        mac: metadata?.mac,
+        paymentMethod: metadata?.paymentMethod || "STRIPE_CHECKOUT",
+        checkoutState,
+      }),
+      metadata: JSON.stringify({
+        ...metadata,
+        checkoutState,
+        paymentStatus: paymentStatus || checkoutState,
+      }),
+      processedAt:
+        checkoutState === "FAILED" || checkoutState === "EXPIRED"
+          ? new Date().toISOString()
+          : existing.processedAt,
+    },
+  });
+}
+
+async function processStripeCheckoutSession(session) {
+  const metadata = session?.metadata || {};
+  const gatewaySessionId = session?.id || metadata.gatewaySessionId;
+
+  if (!gatewaySessionId) {
+    throw new Error("Stripe checkout session is missing an id");
+  }
+
+  const existingTransaction = await findPublicCheckoutTransaction(gatewaySessionId);
+  const existingMetadata = parseJsonValue(existingTransaction?.metadata, {});
+
+  if (
+    existingTransaction &&
+    (existingTransaction.status || "").toString().toUpperCase() === "PAID" &&
+    existingMetadata?.activationId
+  ) {
+    return toCheckoutStatusResponse(existingTransaction, "PAID");
+  }
+
+  const { plan, application } = await loadPublicCheckoutContext(
+    metadata.planId || existingMetadata?.planId,
+    metadata.applicationId || existingMetadata?.applicationId,
+  );
+
+  return finalizePublicActivation({
+    plan,
+    application,
+    mac: metadata.mac || existingMetadata?.mac,
+    deviceKey: metadata.deviceKey || existingMetadata?.deviceKey,
+    customerName: metadata.customerName || existingMetadata?.customerName,
+    customerEmail:
+      session?.customer_details?.email ||
+      session?.customer_email ||
+      metadata.customerEmail ||
+      existingMetadata?.customerEmail ||
+      null,
+    paymentMethod: "STRIPE",
+    paymentReference: session?.payment_intent || gatewaySessionId,
+    duration: metadata.duration || existingMetadata?.duration || undefined,
+    paymentStatus: "PAID",
+    gatewaySessionId,
+    existingTransactionId: existingTransaction?.id || null,
+    existingTransactionMetadata: existingMetadata,
+  });
 }
 
 async function ensureDefaultDirectPlans() {
@@ -235,6 +493,8 @@ async function finalizePublicActivation({
   duration,
   paymentStatus = "CONFIRMED",
   gatewaySessionId = null,
+  existingTransactionId = null,
+  existingTransactionMetadata = null,
 }) {
   const normalizedMac = normalizeMac(mac);
   const normalizedDeviceKey = normalizeDeviceKey(deviceKey);
@@ -316,8 +576,12 @@ async function finalizePublicActivation({
     deviceId: device.id,
     applicationId: selectedApplicationId,
     appName: application.name,
+    activationKind: "PAID",
     duration: resolvedDuration,
     expiresAt,
+    trialStartedAt: existingActivation?.trialStartedAt || null,
+    trialEndsAt: existingActivation?.trialEndsAt || null,
+    trialConsumedAt: existingActivation?.trialConsumedAt || null,
     status: "ACTIVE",
     activatedAt,
   };
@@ -330,28 +594,47 @@ async function finalizePublicActivation({
         })
       : await prisma.activatedApp.create({ data: activationData });
 
-  const transaction = await prisma.creditTransaction.create({
-    data: {
-      type: "PUBLIC_PLAN_PURCHASE",
-      status: paymentStatus,
-      amount: Number(plan.price || 0),
-      notes: JSON.stringify({
-        source: "public_landing_page",
-        customerName: customerName || null,
-        customerEmail: customerEmail || null,
-        mac: normalizedMac,
-        deviceKey: normalizedDeviceKey,
-        applicationId: selectedApplicationId,
-        appName: application.name,
-        planId: plan.id,
-        planName: plan.name,
-        paymentMethod,
-        paymentReference,
-        gatewaySessionId,
-      }),
-      processedAt: activatedAt,
-    },
-  });
+  const transactionMetadata = {
+    ...(existingTransactionMetadata || {}),
+    ...buildPublicTransactionMetadata({
+      customerName,
+      customerEmail,
+      mac: normalizedMac,
+      deviceKey: normalizedDeviceKey,
+      application,
+      plan,
+      duration: resolvedDuration,
+      gatewaySessionId,
+      paymentReference,
+      paymentMethod,
+      checkoutState: paymentStatus === "PAID" ? "PAID" : paymentStatus,
+      paymentStatus,
+      activation,
+      device,
+    }),
+  };
+
+  const transactionData = {
+    type: "PUBLIC_PLAN_PURCHASE",
+    status: paymentStatus,
+    amount: Number(plan.price || 0),
+    notes: buildPublicTransactionSummary({
+      plan,
+      application,
+      mac: normalizedMac,
+      paymentMethod,
+      checkoutState: paymentStatus === "PAID" ? "PAID" : paymentStatus,
+    }),
+    metadata: JSON.stringify(transactionMetadata),
+    processedAt: activatedAt,
+  };
+
+  const transaction = existingTransactionId
+    ? await prisma.creditTransaction.update({
+        where: { id: existingTransactionId },
+        data: transactionData,
+      })
+    : await prisma.creditTransaction.create({ data: transactionData });
 
   await safeNotify(async () => {
     await notifyUsersByRole("superadmin", {
@@ -378,7 +661,7 @@ async function finalizePublicActivation({
   };
 }
 
-router.get("/public/payment-config", async (req, res) => {
+router.get("/public/payment-config", publicPricingReadLimiter, async (req, res) => {
   try {
     res.json(getPaymentConfig());
   } catch (err) {
@@ -387,7 +670,33 @@ router.get("/public/payment-config", async (req, res) => {
   }
 });
 
-router.get("/public", async (req, res) => {
+router.get("/public/checkout-status/:sessionId", publicPricingReadLimiter, async (req, res) => {
+  try {
+    const sessionId = (req.params.sessionId || "").toString().trim();
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const transaction = await findPublicCheckoutTransaction(sessionId);
+    if (!transaction) {
+      return res.json({
+        success: true,
+        mode: "redirect",
+        provider: "stripe",
+        activated: false,
+        checkoutState: "PENDING",
+        paymentStatus: "pending",
+      });
+    }
+
+    return res.json(toCheckoutStatusResponse(transaction));
+  } catch (err) {
+    console.error("public checkout status error", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.get("/public", publicPricingReadLimiter, async (req, res) => {
   try {
     const plans = await ensureDefaultDirectPlans();
 
@@ -405,7 +714,7 @@ router.get("/public", async (req, res) => {
   }
 });
 
-router.post("/public/:id/checkout", async (req, res) => {
+router.post("/public/:id/checkout", publicPricingWriteLimiter, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const {
@@ -446,6 +755,17 @@ router.post("/public/:id/checkout", async (req, res) => {
     });
 
     if (checkout.mode === "redirect" && checkout.checkoutUrl) {
+      await createPendingPublicCheckoutTransaction({
+        plan,
+        application,
+        customerName,
+        customerEmail,
+        mac,
+        deviceKey,
+        duration,
+        gatewaySessionId: checkout.sessionId,
+      });
+
       return res.json({
         success: true,
         mode: "redirect",
@@ -462,7 +782,7 @@ router.post("/public/:id/checkout", async (req, res) => {
       deviceKey,
       customerName,
       customerEmail,
-      paymentMethod: "SIMULATED",
+      paymentMethod: "MANUAL_TEST",
       paymentReference: `PUBLIC-${Date.now().toString().slice(-6)}`,
       duration,
       paymentStatus: "CONFIRMED",
@@ -487,62 +807,69 @@ router.post("/public/:id/checkout", async (req, res) => {
   }
 });
 
-router.post("/public/confirm-checkout", async (req, res) => {
+router.post("/public/stripe/webhook", async (req, res) => {
+  try {
+    const stripeSignature = req.headers["stripe-signature"];
+    const event = verifyStripeWebhookEvent(req.body, stripeSignature);
+    const session = event?.data?.object;
+
+    if (event?.type === "checkout.session.completed") {
+      if ((session?.payment_status || "").toString().toLowerCase() === "paid") {
+        await processStripeCheckoutSession(session);
+      }
+    } else if (event?.type === "checkout.session.async_payment_succeeded") {
+      await processStripeCheckoutSession(session);
+    } else if (event?.type === "checkout.session.async_payment_failed") {
+      await markPublicCheckoutState(
+        session?.id,
+        "FAILED",
+        session?.payment_status || "failed",
+      );
+    } else if (event?.type === "checkout.session.expired") {
+      await markPublicCheckoutState(
+        session?.id,
+        "EXPIRED",
+        session?.payment_status || "expired",
+      );
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("stripe webhook error", err);
+    return res.status(400).json({ error: err.message || "Webhook error" });
+  }
+});
+
+router.post("/public/confirm-checkout", publicPricingWriteLimiter, async (req, res) => {
   try {
     const { sessionId } = req.body || {};
     if (!sessionId) {
       return res.status(400).json({ error: "sessionId is required" });
     }
 
-    const verification = await verifyCheckoutSession(sessionId);
-    if (!verification.paid) {
-      return res.status(400).json({
-        error: "The payment has not been completed yet",
-        paymentStatus: verification.paymentStatus,
+    const transaction = await findPublicCheckoutTransaction(sessionId);
+    if (!transaction) {
+      return res.status(404).json({
+        error: "Checkout session was not found. Wait a moment and try again.",
       });
     }
 
-    const metadata = verification.metadata || {};
-    const { plan, application } = await loadPublicCheckoutContext(
-      metadata.planId,
-      metadata.applicationId,
-    );
-
-    const activated = await finalizePublicActivation({
-      plan,
-      application,
-      mac: metadata.mac,
-      deviceKey: metadata.deviceKey,
-      customerName: metadata.customerName || null,
-      customerEmail:
-        verification.customerEmail || metadata.customerEmail || null,
-      paymentMethod: verification.provider.toUpperCase(),
-      paymentReference: verification.sessionId,
-      duration: metadata.duration || undefined,
-      paymentStatus: "PAID",
-      gatewaySessionId: verification.sessionId,
-    });
-
-    return res.json({
-      ...activated,
-      mode: "gateway",
-      provider: verification.provider,
-    });
+    return res.json(toCheckoutStatusResponse(transaction));
   } catch (err) {
-    console.error("confirm public checkout error", err);
-    const statusCode = err.statusCode || 500;
-    if (statusCode >= 500 && process.env.NODE_ENV !== "production") {
-      return res.status(statusCode).json({
-        error: err.message || "Server error",
-        stack: err.stack,
-      });
-    }
-    res.status(statusCode).json({ error: err.message || "Server error" });
+    console.error("confirm public checkout status error", err);
+    res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
-router.post("/public/:id/activate", async (req, res) => {
+router.post("/public/:id/activate", publicPricingWriteLimiter, async (req, res) => {
   try {
+    if (!isManualPaymentTestingEnabled()) {
+      return res.status(403).json({
+        error:
+          "Direct manual activation is disabled. Use the checkout route with Stripe or enable manual payment testing for development.",
+      });
+    }
+
     const id = Number(req.params.id);
     const {
       mac,
@@ -550,7 +877,7 @@ router.post("/public/:id/activate", async (req, res) => {
       applicationId,
       customerName,
       customerEmail,
-      paymentMethod = "CARD",
+      paymentMethod = "MANUAL_TEST",
       paymentReference = `PUBLIC-${Date.now().toString().slice(-6)}`,
       duration,
     } = req.body || {};
@@ -795,12 +1122,16 @@ router.post(
       }
 
       const purchaseNote = `Simulated payment confirmed via ${paymentMethod} • Ref ${paymentReference} • Payer ${payerName} (${payerEmail}) • ${plan.name} • ${creditsToAdd} credits • ${formatMoney(plan)}`;
-      const supportsTx = typeof prisma.$transaction === "function";
+      const ipAddress = (() => {
+        const fwd = req.headers["x-forwarded-for"];
+        if (fwd) { const first = fwd.split(",")[0].trim(); if (first) return first; }
+        return req.socket?.remoteAddress || req.ip || null;
+      })();
 
       let transaction;
       let updatedBalance = Number(reseller.credits || 0);
 
-      if (supportsTx) {
+      {
         const result = await prisma.$transaction(async (tx) => {
           const before = await tx.reseller.findUnique({
             where: { id: resellerId },
@@ -818,6 +1149,7 @@ router.post(
               toResellerId: resellerId,
               performedById: req.user.id,
               notes: purchaseNote,
+              ipAddress,
               toBeforeBalance: Number(before?.credits || 0),
               toAfterBalance: Number(after?.credits || 0),
               processedAt: new Date().toISOString(),
@@ -829,31 +1161,6 @@ router.post(
 
         transaction = result.createdTx;
         updatedBalance = result.updatedBalance;
-      } else {
-        const before = await prisma.reseller.findUnique({
-          where: { id: resellerId },
-        });
-        await prisma.reseller.update({
-          where: { id: resellerId },
-          data: { credits: { increment: creditsToAdd } },
-        });
-        const after = await prisma.reseller.findUnique({
-          where: { id: resellerId },
-        });
-        transaction = await prisma.creditTransaction.create({
-          data: {
-            type: "PLAN_PURCHASE",
-            status: "COMPLETED",
-            amount: creditsToAdd,
-            toResellerId: resellerId,
-            performedById: req.user.id,
-            notes: purchaseNote,
-            toBeforeBalance: Number(before?.credits || 0),
-            toAfterBalance: Number(after?.credits || 0),
-            processedAt: new Date().toISOString(),
-          },
-        });
-        updatedBalance = Number(after?.credits || 0);
       }
 
       await safeNotify(async () => {

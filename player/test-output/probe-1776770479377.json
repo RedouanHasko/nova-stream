@@ -1,0 +1,66 @@
+{
+  "url": "http://line.dndnscloud.ru/live/beff5baba4/b293e5db9467/645152.m3u8",
+  "ts": "2026-04-21T11:21:19.376Z",
+  "results": [
+    {
+      "profile": "browser",
+      "tookMs": 224,
+      "status": 458,
+      "headers": {
+        "server": "nginx",
+        "date": "Tue, 21 Apr 2026 11:21:18 GMT",
+        "content-type": "text/html; charset=UTF-8",
+        "transfer-encoding": "chunked",
+        "connection": "keep-alive",
+        "access-control-allow-origin": "*"
+      },
+      "preview": "",
+      "got": false
+    },
+    {
+      "profile": "vlc",
+      "tookMs": 235,
+      "status": 458,
+      "headers": {
+        "server": "nginx",
+        "date": "Tue, 21 Apr 2026 11:21:18 GMT",
+        "content-type": "text/html; charset=UTF-8",
+        "transfer-encoding": "chunked",
+        "connection": "keep-alive",
+        "access-control-allow-origin": "*"
+      },
+      "preview": "",
+      "got": false
+    },
+    {
+      "profile": "ffmpeg",
+      "tookMs": 148,
+      "status": 458,
+      "headers": {
+        "server": "nginx",
+        "date": "Tue, 21 Apr 2026 11:21:18 GMT",
+        "content-type": "text/html; charset=UTF-8",
+        "transfer-encoding": "chunked",
+        "connection": "keep-alive",
+        "access-control-allow-origin": "*"
+      },
+      "preview": "",
+      "got": false
+    },
+    {
+      "profile": "mobile",
+      "tookMs": 223,
+      "status": 458,
+      "headers": {
+        "server": "nginx",
+        "date": "Tue, 21 Apr 2026 11:21:18 GMT",
+        "content-type": "text/html; charset=UTF-8",
+        "transfer-encoding": "chunked",
+        "connection": "keep-alive",
+        "access-control-allow-origin": "*"
+      },
+      "preview": "",
+      "got": false
+    }
+  ]
+}

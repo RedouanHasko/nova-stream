@@ -1,7 +1,15 @@
 const express = require("express");
 const router = express.Router();
 const prisma = require("../db");
+const { buildDeviceProfilePatch, sanitizeDeviceProfile } = require("../lib/device-profile");
 const { auth, requireRole } = require("../middleware/auth");
+const {
+  createPublicActivationGuard,
+  logSecurityEvent,
+} = require("../lib/security-monitor");
+
+const verifyActivationGuard = createPublicActivationGuard("verify-activation");
+const startTrialGuard = createPublicActivationGuard("start-trial");
 
 async function getAppCatalog() {
   try {
@@ -32,6 +40,114 @@ function computeExpiryDate(duration) {
   const expiresAt = new Date();
   expiresAt.setFullYear(expiresAt.getFullYear() + 1);
   return expiresAt.toISOString();
+}
+
+function computeTrialExpiryDate(durationDays = 7) {
+  const safeDuration = Math.min(Math.max(Number(durationDays) || 7, 1), 30);
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + safeDuration);
+  return expiresAt.toISOString();
+}
+
+function normalizeTrialDurationDays(value, fallback = 7) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(Math.trunc(parsed), 1), 30);
+}
+
+function getActivationKind(activation) {
+  return (activation?.activationKind || "PAID").toString().trim().toUpperCase();
+}
+
+function isTrialActivation(activation) {
+  return getActivationKind(activation) === "TRIAL";
+}
+
+function getTrialDurationDaysForApplication(application) {
+  return normalizeTrialDurationDays(application?.trialDurationDays, 7);
+}
+
+async function resolveTargetApplication({ applicationId, appName } = {}) {
+  if (
+    applicationId !== undefined &&
+    applicationId !== null &&
+    applicationId !== "" &&
+    !Number.isNaN(Number(applicationId))
+  ) {
+    return prisma.application.findUnique({
+      where: { id: Number(applicationId) },
+    });
+  }
+
+  if (appName) {
+    const exactMatch = await prisma.application.findFirst({
+      where: { name: appName.toString().trim() },
+    });
+    if (exactMatch) return exactMatch;
+
+    const activeApps = await prisma.application.findMany({
+      where: { status: "ACTIVE" },
+      orderBy: { name: "asc" },
+    });
+
+    const normalizedName = appName.toString().trim().toLowerCase();
+    return (
+      activeApps.find(
+        (item) => (item?.name || "").toString().trim().toLowerCase() === normalizedName,
+      ) || null
+    );
+  }
+
+  const activeApps = await prisma.application.findMany({
+    where: { status: "ACTIVE" },
+    orderBy: { name: "asc" },
+  });
+
+  return activeApps.length === 1 ? activeApps[0] : null;
+}
+
+function buildTrialState(application, activations = []) {
+  const trialActivation = activations.find(isTrialActivation) || null;
+  const trialStatus = trialActivation
+    ? getResolvedActivationStatus(trialActivation)
+    : "NOT_STARTED";
+  const trialDurationDays = getTrialDurationDaysForApplication(application);
+  const trialEnabled = application ? application.trialEnabled !== false : false;
+  const isTrialActive =
+    !!trialActivation && trialStatus === "ACTIVE" && isTrialActivation(trialActivation);
+  const consumed =
+    !!trialActivation ||
+    activations.some(
+      (activation) =>
+        !!activation?.trialConsumedAt ||
+        !!activation?.trialStartedAt ||
+        isTrialActivation(activation),
+    );
+
+  const expiresAt =
+    trialActivation?.trialEndsAt || trialActivation?.expiresAt || null;
+  const startedAt =
+    trialActivation?.trialStartedAt || trialActivation?.activatedAt || null;
+  const remainingDays =
+    isTrialActive && expiresAt
+      ? Math.max(
+          0,
+          Math.ceil((new Date(expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)),
+        )
+      : 0;
+
+  return {
+    enabled: trialEnabled,
+    durationDays: trialDurationDays,
+    consumed,
+    available: trialEnabled && !consumed,
+    eligible: trialEnabled && !consumed,
+    active: isTrialActive,
+    status: trialStatus,
+    startedAt,
+    expiresAt,
+    remainingDays,
+  };
 }
 
 function isExpiredByDate(activation) {
@@ -272,6 +388,7 @@ async function buildActivationVerification(
   deviceKey,
   applicationId,
   appName,
+  deviceProfile,
 ) {
   const normalizedMac = normalizeMac(mac);
   const normalizedKey = normalizeDeviceKey(deviceKey);
@@ -291,10 +408,12 @@ async function buildActivationVerification(
   });
 
   if (!device) {
+    const normalizedProfile = sanitizeDeviceProfile(deviceProfile);
     device = await prisma.device.create({
       data: {
         mac: normalizedMac,
         deviceKey: normalizedKey,
+        ...(normalizedProfile || {}),
         status: "INACTIVE",
       },
     });
@@ -302,6 +421,14 @@ async function buildActivationVerification(
     device = await prisma.device.update({
       where: { id: device.id },
       data: { deviceKey: normalizedKey },
+    });
+  }
+
+  const deviceProfilePatch = buildDeviceProfilePatch(device, deviceProfile);
+  if (deviceProfilePatch) {
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: deviceProfilePatch,
     });
   }
 
@@ -322,6 +449,7 @@ async function buildActivationVerification(
       device: {
         id: device.id,
         mac: device.mac,
+        deviceKey: device.deviceKey,
         status: device.status,
         createdAt: device.createdAt,
         updatedAt: device.updatedAt,
@@ -333,6 +461,11 @@ async function buildActivationVerification(
 
   await refreshActivationStates({ deviceId: device.id });
   device = await prisma.device.findUnique({ where: { id: device.id } });
+
+  const targetApplication = await resolveTargetApplication({
+    applicationId,
+    appName,
+  });
 
   let activations = await prisma.activatedApp.findMany({
     where: { deviceId: device.id },
@@ -362,6 +495,13 @@ async function buildActivationVerification(
   const hasExpiredActivations = activations.some(
     (activation) => getResolvedActivationStatus(activation) === "EXPIRED",
   );
+  const activeTrialActivation = activeActivations.find(isTrialActivation) || null;
+  const expiredTrialActivation = activations.find(
+    (activation) =>
+      isTrialActivation(activation) &&
+      getResolvedActivationStatus(activation) === "EXPIRED",
+  );
+  const trialState = buildTrialState(targetApplication, activations);
   const blocked = isDeviceBlocked(device);
   const playlists =
     !blocked && activeActivations.length > 0
@@ -375,9 +515,13 @@ async function buildActivationVerification(
     activated: !blocked && activeActivations.length > 0,
     reason: blocked
       ? "blocked"
-      : activeActivations.length > 0
+      : activeTrialActivation
+        ? "trial_active"
+        : activeActivations.length > 0
         ? "active"
-        : hasExpiredActivations
+        : expiredTrialActivation
+          ? "trial_expired"
+          : hasExpiredActivations
           ? "expired"
           : "not_activated",
     device: {
@@ -385,6 +529,11 @@ async function buildActivationVerification(
       mac: device.mac,
       deviceKey: device.deviceKey,
       ownerResellerId: device.ownerResellerId ?? null,
+      platform: device.platform ?? null,
+      deviceName: device.deviceName ?? null,
+      osVersion: device.osVersion ?? null,
+      identitySource: device.identitySource ?? null,
+      deviceInfo: safeJsonParse(device.deviceInfo),
       status: device.status,
       createdAt: device.createdAt,
       updatedAt: device.updatedAt,
@@ -393,19 +542,166 @@ async function buildActivationVerification(
       id: activation.id,
       applicationId: activation.applicationId,
       appName: activation.appName,
+      activationKind: getActivationKind(activation),
       duration: activation.duration || "1_year",
       activatedAt: activation.activatedAt,
       expiresAt: activation.expiresAt || null,
+      trialStartedAt: activation.trialStartedAt || null,
+      trialEndsAt: activation.trialEndsAt || null,
+      trialConsumedAt: activation.trialConsumedAt || null,
       status: getResolvedActivationStatus(activation),
     })),
+    trial: trialState,
     playlists,
   };
+}
+
+async function startFreeTrial({
+  mac,
+  deviceKey,
+  applicationId,
+  appName,
+  deviceProfile,
+}) {
+  const normalizedMac = normalizeMac(mac);
+  const normalizedKey = normalizeDeviceKey(deviceKey);
+
+  if (!normalizedMac || !normalizedKey) {
+    const error = new Error("mac and deviceKey required");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const targetApplication = await resolveTargetApplication({
+    applicationId,
+    appName,
+  });
+
+  if (!targetApplication) {
+    const error = new Error("application not found for trial activation");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  let device = await prisma.device.findUnique({ where: { mac: normalizedMac } });
+  if (!device) {
+    const normalizedProfile = sanitizeDeviceProfile(deviceProfile);
+    device = await prisma.device.create({
+      data: {
+        mac: normalizedMac,
+        deviceKey: normalizedKey,
+        ...(normalizedProfile || {}),
+        status: "INACTIVE",
+      },
+    });
+  } else if (!device.deviceKey) {
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: { deviceKey: normalizedKey },
+    });
+  }
+
+  const deviceProfilePatch = buildDeviceProfilePatch(device, deviceProfile);
+  if (deviceProfilePatch) {
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: deviceProfilePatch,
+    });
+  }
+
+  if (normalizeDeviceKey(device.deviceKey) !== normalizedKey) {
+    return buildActivationVerification(
+      normalizedMac,
+      normalizedKey,
+      applicationId,
+      appName,
+      deviceProfile,
+    );
+  }
+
+  if (isDeviceBlocked(device)) {
+    return buildActivationVerification(
+      normalizedMac,
+      normalizedKey,
+      applicationId,
+      appName,
+      deviceProfile,
+    );
+  }
+
+  await refreshActivationStates({
+    deviceId: device.id,
+    applicationId: targetApplication.id,
+  });
+
+  const activations = await prisma.activatedApp.findMany({
+    where: {
+      deviceId: device.id,
+      applicationId: targetApplication.id,
+    },
+    orderBy: { activatedAt: "desc" },
+  });
+
+  const currentTrialState = buildTrialState(targetApplication, activations);
+  console.log("[startFreeTrial] app:", targetApplication?.id, "trialEnabled:", targetApplication?.trialEnabled, "trialState:", JSON.stringify(currentTrialState), "activations:", activations.length);
+  if (!targetApplication.trialEnabled || !currentTrialState.available) {
+    console.log("[startFreeTrial] BLOCKED by trialEnabled/available gate");
+    return buildActivationVerification(
+      normalizedMac,
+      normalizedKey,
+      targetApplication.id,
+      targetApplication.name,
+      deviceProfile,
+    );
+  }
+
+  if (activations.length > 0) {
+    console.log("[startFreeTrial] BLOCKED by activations.length > 0");
+    return buildActivationVerification(
+      normalizedMac,
+      normalizedKey,
+      targetApplication.id,
+      targetApplication.name,
+      deviceProfile,
+    );
+  }
+
+  const trialStartedAt = new Date().toISOString();
+  const trialEndsAt = computeTrialExpiryDate(
+    getTrialDurationDaysForApplication(targetApplication),
+  );
+
+  await prisma.activatedApp.create({
+    data: {
+      deviceId: device.id,
+      applicationId: targetApplication.id,
+      appName: targetApplication.name,
+      activationKind: "TRIAL",
+      duration: `${getTrialDurationDaysForApplication(targetApplication)}_days_trial`,
+      expiresAt: trialEndsAt,
+      trialStartedAt,
+      trialEndsAt,
+      trialConsumedAt: trialStartedAt,
+      status: "ACTIVE",
+      activatedAt: trialStartedAt,
+    },
+  });
+
+  await syncDeviceStatus(device.id);
+
+  return buildActivationVerification(
+    normalizedMac,
+    normalizedKey,
+    targetApplication.id,
+    targetApplication.name,
+    deviceProfile,
+  );
 }
 
 async function handleVerifyActivation(req, res) {
   try {
     const payload = req.method === "GET" ? req.query : req.body;
-    const { mac, deviceKey, applicationId, appName } = payload || {};
+    const { mac, deviceKey, applicationId, appName, deviceProfile } = payload || {};
     if (!mac || !deviceKey) {
       return res.status(400).json({ error: "mac and deviceKey required" });
     }
@@ -415,7 +711,20 @@ async function handleVerifyActivation(req, res) {
       deviceKey,
       applicationId,
       appName,
+      deviceProfile,
     );
+
+    if (result?.reason === "device_key_mismatch") {
+      logSecurityEvent("device_key_mismatch", req, {
+        mac: normalizeMac(mac),
+        applicationId:
+          applicationId !== undefined && applicationId !== null && applicationId !== ""
+            ? Number(applicationId)
+            : null,
+        appName: (appName || "").toString().trim() || null,
+      });
+    }
+
     return res.json(result);
   } catch (err) {
     console.error(err);
@@ -454,6 +763,8 @@ router.get(
           { mac: { contains: search, mode: "insensitive" } },
           { deviceKey: { contains: search, mode: "insensitive" } },
           { domainUrl: { contains: search, mode: "insensitive" } },
+          { deviceName: { contains: search, mode: "insensitive" } },
+          { platform: { contains: search, mode: "insensitive" } },
         ];
       }
 
@@ -506,6 +817,7 @@ router.post(
         deviceKey,
         ownerResellerId: providedOwner,
         domainUrl,
+        deviceProfile,
       } = req.body;
       const normalizedMac = normalizeMac(mac);
       const normalizedDeviceKey = normalizeDeviceKey(deviceKey);
@@ -532,12 +844,15 @@ router.post(
         }
       }
 
+      const normalizedProfile = sanitizeDeviceProfile(deviceProfile);
+
       const created = await prisma.device.create({
         data: {
           mac: normalizedMac,
           deviceKey: normalizedDeviceKey || null,
           ownerResellerId,
           domainUrl,
+          ...(normalizedProfile || {}),
         },
       });
       res.json(created);
@@ -596,6 +911,11 @@ router.put(
       if (data.deviceKey !== undefined) {
         const normalizedDeviceKey = normalizeDeviceKey(data.deviceKey);
         data.deviceKey = normalizedDeviceKey || null;
+      }
+      const deviceProfilePatch = buildDeviceProfilePatch(existing, data.deviceProfile);
+      delete data.deviceProfile;
+      if (deviceProfilePatch) {
+        Object.assign(data, deviceProfilePatch);
       }
       if (role !== "superadmin") {
         delete data.status;
@@ -742,8 +1062,99 @@ router.post(
   },
 );
 
-router.get("/verify-activation", handleVerifyActivation);
-router.post("/verify-activation", handleVerifyActivation);
+router.get("/verify-activation", verifyActivationGuard, handleVerifyActivation);
+router.post("/verify-activation", verifyActivationGuard, handleVerifyActivation);
+
+router.post("/update-key", async (req, res) => {
+  try {
+    const { mac, currentDeviceKey, newDeviceKey } = req.body || {};
+    const normalizedMac = normalizeMac(mac);
+    const normalizedCurrentKey = normalizeDeviceKey(currentDeviceKey);
+    const normalizedNewKey = normalizeDeviceKey(newDeviceKey);
+
+    if (!normalizedMac || !normalizedCurrentKey || !normalizedNewKey) {
+      return res.status(400).json({
+        error: "mac, currentDeviceKey and newDeviceKey are required",
+      });
+    }
+
+    if (normalizedCurrentKey === normalizedNewKey) {
+      return res.status(400).json({
+        error: "New device key must be different from current key",
+      });
+    }
+
+    if (!/^\d{8}$/.test(normalizedNewKey)) {
+      return res.status(400).json({
+        error: "New device key must be exactly 8 digits",
+      });
+    }
+
+    let device = await prisma.device.findUnique({ where: { mac: normalizedMac } });
+    if (!device) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    if (!device.deviceKey) {
+      return res.status(409).json({
+        error: "This device does not have a key yet",
+      });
+    }
+
+    if (normalizeDeviceKey(device.deviceKey) !== normalizedCurrentKey) {
+      return res.status(403).json({ error: "Current device key is incorrect" });
+    }
+
+    if (device.ownerResellerId) {
+      return res.status(403).json({
+        error:
+          "This device is managed by a reseller account. Change the key from the reseller panel.",
+      });
+    }
+
+    const existingByNewKey = await prisma.device.findUnique({
+      where: { deviceKey: normalizedNewKey },
+    });
+
+    if (existingByNewKey && Number(existingByNewKey.id) !== Number(device.id)) {
+      return res.status(409).json({
+        error: "That new device key is already linked to another MAC address",
+      });
+    }
+
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: { deviceKey: normalizedNewKey },
+    });
+
+    return res.json({
+      success: true,
+      message: "Device key updated successfully",
+      device: {
+        id: device.id,
+        mac: device.mac,
+        status: device.status,
+        updatedAt: device.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("update-key error", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/start-trial", startTrialGuard, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const result = await startFreeTrial(payload);
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(err.statusCode || 500).json({
+      error: err.message || "Server error",
+    });
+  }
+});
 
 // Get app catalog
 router.get("/catalog", auth, async (req, res) => {
@@ -1279,6 +1690,76 @@ router.post(
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Admin/Reseller: change device key without requiring the current key
+router.post(
+  "/admin-change-key",
+  auth,
+  requireRole("superadmin", "reseller", "subreseller"),
+  async (req, res) => {
+    try {
+      const { mac, newDeviceKey } = req.body;
+      const normalizedMac = normalizeMac(mac);
+      const normalizedNewKey = normalizeDeviceKey(newDeviceKey || "");
+
+      if (!normalizedMac) {
+        return res.status(400).json({ error: "mac required" });
+      }
+      if (!normalizedNewKey) {
+        return res.status(400).json({ error: "newDeviceKey required" });
+      }
+      if (normalizedNewKey.length < 4 || normalizedNewKey.length > 20) {
+        return res
+          .status(400)
+          .json({ error: "Device key must be between 4 and 20 characters" });
+      }
+
+      const device = await prisma.device.findUnique({
+        where: { mac: normalizedMac },
+      });
+      if (!device) {
+        return res.status(404).json({ error: "Device not found" });
+      }
+
+      const role = (req.user.role || "").toString().toLowerCase();
+      if (
+        role !== "superadmin" &&
+        device.ownerResellerId !== req.user.resellerId
+      ) {
+        return res.status(403).json({ error: "You don't own this device" });
+      }
+
+      // Ensure new key not already used by a different device
+      const existingByNewKey = await prisma.device.findUnique({
+        where: { deviceKey: normalizedNewKey },
+      });
+      if (existingByNewKey && Number(existingByNewKey.id) !== Number(device.id)) {
+        return res.status(409).json({
+          error: "That device key is already linked to another MAC address",
+        });
+      }
+
+      const updated = await prisma.device.update({
+        where: { id: device.id },
+        data: { deviceKey: normalizedNewKey },
+      });
+
+      return res.json({
+        success: true,
+        message: "Device key updated successfully",
+        device: {
+          id: updated.id,
+          mac: updated.mac,
+          deviceKey: updated.deviceKey,
+          updatedAt: updated.updatedAt,
+        },
+      });
+    } catch (err) {
+      console.error("admin-change-key error", err);
+      return res.status(500).json({ error: "Server error" });
     }
   },
 );

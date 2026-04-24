@@ -51,3 +51,199 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.3);
 }
+
+/* ---------------------------------------------------------------------------
+ * 10-foot / TV mode  (set by main.tsx when coarse pointer / TV UA detected)
+ * --------------------------------------------------------------------------- */
+[data-tv="true"] {
+  font-size: 115%;
+  letter-spacing: 0.01em;
+}
+
+[data-tv="true"] button,
+[data-tv="true"] a {
+  min-height: 48px;
+  min-width: 48px;
+}
+
+/* Focus ring for TV remote navigation — high-visibility outline */
+[data-tv="true"] button:focus-visible,
+[data-tv="true"] a:focus-visible,
+[data-tv="true"] [tabindex]:focus-visible {
+  outline: 3px solid var(--primary-color);
+  outline-offset: 2px;
+  border-radius: 8px;
+  box-shadow: 0 0 0 6px rgba(var(--primary-rgb), 0.25);
+  z-index: 10;
+  position: relative;
+}
+
+/* TV-focused item scale (remote-selected item pops) */
+[data-tv="true"] .tv-focused {
+  outline: 3px solid var(--primary-color);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgba(var(--primary-rgb), 0.3);
+  transform: scale(1.04);
+  z-index: 10;
+  position: relative;
+}
+
+/* Disable hover effects on TV (no mouse cursor) */
+[data-tv="true"] *:hover {
+  /* Reset hover transforms so only focus-visible matters */
+}
+
+/* Reduce motion on TV (often slow GPUs) */
+[data-tv="true"] * {
+  animation-duration: 0.15s !important;
+  transition-duration: 0.15s !important;
+}
+
+/* Disable expensive GPU effects on TV hardware */
+[data-tv="true"] .backdrop-blur-md,
+[data-tv="true"] .backdrop-blur-sm,
+[data-tv="true"] .backdrop-blur-lg,
+[data-tv="true"] .backdrop-blur-xl {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  background-color: rgba(0, 0, 0, 0.85) !important;
+}
+
+/* Disable box-shadow on TV to reduce compositor work */
+[data-tv="true"] .shadow-lg,
+[data-tv="true"] .shadow-xl,
+[data-tv="true"] .shadow-2xl {
+  box-shadow: none !important;
+}
+
+[data-tv="true"] .nova-control-btn,
+[data-tv="true"] .nova-control-btn-primary,
+[data-tv="true"] .nova-control-pill {
+  min-width: 52px;
+  min-height: 52px;
+}
+
+[data-tv="true"] .nova-player-range {
+  height: 8px;
+}
+
+[data-tv="true"] .nova-player-range::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+}
+
+[data-tv="true"] .nova-player-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+}
+
+/* Optimize scroll containers on TV */
+[data-tv="true"] .overflow-y-auto,
+[data-tv="true"] .overflow-x-auto {
+  -webkit-overflow-scrolling: auto;
+  scroll-behavior: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01s !important;
+    transition-duration: 0.01s !important;
+  }
+}
+
+/* Hide scrollbars on TV */
+[data-tv="true"] ::-webkit-scrollbar {
+  display: none;
+}
+
+[data-tv="true"] {
+  scrollbar-width: none;
+}
+
+.nova-subtitle-overlay {
+  color: var(--subtitle-color, #ffffff);
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.48));
+  text-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.9),
+    0 8px 24px rgba(0, 0, 0, 0.7);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(6px);
+}
+
+.nova-player-chip {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(14, 14, 14, 0.78), rgba(6, 6, 6, 0.92));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(10px);
+}
+
+.nova-control-btn {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+}
+
+.nova-control-btn-primary {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(238, 238, 238, 0.9));
+  color: #050505;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.34);
+}
+
+.nova-control-pill {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+}
+
+.nova-skip-indicator {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(180deg, rgba(10, 10, 10, 0.84), rgba(0, 0, 0, 0.92));
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(12px);
+}
+
+.nova-player-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(var(--primary-rgb), 0.92), rgba(255, 255, 255, 0.3));
+}
+
+.nova-player-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: #fff;
+  border: 2px solid rgba(var(--primary-rgb), 0.95);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.nova-player-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: #fff;
+  border: 2px solid rgba(var(--primary-rgb), 0.95);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.nova-video-surface {
+  transform: translateZ(0);
+  will-change: transform;
+}
+
+.nova-player-fade {
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.72) 0%,
+    transparent 30%,
+    transparent 68%,
+    rgba(0, 0, 0, 0.88) 100%
+  );
+}

@@ -1,6 +1,7 @@
 import { motion } from "motion/react";
-import { LucideIcon, Loader2 } from "lucide-react";
+import { LucideIcon } from "lucide-react";
 import { cn } from "../lib/utils";
+import { forwardRef } from "react";
 
 interface TileProps {
   icon: LucideIcon;
@@ -10,9 +11,10 @@ interface TileProps {
   className?: string;
   large?: boolean;
   isLoading?: boolean;
+  loadProgress?: number;
 }
 
-export default function Tile({
+const Tile = forwardRef<HTMLButtonElement, TileProps>(function Tile({
   icon: Icon,
   label,
   subLabel,
@@ -20,40 +22,60 @@ export default function Tile({
   className,
   large,
   isLoading,
-}: TileProps) {
+  loadProgress = 0,
+}, ref) {
+  const clampedProgress = Math.max(0, Math.min(100, loadProgress));
+  const showLoadingState = isLoading || clampedProgress > 0;
+  const showLoadingLabel = isLoading || (clampedProgress > 0 && clampedProgress < 100);
+
   return (
     <motion.button
+      ref={ref as any}
       whileHover={{ scale: 1.05 }}
       whileTap={{ scale: 0.95 }}
       onClick={onClick}
+      tabIndex={0}
       className={cn(
-        "flex flex-col items-center justify-center gap-2 rounded-xl transition-all duration-200",
-        "border border-white/10 shadow-lg shadow-black/40",
+        "relative overflow-hidden flex flex-col items-center justify-center gap-2 rounded-xl transition-all duration-200",
+        "border border-white/10 shadow-lg shadow-black/40 backdrop-blur-md",
         large ? "aspect-square w-full" : "aspect-video w-full",
         className,
       )}
-      style={{ backgroundColor: "rgba(var(--primary-rgb), 0.8)" }}
+      style={{ backgroundColor: "rgba(255,255,255,0.04)" }}
     >
-      {isLoading ? (
-        <Loader2
-          className={cn(
-            "text-white animate-spin",
-            large ? "w-12 h-12" : "w-6 h-6",
-          )}
+      <div className="absolute inset-0 bg-white/[0.03]" />
+      <motion.div
+        className="absolute inset-x-0 bottom-0 overflow-hidden"
+        initial={false}
+        animate={{ height: `${clampedProgress}%`, opacity: showLoadingState ? 1 : 0 }}
+        transition={{ type: "spring", stiffness: 140, damping: 22 }}
+        style={{ backgroundColor: "rgba(var(--primary-rgb), 0.72)" }}
+      >
+        <motion.div
+          className="absolute inset-x-0 top-0 h-px bg-white/30"
+          animate={{ x: ["-10%", "10%", "-10%"] }}
+          transition={{ duration: 2.8, repeat: Infinity, ease: "easeInOut" }}
         />
-      ) : (
-        <Icon className={cn("text-white", large ? "w-16 h-16" : "w-8 h-8")} />
-      )}
-      <div className="flex flex-col items-center">
+      </motion.div>
+
+      <div className="absolute inset-0 bg-black/10" />
+
+      <Icon
+        className={cn(
+          "relative z-10 text-white drop-shadow-[0_4px_14px_rgba(0,0,0,0.35)]",
+          large ? "w-16 h-16" : "w-8 h-8",
+        )}
+      />
+      <div className="relative z-10 flex flex-col items-center">
         <span
           className={cn(
-            "font-semibold tracking-wide",
+            "font-semibold tracking-wide text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.35)]",
             large ? "text-2xl" : "text-lg",
           )}
         >
           {label}
         </span>
-        {isLoading ? (
+        {showLoadingLabel ? (
           <span className="text-[10px] opacity-60 font-medium uppercase tracking-widest">
             Loading...
           </span>
@@ -65,4 +87,6 @@ export default function Tile({
       </div>
     </motion.button>
   );
-}
+});
+
+export default Tile;

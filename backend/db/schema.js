@@ -38,6 +38,8 @@ function applySchema(db, { ensureColumn, ensureIndex, persist }) {
       toAfterBalance REAL,
       performedById INTEGER,
       notes TEXT,
+      ipAddress TEXT,
+      metadata TEXT,
       createdAt TEXT DEFAULT (datetime('now')),
       processedAt TEXT
     );
@@ -58,8 +60,12 @@ function applySchema(db, { ensureColumn, ensureIndex, persist }) {
       deviceId INTEGER,
       applicationId INTEGER,
       appName TEXT,
+      activationKind TEXT DEFAULT 'PAID',
       duration TEXT DEFAULT '1_year',
       expiresAt TEXT,
+      trialStartedAt TEXT,
+      trialEndsAt TEXT,
+      trialConsumedAt TEXT,
       status TEXT DEFAULT 'ACTIVE',
       activatedAt TEXT DEFAULT (datetime('now'))
     );
@@ -69,6 +75,9 @@ function applySchema(db, { ensureColumn, ensureIndex, persist }) {
       name TEXT UNIQUE NOT NULL,
       logoUrl TEXT,
       description TEXT,
+      downloadUrl TEXT,
+      trialEnabled INTEGER DEFAULT 1,
+      trialDurationDays INTEGER DEFAULT 7,
       status TEXT DEFAULT 'ACTIVE',
       createdAt TEXT DEFAULT (datetime('now')),
       updatedAt TEXT DEFAULT (datetime('now'))
@@ -174,8 +183,12 @@ function applySchema(db, { ensureColumn, ensureIndex, persist }) {
 
   ensureColumn("devices", "deviceKey", "TEXT");
   ensureColumn("activatedApps", "applicationId", "INTEGER");
+  ensureColumn("activatedApps", "activationKind", "TEXT DEFAULT 'PAID'");
   ensureColumn("activatedApps", "duration", "TEXT DEFAULT '1_year'");
   ensureColumn("activatedApps", "expiresAt", "TEXT");
+  ensureColumn("activatedApps", "trialStartedAt", "TEXT");
+  ensureColumn("activatedApps", "trialEndsAt", "TEXT");
+  ensureColumn("activatedApps", "trialConsumedAt", "TEXT");
   ensureColumn("activatedApps", "status", "TEXT DEFAULT 'ACTIVE'");
   ensureColumn("creditTransactions", "fromResellerId", "INTEGER");
   ensureColumn("creditTransactions", "fromBeforeBalance", "REAL");
@@ -186,11 +199,15 @@ function applySchema(db, { ensureColumn, ensureIndex, persist }) {
   ensureColumn("creditTransactions", "performedById", "INTEGER");
   ensureColumn("creditTransactions", "notes", "TEXT");
   ensureColumn("creditTransactions", "processedAt", "TEXT");
+  ensureColumn("creditTransactions", "ipAddress", "TEXT");
+  ensureColumn("creditTransactions", "metadata", "TEXT");
   ensureColumn("users", "phone", "TEXT");
   ensureColumn("resellers", "phone", "TEXT");
   ensureColumn("applications", "logoUrl", "TEXT");
   ensureColumn("applications", "description", "TEXT");
   ensureColumn("applications", "downloadUrl", "TEXT");
+  ensureColumn("applications", "trialEnabled", "INTEGER DEFAULT 1");
+  ensureColumn("applications", "trialDurationDays", "INTEGER DEFAULT 7");
   ensureColumn("applications", "status", "TEXT DEFAULT 'ACTIVE'");
   ensureColumn("applications", "createdAt", "TEXT DEFAULT (datetime('now'))");
   ensureColumn("applications", "updatedAt", "TEXT DEFAULT (datetime('now'))");

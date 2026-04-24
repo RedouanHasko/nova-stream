@@ -12,6 +12,7 @@ import {
   LogOut,
   X,
   LayoutGrid,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { motion } from "motion/react";
@@ -52,6 +53,12 @@ const navigation = [
     href: "/credits",
     icon: CreditCard,
     roles: ["superadmin", "reseller", "subreseller"],
+  },
+  {
+    name: "Audit Logs",
+    href: "/audit-logs",
+    icon: ShieldCheck,
+    roles: ["superadmin"],
   },
   {
     name: "Settings",

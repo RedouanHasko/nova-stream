@@ -23,10 +23,11 @@ import {
   UserCircle,
 } from "lucide-react";
 import React, { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useI18n } from "../contexts/I18nContext";
 import {
   getDeviceFeed,
+  updateDeviceKey,
   verifyActivation,
   type ActivationCheckResponse,
 } from "../lib/api";
@@ -34,6 +35,7 @@ import {
 export default function ManagePlaylists() {
   const { t } = useI18n();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [macAddress, setMacAddress] = useState("");
   const [deviceKey, setDeviceKey] = useState("");
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -41,6 +43,9 @@ export default function ManagePlaylists() {
   const [isAddPlaylistOpen, setIsAddPlaylistOpen] = useState(false);
   const [isAddXCPlaylistOpen, setIsAddXCPlaylistOpen] = useState(false);
   const [newMacAddress, setNewMacAddress] = useState("");
+  const [newDeviceKey, setNewDeviceKey] = useState("");
+  const [confirmDeviceKey, setConfirmDeviceKey] = useState("");
+  const [isUpdatingDeviceKey, setIsUpdatingDeviceKey] = useState(false);
   const [isCaptchaChecked, setIsCaptchaChecked] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [activationResult, setActivationResult] =
@@ -58,6 +63,13 @@ export default function ManagePlaylists() {
     const timeoutId = window.setTimeout(() => setNotice(null), 4000);
     return () => window.clearTimeout(timeoutId);
   }, [notice]);
+
+  useEffect(() => {
+    const macFromQuery = searchParams.get("mac");
+    if (macFromQuery) {
+      setMacAddress(formatMacAddress(macFromQuery));
+    }
+  }, [searchParams]);
 
   const formatMacAddress = (value: string) => {
     const hexOnly = value.replace(/[^a-fA-F0-9]/g, "").toUpperCase();
@@ -123,9 +135,50 @@ export default function ManagePlaylists() {
     setMacAddress("");
     setDeviceKey("");
     setNewMacAddress("");
+    setNewDeviceKey("");
+    setConfirmDeviceKey("");
     setIsCaptchaChecked(false);
     setActivationResult(null);
     setDeviceFeed(null);
+  };
+
+  const handleUpdateDeviceKey = async () => {
+    if (!macAddress || !deviceKey) {
+      setNotice("MAC address and current device key are required.");
+      return;
+    }
+
+    if (!/^\d{8}$/.test(newDeviceKey)) {
+      setNotice("New device key must be exactly 8 digits.");
+      return;
+    }
+
+    if (newDeviceKey !== confirmDeviceKey) {
+      setNotice("New device key confirmation does not match.");
+      return;
+    }
+
+    if (newDeviceKey === deviceKey) {
+      setNotice("New device key must be different from current key.");
+      return;
+    }
+
+    setIsUpdatingDeviceKey(true);
+    try {
+      await updateDeviceKey({
+        mac: macAddress,
+        currentDeviceKey: deviceKey,
+        newDeviceKey,
+      });
+      setDeviceKey(newDeviceKey);
+      setNewDeviceKey("");
+      setConfirmDeviceKey("");
+      setNotice("Device key updated successfully. Use the new key next login.");
+    } catch (error: any) {
+      setNotice(error?.message || "Unable to update device key right now.");
+    } finally {
+      setIsUpdatingDeviceKey(false);
+    }
   };
 
   const showNotice = (message: string) => {
@@ -296,27 +349,12 @@ export default function ManagePlaylists() {
                   <label className="text-xs font-bold text-gray-400 uppercase tracking-widest">
                     Current Device Key
                   </label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={deviceKey}
-                      onChange={(e) => setDeviceKey(e.target.value)}
-                      className="flex-1 bg-gray-50 border-none rounded-xl px-5 py-3.5 font-mono text-gray-600 focus:ring-2 focus:ring-red-500/20 transition-all"
-                    />
-                    <button
-                      type="button"
-                      onClick={() =>
-                        showNotice(
-                          "Device key saving will be connected to the backend in the next step.",
-                        )
-                      }
-                      aria-label="Save current device key"
-                      title="Save current device key"
-                      className="bg-gray-100 text-gray-600 px-4 rounded-xl hover:bg-gray-200 transition-all"
-                    >
-                      <Save size={18} />
-                    </button>
-                  </div>
+                  <input
+                    type="password"
+                    value={deviceKey}
+                    onChange={(e) => setDeviceKey(e.target.value)}
+                    className="w-full bg-gray-50 border-none rounded-xl px-5 py-3.5 font-mono text-gray-600 focus:ring-2 focus:ring-red-500/20 transition-all"
+                  />
                 </div>
                 <div className="space-y-2">
                   <label className="text-xs font-bold text-gray-400 uppercase tracking-widest">
@@ -324,20 +362,31 @@ export default function ManagePlaylists() {
                   </label>
                   <input
                     type="password"
-                    placeholder="Enter new key"
+                    value={newDeviceKey}
+                    onChange={(e) => setNewDeviceKey(e.target.value)}
+                    placeholder="Enter new 8-digit key"
+                    className="w-full bg-gray-50 border-none rounded-xl px-5 py-3.5 focus:ring-2 focus:ring-red-500/20 transition-all"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-gray-400 uppercase tracking-widest">
+                    Confirm New Device Key
+                  </label>
+                  <input
+                    type="password"
+                    value={confirmDeviceKey}
+                    onChange={(e) => setConfirmDeviceKey(e.target.value)}
+                    placeholder="Confirm new key"
                     className="w-full bg-gray-50 border-none rounded-xl px-5 py-3.5 focus:ring-2 focus:ring-red-500/20 transition-all"
                   />
                 </div>
                 <button
                   type="button"
-                  onClick={() =>
-                    showNotice(
-                      "Device key updates are ready in the UI and will be persisted after backend wiring.",
-                    )
-                  }
+                  onClick={handleUpdateDeviceKey}
+                  disabled={isUpdatingDeviceKey}
                   className="w-full bg-red-600 text-white py-4 rounded-xl font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-600/20"
                 >
-                  Update Device Key
+                  {isUpdatingDeviceKey ? "Updating key..." : "Update Device Key"}
                 </button>
               </div>
             </div>

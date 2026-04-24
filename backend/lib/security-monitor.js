@@ -12,7 +12,38 @@ const LOGIN_LOCK_DURATION_MS = Number(
 );
 const LOGIN_MAX_FAILURES = Number(process.env.LOGIN_MAX_FAILURES || 5);
 
+const ACTIVATION_WINDOW_MS = Number(
+  process.env.ACTIVATION_GUARD_WINDOW_MS || 5 * 60 * 1000,
+);
+const ACTIVATION_MAX_REQUESTS_PER_IP = Number(
+  process.env.ACTIVATION_GUARD_MAX_PER_IP || 120,
+);
+const ACTIVATION_MAX_REQUESTS_PER_MAC_PER_IP = Number(
+  process.env.ACTIVATION_GUARD_MAX_PER_MAC_PER_IP || 30,
+);
+const ACTIVATION_BLOCK_DURATION_MS = Number(
+  process.env.ACTIVATION_GUARD_BLOCK_MS || 30 * 60 * 1000,
+);
+const ACTIVATION_ANOMALY_THRESHOLD = Number(
+  process.env.ACTIVATION_GUARD_ANOMALY_THRESHOLD || 220,
+);
+const SECURITY_ALERT_WEBHOOK_URL = (
+  process.env.SECURITY_ALERT_WEBHOOK_URL || ""
+).toString().trim();
+const SECURITY_ALERT_COOLDOWN_MS = Number(
+  process.env.SECURITY_ALERT_COOLDOWN_MS || 5 * 60 * 1000,
+);
+const DEVICE_KEY_MISMATCH_SPIKE_THRESHOLD = Number(
+  process.env.DEVICE_KEY_MISMATCH_SPIKE_THRESHOLD || 25,
+);
+const DEVICE_KEY_MISMATCH_SPIKE_WINDOW_MS = Number(
+  process.env.DEVICE_KEY_MISMATCH_SPIKE_WINDOW_MS || 10 * 60 * 1000,
+);
+
 const loginAttempts = new Map();
+const activationAttempts = new Map();
+const alertCooldowns = new Map();
+const keyMismatchAttempts = new Map();
 
 function resolveClientIp(req) {
   const forwarded = (req.headers?.["x-forwarded-for"] || "")
@@ -52,6 +83,79 @@ function appendAuditEntry(entry) {
   }
 }
 
+function shouldAlert(alertKey, now = Date.now()) {
+  const lastSentAt = Number(alertCooldowns.get(alertKey) || 0);
+  if (lastSentAt && now - lastSentAt < SECURITY_ALERT_COOLDOWN_MS) {
+    return false;
+  }
+  alertCooldowns.set(alertKey, now);
+  return true;
+}
+
+async function sendSecurityAlert(entry) {
+  if (!SECURITY_ALERT_WEBHOOK_URL) return;
+
+  try {
+    if (typeof fetch !== "function") return;
+
+    await fetch(SECURITY_ALERT_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "backend-security-monitor",
+        severity: "high",
+        timestamp: entry.timestamp,
+        event: entry.event,
+        ip: entry.ip,
+        path: entry.path,
+        details: entry.details,
+      }),
+    });
+  } catch (error) {
+    console.warn("Security alert dispatch failed:", error?.message || error);
+  }
+}
+
+function trackDeviceKeyMismatchSpike(entry) {
+  const now = Date.now();
+  const key = `${entry.ip || "unknown"}::device_key_mismatch`;
+  const current = keyMismatchAttempts.get(key) || {
+    startedAt: now,
+    count: 0,
+  };
+
+  if (now - Number(current.startedAt || 0) > DEVICE_KEY_MISMATCH_SPIKE_WINDOW_MS) {
+    current.startedAt = now;
+    current.count = 0;
+  }
+
+  current.count += 1;
+  keyMismatchAttempts.set(key, current);
+
+  if (current.count < DEVICE_KEY_MISMATCH_SPIKE_THRESHOLD) {
+    return;
+  }
+
+  const alertKey = `${key}:spike`;
+  if (!shouldAlert(alertKey, now)) {
+    return;
+  }
+
+  const spikeEntry = {
+    ...entry,
+    event: "device_key_mismatch_spike",
+    details: {
+      ...(entry.details || {}),
+      count: current.count,
+      windowMs: DEVICE_KEY_MISMATCH_SPIKE_WINDOW_MS,
+      threshold: DEVICE_KEY_MISMATCH_SPIKE_THRESHOLD,
+    },
+  };
+
+  appendAuditEntry(spikeEntry);
+  void sendSecurityAlert(spikeEntry);
+}
+
 function logSecurityEvent(event, req, details = {}) {
   const safeDetails = sanitizeDetails(details);
   const entry = {
@@ -67,6 +171,17 @@ function logSecurityEvent(event, req, details = {}) {
   };
 
   appendAuditEntry(entry);
+
+  if (event === "device_key_mismatch") {
+    trackDeviceKeyMismatchSpike(entry);
+  }
+
+  if (["login_locked_out", "activation_guard_ip_blocked"].includes(event)) {
+    const alertKey = `${event}:${entry.ip || "unknown"}`;
+    if (shouldAlert(alertKey)) {
+      void sendSecurityAlert(entry);
+    }
+  }
 }
 
 function getLockKey(req, email = "") {
@@ -154,6 +269,122 @@ function clearFailedLoginAttempts(req, email = "") {
   loginAttempts.delete(getLockKey(req, email));
 }
 
+function normalizeMacAddressCandidate(value) {
+  return (value || "").toString().trim().toUpperCase();
+}
+
+function extractMacFromRequest(req) {
+  const body = req.body || {};
+  const query = req.query || {};
+  return (
+    normalizeMacAddressCandidate(body.mac) ||
+    normalizeMacAddressCandidate(body.macAddress) ||
+    normalizeMacAddressCandidate(query.mac) ||
+    normalizeMacAddressCandidate(query.macAddress)
+  );
+}
+
+function getActivationAttemptRecord(ip) {
+  const now = Date.now();
+  const existing = activationAttempts.get(ip);
+  if (!existing) {
+    return {
+      startedAt: now,
+      total: 0,
+      blockedUntil: 0,
+      macAttempts: new Map(),
+    };
+  }
+
+  if (existing.blockedUntil && existing.blockedUntil <= now) {
+    activationAttempts.delete(ip);
+    return {
+      startedAt: now,
+      total: 0,
+      blockedUntil: 0,
+      macAttempts: new Map(),
+    };
+  }
+
+  if (now - Number(existing.startedAt || 0) > ACTIVATION_WINDOW_MS) {
+    return {
+      startedAt: now,
+      total: 0,
+      blockedUntil: 0,
+      macAttempts: new Map(),
+    };
+  }
+
+  return existing;
+}
+
+function createPublicActivationGuard(routeName = "activation") {
+  return (req, res, next) => {
+    const ip = resolveClientIp(req);
+    const now = Date.now();
+    const record = getActivationAttemptRecord(ip);
+
+    if (record.blockedUntil && record.blockedUntil > now) {
+      const retryAfterSec = Math.max(
+        1,
+        Math.ceil((record.blockedUntil - now) / 1000),
+      );
+      res.setHeader("Retry-After", retryAfterSec.toString());
+      return res.status(429).json({
+        error: "Too many activation attempts. Please try again later.",
+      });
+    }
+
+    record.total = Number(record.total || 0) + 1;
+    const mac = extractMacFromRequest(req);
+    if (mac) {
+      const currentMacAttempts = Number(record.macAttempts.get(mac) || 0) + 1;
+      record.macAttempts.set(mac, currentMacAttempts);
+    }
+
+    const macAttempts = mac ? Number(record.macAttempts.get(mac) || 0) : 0;
+    const ipLimitExceeded = record.total > ACTIVATION_MAX_REQUESTS_PER_IP;
+    const macLimitExceeded =
+      !!mac && macAttempts > ACTIVATION_MAX_REQUESTS_PER_MAC_PER_IP;
+
+    if (record.total >= ACTIVATION_ANOMALY_THRESHOLD) {
+      record.blockedUntil = now + ACTIVATION_BLOCK_DURATION_MS;
+      logSecurityEvent("activation_guard_ip_blocked", req, {
+        routeName,
+        ip,
+        total: record.total,
+        mac: mac || null,
+        macAttempts,
+        blockedForMs: ACTIVATION_BLOCK_DURATION_MS,
+      });
+    }
+
+    activationAttempts.set(ip, record);
+
+    if (!ipLimitExceeded && !macLimitExceeded) {
+      return next();
+    }
+
+    if (ipLimitExceeded || macLimitExceeded) {
+      logSecurityEvent("activation_guard_rate_limited", req, {
+        routeName,
+        ip,
+        total: record.total,
+        mac: mac || null,
+        macAttempts,
+        ipLimitExceeded,
+        macLimitExceeded,
+      });
+    }
+
+    const retryAfterSec = Math.max(1, Math.ceil(ACTIVATION_WINDOW_MS / 1000));
+    res.setHeader("Retry-After", retryAfterSec.toString());
+    return res.status(429).json({
+      error: "Too many activation attempts. Please try again later.",
+    });
+  };
+}
+
 function sensitiveNoStore(req, res, next) {
   res.setHeader(
     "Cache-Control",
@@ -175,4 +406,5 @@ module.exports = {
   registerFailedLogin,
   resolveClientIp,
   sensitiveNoStore,
+  createPublicActivationGuard,
 };

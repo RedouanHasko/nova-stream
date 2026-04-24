@@ -355,11 +355,14 @@ function createApplicationRepository({ runQuery, runInsert, mapRow, persist }) {
     create: async ({ data }) => {
       const now = new Date().toISOString();
       const id = await runInsert(
-        "INSERT INTO applications (name, logoUrl, description, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO applications (name, logoUrl, description, downloadUrl, trialEnabled, trialDurationDays, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.name,
           data.logoUrl || null,
           data.description || null,
+          data.downloadUrl || null,
+          data.trialEnabled === undefined ? 1 : data.trialEnabled ? 1 : 0,
+          data.trialDurationDays ?? 7,
           data.status || "ACTIVE",
           now,
           now,
@@ -388,6 +391,18 @@ function createApplicationRepository({ runQuery, runInsert, mapRow, persist }) {
       if (data.description !== undefined) {
         fields.push("description = ?");
         params.push(data.description);
+      }
+      if (data.downloadUrl !== undefined) {
+        fields.push("downloadUrl = ?");
+        params.push(data.downloadUrl);
+      }
+      if (data.trialEnabled !== undefined) {
+        fields.push("trialEnabled = ?");
+        params.push(data.trialEnabled ? 1 : 0);
+      }
+      if (data.trialDurationDays !== undefined) {
+        fields.push("trialDurationDays = ?");
+        params.push(data.trialDurationDays);
       }
       if (data.status !== undefined) {
         fields.push("status = ?");

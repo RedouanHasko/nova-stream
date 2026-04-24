@@ -20,6 +20,7 @@ import {
   X,
   Lock,
   Unlock,
+  ExternalLink,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
@@ -54,7 +55,6 @@ export default function Movies() {
 
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [visibleCount, setVisibleCount] = useState(50);
   const [localVodStreams, setLocalVodStreams] = useState<MovieStream[] | null>(
     null,
   );
@@ -71,7 +71,12 @@ export default function Movies() {
   const [pendingLockedCategoryId, setPendingLockedCategoryId] = useState<
     string | null
   >(null);
-  const observerTarget = useRef<HTMLDivElement>(null);
+  // Virtual grid sizing
+  const gridContainerRef = useRef<HTMLDivElement>(null);
+  const [gridWidth, setGridWidth] = useState(800);
+  const [visibleCount, setVisibleCount] = useState(80);
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const CARD_GAP = 16;
 
   // If prefetch didn't load VOD streams, fetch per-category on demand.
   useEffect(() => {
@@ -119,8 +124,23 @@ export default function Movies() {
       };
     }
 
-    // If 'all' is selected, try fetching the first category to show some items
+    // If 'all' is selected, fetch all VOD streams (populate playlistData.vodStreams)
     const cats = playlistData.vodCategories || [];
+    if (activeCategory === "all") {
+      if (!isFetchingVod) {
+        // Trigger fetchVod from context to populate all streams
+        // fetchVod is a no-op if prefetch already filled streams
+        fetchVod().catch((err: any) => {
+          console.error("fetchVod failed:", err);
+          toast.error("Failed to load movies");
+        });
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // If a specific category is selected, fetch that category to show items
     if (cats.length > 0) {
       fetchCategory(cats[0].category_id);
       return () => {
@@ -135,13 +155,12 @@ export default function Movies() {
     isFetchingVod,
   ]);
 
+  // Reset visible count when filters/search change
+  
+
   // Deferred values so filtering never blocks the UI
   const deferredSearch = useDeferredValue(searchQuery);
   const deferredCategory = useDeferredValue(activeCategory);
-
-  useEffect(() => {
-    startTransition(() => setVisibleCount(50));
-  }, [searchQuery, activeCategory]);
 
   const categories = useMemo(() => {
     const cats = playlistData.vodCategories || [];
@@ -202,23 +221,30 @@ export default function Movies() {
     return filtered;
   }, [movies, deferredSearch, deferredCategory, favorites.vod, sortBy]);
 
-  const visibleMovies = filteredMovies.slice(0, visibleCount);
-
-  const loadMore = useCallback(
-    () => setVisibleCount((prev) => Math.min(prev + 50, filteredMovies.length)),
-    [filteredMovies.length],
-  );
-
+  // Reset visible count when filters/search change
   useEffect(() => {
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) loadMore();
-      },
-      { threshold: 0.1 },
-    );
-    if (observerTarget.current) observer.observe(observerTarget.current);
-    return () => observer.disconnect();
-  }, [loadMore]);
+    setVisibleCount(80);
+  }, [deferredSearch, deferredCategory, sortBy, playlistData.vodStreams?.length, localVodStreams?.length]);
+
+  // Scroll handler to load more items when near bottom
+  useEffect(() => {
+    const el = listScrollRef.current;
+    if (!el) return;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        const threshold = 800; // px from bottom
+        if (el.scrollHeight - (el.scrollTop + el.clientHeight) < threshold) {
+          setVisibleCount((v) => Math.min((filteredMovies?.length || 0), v + 80));
+        }
+        ticking = false;
+      });
+    };
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [filteredMovies.length]);
 
   const sidebarItems = useMemo(() => {
     if (!Array.isArray(movies))
@@ -244,7 +270,7 @@ export default function Movies() {
     ];
   }, [movies, categories, favorites.vod.length]);
 
-  const handleMovieClick = async (movie: MovieStream) => {
+  const handleMovieClick = useCallback(async (movie: MovieStream) => {
     setSelectedMovie(movie);
     setIsLoadingInfo(true);
     setMovieInfo(null);
@@ -266,7 +292,29 @@ export default function Movies() {
     } else {
       setIsLoadingInfo(false);
     }
-  };
+  }, [activePlaylist]);
+
+  // Column count from container width (mirrors Tailwind breakpoints)
+  const columnCount = useMemo(() => {
+    if (gridWidth >= 1280) return 6;
+    if (gridWidth >= 1024) return 5;
+    if (gridWidth >= 768) return 4;
+    if (gridWidth >= 640) return 3;
+    return 2;
+  }, [gridWidth]);
+
+  // Measure grid container with ResizeObserver
+  useEffect(() => {
+    const el = gridContainerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const { width } = entries[0].contentRect;
+      if (width > 0) setGridWidth(width);
+    });
+    ro.observe(el);
+    setGridWidth(el.clientWidth || 800);
+    return () => ro.disconnect();
+  }, []);
 
   const playMovie = (movie: MovieStream) => {
     if (!activePlaylist) return;
@@ -280,12 +328,14 @@ export default function Movies() {
     const ext = movie.container_extension || "mp4";
     const url = `${baseUrl}/movie/${user}/${pass}/${id}.${ext}`;
 
-    navigate("/player", {
+    navigate("/watch", {
       state: {
         title: movie.name,
         url: url,
         poster: movie.stream_icon,
         streamId: id,
+        extension: ext,
+        streamInfo: movieInfo?.info ?? null,
       },
     });
   };
@@ -315,6 +365,41 @@ export default function Movies() {
       setActiveCategory(catId);
     }
   };
+
+  // TV remote navigation — D-pad moves focus across grid items; Enter opens modal
+  const focusedMovieIndexRef = useRef(-1);
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (!key) return;
+      const total = filteredMovies.length;
+      if (total === 0) return;
+
+      if (key === "enter") {
+        if (focusedMovieIndexRef.current >= 0 && focusedMovieIndexRef.current < total) {
+          handleMovieClick(filteredMovies[focusedMovieIndexRef.current]);
+        }
+        return;
+      }
+      if (key === "back" || key === "backspace") {
+        setSelectedMovie(null);
+        return;
+      }
+      let next = focusedMovieIndexRef.current;
+      if (key === "right") next = Math.min(next + 1, total - 1);
+      else if (key === "left") next = Math.max(next - 1, 0);
+      else if (key === "down") next = Math.min(next + columnCount, total - 1);
+      else if (key === "up") next = Math.max(next - columnCount, 0);
+      else return;
+      if (next < 0) next = 0;
+      focusedMovieIndexRef.current = next;
+      // Scroll focused card into view via the virtual list container
+      const el = gridContainerRef.current?.querySelector(`[data-movie-index="${next}"]`) as HTMLElement | null;
+      el?.scrollIntoView({ block: "nearest" });
+    };
+    window.addEventListener("tv-remote-key", handler);
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, [filteredMovies, columnCount, handleMovieClick]);
 
   return (
     <div className="flex flex-col h-screen">
@@ -475,7 +560,7 @@ export default function Movies() {
         />
 
         {/* Movie Grid */}
-        <div className="flex-1 p-8 overflow-y-auto bg-black/10">
+        <div ref={gridContainerRef} className="flex-1 flex flex-col overflow-hidden bg-black/10">
           {!isConnected ? (
             <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
               <div className="p-6 bg-white/5 rounded-full">
@@ -496,16 +581,9 @@ export default function Movies() {
             </div>
           ) : (
             <>
-              {activePlaylist && activePlaylist.type !== "xtream" && (
-                <div className="mb-6 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
-                  <strong>Note:</strong> Movies require an Xtream-type playlist
-                  to use the provider VOD API. Your current playlist is set to
-                  <span className="ml-1 font-bold">{activePlaylist.type}</span>.
-                </div>
-              )}
-
-              <div className="flex items-center justify-between mb-8">
-                <div className="relative">
+              <div className="px-8 pt-8 pb-4">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="relative">
                   <button
                     onClick={() => setShowSortMenu(!showSortMenu)}
                     className="flex items-center gap-2 bg-white/5 hover:bg-white/10 px-4 py-2 rounded-lg transition-colors"
@@ -568,32 +646,38 @@ export default function Movies() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
-                {visibleMovies.map((movie) => (
-                  <MovieCard
-                    key={movie.stream_id}
-                    title={movie.name}
-                    poster={movie.stream_icon}
-                    onClick={() => handleMovieClick(movie)}
-                  />
-                ))}
-              </div>
-              {/* Sentinel: loads next category (all mode) or more cards (specific category) */}
-              {visibleCount < filteredMovies.length && (
-                <div
-                  ref={observerTarget}
-                  className="h-20 flex items-center justify-center mt-4 gap-2"
-                >
-                  <Loader2 className="w-6 h-6 animate-spin text-primary" />
-                  <span className="text-white/40 text-sm">
-                    Loading more movies...
-                  </span>
+              {activePlaylist && activePlaylist.type !== "xtream" && (
+                <div className="mx-8 mb-2 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
+                  <strong>Note:</strong> Movies require an Xtream-type playlist. Current:{" "}
+                  <span className="font-bold">{activePlaylist.type}</span>.
                 </div>
               )}
-              {filteredMovies.length === 0 && (
+              </div>{/* end px-8 header */}
+
+              {filteredMovies.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-64 text-white/40">
                   <Search className="w-12 h-12 mb-4 opacity-20" />
                   <p>{t.noMoviesFound}</p>
+                </div>
+              ) : (
+                <div ref={listScrollRef} className="flex-1 overflow-y-auto px-8 pb-8 scrollbar-hide">
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
+                      gap: CARD_GAP,
+                    }}
+                  >
+                    {filteredMovies.slice(0, visibleCount).map((movie, idx) => (
+                      <div key={movie.stream_id} data-movie-index={idx}>
+                        <MovieCard
+                          title={movie.name}
+                          poster={movie.stream_icon}
+                          onClick={() => handleMovieClick(movie)}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </>
@@ -727,7 +811,8 @@ export default function Movies() {
                   <div className="pt-8 flex gap-4">
                     <button
                       onClick={() => playMovie(selectedMovie)}
-                      className="flex-1 bg-primary hover:bg-primary-hover text-white py-4 rounded-2xl font-black text-xl flex items-center justify-center gap-3 transition-all shadow-xl shadow-primary/20"
+                      disabled={isLoadingInfo}
+                      className="flex-1 bg-primary hover:bg-primary-hover text-white py-4 rounded-2xl font-black text-xl flex items-center justify-center gap-3 transition-all shadow-xl shadow-primary/20 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <Play className="w-6 h-6 fill-current" />
                       Watch Now
@@ -751,6 +836,21 @@ export default function Movies() {
                         )}
                       />
                     </button>
+                    {movieInfo?.info?.youtube_trailer && (
+                      <a
+                        href={
+                          movieInfo.info.youtube_trailer.startsWith("http")
+                            ? movieInfo.info.youtube_trailer
+                            : `https://www.youtube.com/watch?v=${movieInfo.info.youtube_trailer}`
+                        }
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="p-4 rounded-2xl bg-white/5 hover:bg-white/10 transition-colors flex items-center gap-2 text-sm font-bold"
+                      >
+                        <ExternalLink className="w-5 h-5" />
+                        Trailer
+                      </a>
+                    )}
                   </div>
                 </div>
               </div>

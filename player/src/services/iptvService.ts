@@ -117,7 +117,14 @@ function openIDB(): Promise<IDBDatabase> {
         db.createObjectStore(IDB_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      // Auto-reset dbPromise when the browser closes the connection or demands a
+      // version upgrade from another tab so the next call opens a fresh connection.
+      db.onclose = () => { dbPromise = null; };
+      db.onversionchange = () => { db.close(); dbPromise = null; };
+      resolve(db);
+    };
     req.onerror = () => {
       dbPromise = null;
       reject(req.error);
@@ -132,11 +139,16 @@ async function idbGet(
   try {
     const db = await openIDB();
     return new Promise((resolve) => {
-      const tx = db.transaction(IDB_STORE, "readonly");
-      const store = tx.objectStore(IDB_STORE);
-      const req = store.get(key);
-      req.onsuccess = () => resolve(req.result ?? undefined);
-      req.onerror = () => resolve(undefined);
+      try {
+        const tx = db.transaction(IDB_STORE, "readonly");
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result ?? undefined);
+        req.onerror = () => resolve(undefined);
+      } catch {
+        dbPromise = null;
+        resolve(undefined);
+      }
     });
   } catch {
     return undefined;
@@ -147,30 +159,105 @@ async function idbSet(key: string, data: any): Promise<void> {
   try {
     const db = await openIDB();
     return new Promise((resolve) => {
-      const tx = db.transaction(IDB_STORE, "readwrite");
-      const store = tx.objectStore(IDB_STORE);
-      store.put({ data, ts: Date.now() }, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
+      try {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        const store = tx.objectStore(IDB_STORE);
+        store.put({ data, ts: Date.now() }, key);
+        tx.oncomplete = () => {
+          resolve();
+          idbEvictOld().catch(() => {});
+        };
+        tx.onerror = () => resolve();
+      } catch {
+        dbPromise = null;
+        resolve();
+      }
     });
   } catch {
     // IndexedDB unavailable — silently skip
   }
 }
 
-async function idbClear(): Promise<void> {
+// Evict entries older than 7 days — runs at most once per session.
+let _idbEvictedThisSession = false;
+async function idbEvictOld(): Promise<void> {
+  if (_idbEvictedThisSession) return;
+  _idbEvictedThisSession = true;
+  const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
   try {
     const db = await openIDB();
-    return new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       const tx = db.transaction(IDB_STORE, "readwrite");
-      tx.objectStore(IDB_STORE).clear();
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        if ((cursor.value as any)?.ts < cutoff) cursor.delete();
+        cursor.continue();
+      };
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     });
   } catch {
-    // silently skip
+    _idbEvictedThisSession = false; // allow retry on next set
   }
 }
+
+async function idbClear(): Promise<void> {
+  try {
+    const db = await openIDB();
+    await new Promise<void>((resolve) => {
+      try {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        tx.objectStore(IDB_STORE).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+  } catch {
+    // silently skip
+  } finally {
+    // Null the cached promise so the next DB operation opens a fresh connection
+    // instead of reusing a connection that may have been closed by the browser.
+    dbPromise = null;
+  }
+}
+
+// Batch-read multiple keys in a single IDB transaction — much faster than N separate reads.
+async function idbGetBatch(
+  keys: string[],
+): Promise<Map<string, { data: any; ts: number }>> {
+  const result = new Map<string, { data: any; ts: number }>();
+  if (keys.length === 0) return result;
+  try {
+    const db = await openIDB();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const store = tx.objectStore(IDB_STORE);
+      let pending = keys.length;
+      const done = () => {
+        if (--pending === 0) resolve();
+      };
+      for (const key of keys) {
+        const req = store.get(key);
+        req.onsuccess = () => {
+          if (req.result) result.set(key, req.result);
+          done();
+        };
+        req.onerror = done;
+      }
+    });
+  } catch {
+    // IDB unavailable
+  }
+  return result;
+}
+
+// Pre-open the IDB connection at module load so the first real read is instant.
+openIDB().catch(() => {});
 
 export class IPTVService {
   // ── In-memory L1 cache ──────────────────────────────────────────────
@@ -188,6 +275,43 @@ export class IPTVService {
   // How often a background refresh can check the server for new data
   private static readonly REFRESH_INTERVAL = 30 * 60 * 1000; // 30 min
 
+  private static dedupeByNumericKey<T extends Record<string, any>>(
+    items: T[],
+    key: string,
+  ): T[] {
+    const seen = new Set<number | string>();
+    const out: T[] = [];
+    for (const item of items) {
+      const raw = item?.[key];
+      const k =
+        typeof raw === "number" || typeof raw === "string"
+          ? raw
+          : JSON.stringify(item);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(item);
+    }
+    return out;
+  }
+
+  private static async fetchByCategoriesBatched<T>(
+    categoryIds: Array<string | number>,
+    fetcher: (categoryId: string | number) => Promise<T[]>,
+    batchSize = 6,
+  ): Promise<T[]> {
+    const all: T[] = [];
+    for (let i = 0; i < categoryIds.length; i += batchSize) {
+      const chunk = categoryIds.slice(i, i + batchSize);
+      const settled = await Promise.allSettled(chunk.map((id) => fetcher(id)));
+      for (const result of settled) {
+        if (result.status === "fulfilled" && Array.isArray(result.value)) {
+          all.push(...result.value);
+        }
+      }
+    }
+    return all;
+  }
+
   /** Wipe both memory + IndexedDB caches (call on playlist switch / logout). */
   static clearMemoryCache() {
     this.memCache.clear();
@@ -197,53 +321,13 @@ export class IPTVService {
 
   static async clearAllCaches() {
     this.memCache.clear();
+    _idbEvictedThisSession = false;
     await idbClear();
   }
 
   // ── Low-level fetch (no cache) ─────────────────────────────────────
-  private static async fetchWithProxy(url: string, retries = 2) {
-    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60_000);
-      try {
-        const response = await fetch(proxyUrl, { signal: controller.signal });
-        if (!response.ok) {
-          // Retry on 5xx upstream errors
-          if (response.status >= 500 && attempt < retries) {
-            clearTimeout(timeoutId);
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-            continue;
-          }
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const text = await response.text();
-        try {
-          return JSON.parse(text);
-        } catch {
-          throw new Error(
-            `Non-JSON response from server (${text.slice(0, 80)})`,
-          );
-        }
-      } catch (err: any) {
-        clearTimeout(timeoutId);
-        // Retry on network errors (ERR_CONNECTION_REFUSED, etc.)
-        if (
-          attempt < retries &&
-          (err.name === "TypeError" || err.message?.includes("fetch"))
-        ) {
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-          continue;
-        }
-        throw err;
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    }
-    throw new Error("Max retries reached");
-  }
-
-  private static async fetchTextWithProxy(url: string, retries = 2) {
+  // Single retry-capable method that returns response body as text.
+  private static async fetchTextWithProxy(url: string, retries = 2): Promise<string> {
     const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
       const controller = new AbortController();
@@ -252,7 +336,6 @@ export class IPTVService {
         const response = await fetch(proxyUrl, { signal: controller.signal });
         if (!response.ok) {
           if (response.status >= 500 && attempt < retries) {
-            clearTimeout(timeoutId);
             await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
             continue;
           }
@@ -260,7 +343,6 @@ export class IPTVService {
         }
         return await response.text();
       } catch (err: any) {
-        clearTimeout(timeoutId);
         if (
           attempt < retries &&
           (err.name === "TypeError" || err.message?.includes("fetch"))
@@ -274,6 +356,16 @@ export class IPTVService {
       }
     }
     throw new Error("Max retries reached");
+  }
+
+  // JSON convenience wrapper around fetchTextWithProxy.
+  private static async fetchWithProxy(url: string, retries = 2): Promise<any> {
+    const text = await this.fetchTextWithProxy(url, retries);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Non-JSON response from server (${text.slice(0, 80)})`);
+    }
   }
 
   private static parseProgramTime(value?: string, fallbackTimestamp?: string) {
@@ -580,7 +672,14 @@ export class IPTVService {
   ): Promise<LiveStream[]> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams`;
     const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
-    return this.normalizeListResponse(data) as LiveStream[];
+    const direct = this.normalizeListResponse(data) as LiveStream[];
+    if (direct.length > 0) return direct;
+
+    // Fallback for providers that briefly return empty data while cache is cold.
+    const refreshed = this.normalizeListResponse(
+      await this.forceRefresh(url),
+    ) as LiveStream[];
+    return refreshed.length > 0 ? refreshed : direct;
   }
 
   static async getVodCategories(
@@ -723,6 +822,23 @@ export class IPTVService {
     seriesCategories: Category[];
     seriesStreams: SeriesStream[];
   }> {
+    // Batch-warm memCache from IDB in a single transaction before the 6 parallel
+    // cachedFetch calls, so each one hits L1 instantly instead of doing a separate IDB read.
+    const warmKeys = [
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_categories`,
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams`,
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_categories`,
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_streams`,
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_series_categories`,
+      `${host}/player_api.php?username=${user}&password=${pass}&action=get_series`,
+    ];
+    const batchEntries = await idbGetBatch(warmKeys);
+    for (const [key, entry] of batchEntries) {
+      if (!IPTVService.memCache.has(key)) {
+        IPTVService.memCache.set(key, entry);
+      }
+    }
+
     const total = 6;
     let completed = 0;
 

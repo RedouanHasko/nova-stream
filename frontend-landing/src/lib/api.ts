@@ -1,13 +1,10 @@
-const DEFAULT_API_BASE =
-  typeof window !== "undefined" && window.location?.hostname
-    ? `${window.location.protocol}//${window.location.hostname}:5000`
-    : "";
+import { getSecureApiBase, toSecureUrl } from "./security";
 
-const API_BASE = import.meta.env.VITE_API_URL || DEFAULT_API_BASE;
+const API_BASE = getSecureApiBase();
 
 export function resolveImageUrl(path: string | null | undefined): string {
   if (!path) return "";
-  if (/^https?:\/\//i.test(path)) return path;
+  if (/^https?:\/\//i.test(path)) return toSecureUrl(path);
   return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
@@ -148,6 +145,17 @@ export async function getDeviceFeed(body: {
   });
 }
 
+export async function updateDeviceKey(body: {
+  mac: string;
+  currentDeviceKey: string;
+  newDeviceKey: string;
+}) {
+  return request("/api/devices/update-key", {
+    method: "POST",
+    body,
+  });
+}
+
 export async function activatePublicPlan(
   planId: number,
   body: {
@@ -174,7 +182,13 @@ export type CheckoutResponse = {
   sessionId?: string;
   gatewayConfigured?: boolean;
   activated?: boolean;
+  checkoutState?: string;
+  paymentStatus?: string;
+  mac?: string | null;
+  applicationName?: string | null;
+  planName?: string | null;
   device?: Record<string, unknown>;
+  activation?: Record<string, unknown> | null;
   activations?: unknown[];
 };
 
@@ -204,10 +218,19 @@ export async function confirmPublicCheckout(
   });
 }
 
+export async function getPublicCheckoutStatus(
+  sessionId: string,
+): Promise<CheckoutResponse> {
+  return request(`/api/pricing/public/checkout-status/${sessionId}`, {
+    method: "GET",
+  });
+}
+
 export async function getPublicPaymentConfig(): Promise<{
   provider: string;
   configured: boolean;
   mode: string;
+  manualTestingEnabled: boolean;
   publishableKey: string | null;
 }> {
   return request("/api/pricing/public/payment-config", { method: "GET" });

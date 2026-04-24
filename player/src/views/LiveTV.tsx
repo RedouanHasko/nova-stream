@@ -6,6 +6,7 @@ import {
   useRef,
   useDeferredValue,
   startTransition,
+  memo,
 } from "react";
 import {
   ArrowLeft,
@@ -22,7 +23,6 @@ import {
   VolumeX,
   Music,
   Subtitles,
-  Settings,
   PictureInPicture2,
   Monitor,
   Lock,
@@ -31,7 +31,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { List } from "react-window";
+
 import Sidebar from "../components/Sidebar";
 import Logo from "../components/Logo";
 import WeatherWidget from "../components/WeatherWidget";
@@ -181,7 +181,7 @@ const MiniPlayer = ({
   onPrev?: () => void;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
 }) => {
-  const { settings, updateSettings } = usePlaylist();
+  const { settings } = usePlaylist();
   const internalVideoRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalVideoRef || internalVideoRef;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -205,19 +205,15 @@ const MiniPlayer = ({
   const lastVolumeRef = useRef(0.8);
 
   // HLS State
-  const [levels, setLevels] = useState<any[]>([]);
-  const [currentLevel, setCurrentLevel] = useState(-1);
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
   const [currentAudioTrack, setCurrentAudioTrack] = useState(-1);
   const [subtitleTracks, setSubtitleTracks] = useState<any[]>([]);
   const [currentSubtitleTrack, setCurrentSubtitleTrack] = useState(-1);
   const [activeMenu, setActiveMenu] = useState<
     | "none"
-    | "quality"
     | "audio"
     | "subtitle"
     | "aspect"
-    | "format"
     | "stability"
   >("none");
   const [stabilityMode, setStabilityMode] = useState<"stable" | "ultra">(
@@ -253,7 +249,6 @@ const MiniPlayer = ({
     const video = videoRef.current;
     setIsLoading(true);
     setIsPlaying(true);
-    setLevels([]);
     setAudioTracks([]);
     setSubtitleTracks([]);
     const baseUrl = url.substring(0, url.lastIndexOf("."));
@@ -265,8 +260,7 @@ const MiniPlayer = ({
     let proxiedUrl = `${window.location.origin}/api/proxy?url=${encodeURIComponent(url)}`;
 
     const isM3U8 = url.includes(".m3u8") || !url.includes(".ts");
-    const isTS =
-      !isM3U8 && (url.includes(".ts") || settings.streamFormat === "ts");
+    const isTS = !isM3U8 && url.includes(".ts");
 
     const tryMpegts = () => {
       if (
@@ -512,35 +506,38 @@ const MiniPlayer = ({
           enableWorker: true,
           enableSoftwareAES: false,
 
-          // Low-latency live sync
-          lowLatencyMode: true,
-          backBufferLength: isUltra ? 20 : 6,
-          liveSyncDurationCount: isUltra ? 5 : 2,
-          liveMaxLatencyDurationCount: isUltra ? 12 : 6,
+          // Prefer stability over low latency on slow networks.
+          lowLatencyMode: false,
+          backBufferLength: isUltra ? 30 : 20,
+          liveSyncDurationCount: isUltra ? 10 : 6,
+          liveMaxLatencyDurationCount: isUltra ? 20 : 12,
 
           // Buffer tuning
           startLevel: -1,
-          maxBufferLength: isUltra ? 20 : 6,
-          maxMaxBufferLength: isUltra ? 40 : 12,
-          maxBufferSize: (isUltra ? 40 : 16) * 1000 * 1000,
-          maxBufferHole: 0.25,
-          highBufferWatchdogPeriod: 2,
-          nudgeMaxRetry: 4,
+          maxBufferLength: isUltra ? 30 : 15,
+          maxMaxBufferLength: isUltra ? 60 : 30,
+          maxBufferSize: (isUltra ? 48 : 24) * 1000 * 1000,
+          maxBufferHole: 0.5,
+          highBufferWatchdogPeriod: 3,
+          nudgeMaxRetry: 6,
 
           // ABR
           capLevelToPlayerSize: true,
-          abrEwmaDefaultEstimate: 1_000_000,
-          abrBandWidthFactor: 0.95,
-          abrBandWidthUpFactor: 0.9,
-          testBandwidth: true,
+          abrEwmaDefaultEstimate: 800_000,
+          abrBandWidthFactor: 0.8,
+          abrBandWidthUpFactor: 0.65,
+          testBandwidth: false,
 
           // Loading
           autoStartLoad: true,
           startFragPrefetch: false,
           progressive: true,
-          fragLoadingMaxRetry: 12,
-          manifestLoadingMaxRetry: 12,
-          levelLoadingMaxRetry: 12,
+          fragLoadingMaxRetry: 20,
+          manifestLoadingMaxRetry: 8,
+          levelLoadingMaxRetry: 8,
+          fragLoadingTimeOut: 60_000,
+          manifestLoadingTimeOut: 45_000,
+          levelLoadingTimeOut: 45_000,
         });
 
         hlsRef.current = hls;
@@ -560,17 +557,11 @@ const MiniPlayer = ({
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           setIsLoading(false);
-          setLevels(hls.levels || []);
-          setCurrentLevel(hls.currentLevel);
           setAudioTracks(hls.audioTracks || []);
           setCurrentAudioTrack(hls.audioTrack);
           setSubtitleTracks(hls.subtitleTracks || []);
           setCurrentSubtitleTrack(hls.subtitleTrack);
           video.play().catch(() => setIsPlaying(false));
-        });
-
-        hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
-          setCurrentLevel(data.level);
         });
 
         hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
@@ -658,7 +649,7 @@ const MiniPlayer = ({
         mpegtsRef.current = null;
       }
     };
-  }, [url, settings.streamFormat, stabilityMode]);
+  }, [url, stabilityMode]);
 
   const togglePlay = (e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -1062,53 +1053,6 @@ const MiniPlayer = ({
                   </AnimatePresence>
                 </div>
 
-                {/* Stream Format */}
-                <div className="relative">
-                  <button
-                    onClick={() => handleMenuClick("format")}
-                    className={cn(
-                      "p-2 rounded-full transition-colors",
-                      activeMenu === "format"
-                        ? "bg-primary text-white"
-                        : "hover:bg-white/10 text-white",
-                    )}
-                    title="Change Stream Format"
-                  >
-                    <Settings className="w-5 h-5" />
-                  </button>
-                  <AnimatePresence>
-                    {activeMenu === "format" && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: 10 }}
-                        className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[140px] shadow-2xl"
-                      >
-                        <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                          Stream Format
-                        </div>
-                        {(["hls"] as const).map((fmt) => (
-                          <button
-                            key={fmt}
-                            onClick={() => {
-                              updateSettings({ streamFormat: fmt });
-                              setActiveMenu("none");
-                            }}
-                            className={cn(
-                              "w-full text-left px-3 py-2 rounded-lg text-xs uppercase transition-colors",
-                              settings.streamFormat === fmt
-                                ? "bg-primary text-white"
-                                : "hover:bg-white/10 text-white/80",
-                            )}
-                          >
-                            {fmt}
-                          </button>
-                        ))}
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-
                 {/* PiP */}
                 {isPipAvailable && (
                   <button
@@ -1232,69 +1176,7 @@ const MiniPlayer = ({
                   </div>
                 )}
 
-                {/* Quality */}
-                {levels.length > 0 && (
-                  <div className="relative">
-                    <button
-                      onClick={() => handleMenuClick("quality")}
-                      className={cn(
-                        "p-2 rounded-full transition-colors",
-                        activeMenu === "quality"
-                          ? "bg-primary text-white"
-                          : "hover:bg-white/10 text-white",
-                      )}
-                    >
-                      <Settings className="w-5 h-5" />
-                    </button>
-                    <AnimatePresence>
-                      {activeMenu === "quality" && (
-                        <motion.div
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: 10 }}
-                          className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[140px] shadow-2xl"
-                        >
-                          <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                            Quality
-                          </div>
-                          <button
-                            onClick={() => {
-                              if (hlsRef.current)
-                                hlsRef.current.currentLevel = -1;
-                              setActiveMenu("none");
-                            }}
-                            className={cn(
-                              "w-full text-left px-3 py-2 rounded-lg text-xs transition-colors",
-                              currentLevel === -1
-                                ? "bg-primary text-white"
-                                : "hover:bg-white/10 text-white/80",
-                            )}
-                          >
-                            Auto
-                          </button>
-                          {levels.map((level, idx) => (
-                            <button
-                              key={idx}
-                              onClick={() => {
-                                if (hlsRef.current)
-                                  hlsRef.current.currentLevel = idx;
-                                setActiveMenu("none");
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-2 rounded-lg text-xs transition-colors",
-                                currentLevel === idx
-                                  ? "bg-primary text-white"
-                                  : "hover:bg-white/10 text-white/80",
-                              )}
-                            >
-                              {level.height}p
-                            </button>
-                          ))}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                )}
+
               </>
             )}
 
@@ -1321,6 +1203,16 @@ const toProxyAssetUrl = (src?: string) => {
     return `${window.location.origin}/api/proxy?url=${encodeURIComponent(src)}`;
   }
   return src;
+};
+
+const CHANNEL_BATCH_SIZE = 50;
+const CATEGORY_DIVIDER_PATTERN = /^#+\s*[^#]+\s*#+$/;
+
+const normalizeCategoryId = (value: unknown) => String(value ?? "").trim();
+
+const isListableLiveChannel = (channel: LiveStream) => {
+  const name = String(channel?.name ?? "").trim();
+  return Boolean(channel?.stream_id) && !CATEGORY_DIVIDER_PATTERN.test(name);
 };
 
 const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
@@ -1385,29 +1277,21 @@ const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
   );
 };
 
-const ChannelRow = ({ index, style, ...props }: any) => {
-  const {
-    filteredChannels,
-    selectedChannelId,
-    favorites,
-    setSelectedChannel,
-    setHoveredChannel,
-  } = props;
-  const channel = filteredChannels[index];
-  if (!channel) return null;
-
-  const isSelected = selectedChannelId === channel.stream_id;
-
+const ChannelRow = memo(({ channel, isSelected, isFavorite, onSelect, onHover }: {
+  channel: any;
+  isSelected: boolean;
+  isFavorite: boolean;
+  onSelect: (ch: any) => void;
+  onHover: (ch: any) => void;
+}) => {
   return (
-    <div style={style}>
+    <div>
       <button
-        onMouseEnter={() => setHoveredChannel?.(channel)}
-        onFocus={() => setHoveredChannel?.(channel)}
-        onClick={() => {
-          setSelectedChannel(channel);
-        }}
+        onMouseEnter={() => onHover(channel)}
+        onFocus={() => onHover(channel)}
+        onClick={() => onSelect(channel)}
         className={cn(
-          "flex items-center gap-4 w-full h-full px-6 text-left transition-all",
+          "flex items-center gap-4 w-full h-[72px] px-6 text-left transition-all",
           "hover:bg-white/5 border-b border-white/5",
           isSelected && "bg-primary/20",
         )}
@@ -1430,14 +1314,14 @@ const ChannelRow = ({ index, style, ...props }: any) => {
               Playing
             </div>
           )}
-          {favorites.includes(channel.stream_id) && (
+          {isFavorite && (
             <Star className="w-4 h-4 fill-primary text-primary" />
           )}
         </div>
       </button>
     </div>
   );
-};
+});
 
 export default function LiveTV() {
   const navigate = useNavigate();
@@ -1446,10 +1330,12 @@ export default function LiveTV() {
     activePlaylist,
     isConnected,
     playlistData,
+    fetchLive,
     isFetchingLive,
     favorites,
     toggleFavorite,
     settings,
+    updateSettings,
     isParentalUnlocked,
     unlockParental,
     lockParental,
@@ -1458,7 +1344,7 @@ export default function LiveTV() {
   // Default to first real category on first render
   const [activeCategory, setActiveCategory] = useState(() => {
     const cats = playlistData.liveCategories || [];
-    return cats.length > 0 ? cats[0].category_id : "all";
+    return cats.length > 0 ? normalizeCategoryId(cats[0].category_id) : "all";
   });
   const [selectedChannel, setSelectedChannel] = useState<LiveStream | null>(
     null,
@@ -1466,8 +1352,6 @@ export default function LiveTV() {
   const [hoveredChannel, setHoveredChannel] = useState<LiveStream | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const playerRef = useRef<HTMLVideoElement>(null);
-  const warmedChannelUrlsRef = useRef<Set<string>>(new Set());
-  const warmAbortRef = useRef<AbortController | null>(null);
   const [epgData, setEpgData] = useState<EpgProgram[]>([]);
   const [isEpgLoading, setIsEpgLoading] = useState(false);
   const [guideNow, setGuideNow] = useState(() => Date.now());
@@ -1477,6 +1361,61 @@ export default function LiveTV() {
     string | null
   >(null);
   const epgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const colorActionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastNonFavoriteCategoryRef = useRef(activeCategory);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const liveRetryStateRef = useRef<{
+    playlistKey: string | null;
+    attempts: number;
+  }>({ playlistKey: null, attempts: 0 });
+
+  useEffect(() => {
+    const playlistKey = activePlaylist?.id || null;
+    const hasAnyLiveData =
+      (playlistData.liveStreams?.length || 0) > 0 ||
+      (playlistData.liveCategories?.length || 0) > 0;
+
+    if (!isConnected || !playlistKey || isFetchingLive) {
+      if (!playlistKey) {
+        liveRetryStateRef.current = { playlistKey: null, attempts: 0 };
+      }
+      return;
+    }
+
+    if (liveRetryStateRef.current.playlistKey !== playlistKey) {
+      liveRetryStateRef.current = { playlistKey, attempts: 0 };
+    }
+
+    if ((playlistData.liveStreams?.length || 0) > 0) {
+      liveRetryStateRef.current = { playlistKey, attempts: 0 };
+      return;
+    }
+
+    if (liveRetryStateRef.current.attempts >= 3) {
+      return;
+    }
+
+    // Recover from partial prefetch states where categories loaded but live streams did not.
+    // Also covers first-open cases where live data has not been requested yet.
+    liveRetryStateRef.current = {
+      playlistKey,
+      attempts: liveRetryStateRef.current.attempts + 1,
+    };
+
+    fetchLive().catch((error) => {
+      console.error("Live channel retry failed:", error);
+      if (hasAnyLiveData) {
+        toast.error("Live channels could not be refreshed.");
+      }
+    });
+  }, [
+    activePlaylist?.id,
+    fetchLive,
+    isConnected,
+    isFetchingLive,
+    playlistData.liveCategories?.length,
+    playlistData.liveStreams?.length,
+  ]);
 
   useEffect(() => {
     if (epgTimerRef.current) clearTimeout(epgTimerRef.current);
@@ -1555,7 +1494,10 @@ export default function LiveTV() {
     const cats = playlistData.liveCategories || [];
     if (isParentalUnlocked) return cats;
     return cats.filter(
-      (cat) => !settings.hiddenCategories.live.includes(cat.category_id),
+      (cat) =>
+        !settings.hiddenCategories.live.includes(
+          normalizeCategoryId(cat.category_id),
+        ),
     );
   }, [
     playlistData.liveCategories,
@@ -1567,7 +1509,10 @@ export default function LiveTV() {
     const allStreams = playlistData.liveStreams || [];
     if (isParentalUnlocked) return allStreams;
     return allStreams.filter(
-      (s) => !settings.hiddenCategories.live.includes(s.category_id),
+      (stream) =>
+        !settings.hiddenCategories.live.includes(
+          normalizeCategoryId(stream.category_id),
+        ),
     );
   }, [
     playlistData.liveStreams,
@@ -1575,18 +1520,35 @@ export default function LiveTV() {
     isParentalUnlocked,
   ]);
 
+  const listableChannels = useMemo(
+    () => streams.filter(isListableLiveChannel),
+    [streams],
+  );
+
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (let index = 0; index < listableChannels.length; index += 1) {
+      const categoryId = normalizeCategoryId(listableChannels[index].category_id);
+      if (!categoryId) continue;
+      counts[categoryId] = (counts[categoryId] || 0) + 1;
+    }
+    return counts;
+  }, [listableChannels]);
+
   const filteredChannels = useMemo(() => {
-    if (!Array.isArray(streams)) return [];
-    let filtered = streams.filter((c) => {
-      // Filter out category divider rows (e.g., names like '##### General #####')
-      if (/^#+\s*[^#]+\s*#+$/.test(c.name.trim())) return false;
-      const matchesSearch = c.name
+    if (!Array.isArray(listableChannels)) return [];
+    let filtered = listableChannels.filter((channel) => {
+      const matchesSearch = channel.name
         .toLowerCase()
         .includes(searchQuery.toLowerCase());
       const matchesCategory =
-        activeCategory === "all" || c.category_id === activeCategory;
+        activeCategory === "all" ||
+        normalizeCategoryId(channel.category_id) ===
+          normalizeCategoryId(activeCategory);
       const matchesFav =
-        activeCategory === "fav" ? favorites.live.includes(c.stream_id) : true;
+        activeCategory === "fav"
+          ? favorites.live.includes(channel.stream_id)
+          : true;
       return matchesSearch && matchesCategory && matchesFav;
     });
 
@@ -1607,7 +1569,13 @@ export default function LiveTV() {
     }
 
     return filtered;
-  }, [streams, searchQuery, activeCategory, favorites.live, settings.liveSort]);
+  }, [
+    listableChannels,
+    searchQuery,
+    activeCategory,
+    favorites.live,
+    settings.liveSort,
+  ]);
 
   // Defer rendering of the channel list for UI responsiveness
   const deferredChannels = useDeferredValue(filteredChannels);
@@ -1615,7 +1583,7 @@ export default function LiveTV() {
   // When categories load and we're still on "all", switch to first real category
   useEffect(() => {
     if (activeCategory === "all" && categories.length > 0) {
-      setActiveCategory(categories[0].category_id);
+      setActiveCategory(normalizeCategoryId(categories[0].category_id));
     }
   }, [categories]);
 
@@ -1624,64 +1592,205 @@ export default function LiveTV() {
     setSelectedChannel(null);
   }, [activeCategory]);
 
-  const [listHeight, setListHeight] = useState(800);
+  const [displayLimit, setDisplayLimit] = useState(CHANNEL_BATCH_SIZE);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Reset display limit when category or search changes
+  useEffect(() => {
+    setDisplayLimit(CHANNEL_BATCH_SIZE);
+    setFocusIndex(0);
+    setHoveredChannel(null);
+    if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0;
+  }, [activeCategory, searchQuery]);
+
+  const displayedChannels = useMemo(
+    () => deferredChannels.slice(0, displayLimit),
+    [deferredChannels, displayLimit],
+  );
+
+  const loadMoreChannels = useCallback(() => {
+    setDisplayLimit((previous) =>
+      Math.min(previous + CHANNEL_BATCH_SIZE, deferredChannels.length),
+    );
+  }, [deferredChannels.length]);
+
+  const handleChannelListScroll = useCallback(
+    (event: React.UIEvent<HTMLDivElement>) => {
+      const element = event.currentTarget;
+      const remaining =
+        element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (remaining <= 240 && displayLimit < deferredChannels.length) {
+        loadMoreChannels();
+      }
+    },
+    [deferredChannels.length, displayLimit, loadMoreChannels],
+  );
+
+  // IntersectionObserver to load more when sentinel comes into view
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && displayLimit < deferredChannels.length) {
+          loadMoreChannels();
+        }
+      },
+      { root: scrollContainerRef.current, threshold: 0.1 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [displayLimit, deferredChannels.length, loadMoreChannels]);
   // TV navigation state
   const [focusIndex, setFocusIndex] = useState(0);
   // Color button action feedback
   const [colorAction, setColorAction] = useState<string>("");
 
-  useEffect(() => {
-    if (containerRef.current) {
-      setListHeight(containerRef.current.offsetHeight);
+  const showColorAction = useCallback((message: string) => {
+    setColorAction(message);
+    if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    colorActionTimerRef.current = setTimeout(() => {
+      setColorAction("");
+      colorActionTimerRef.current = null;
+    }, 1400);
+  }, []);
+
+  const cycleLiveSort = useCallback(() => {
+    const nextSort =
+      settings.liveSort === "default"
+        ? "az"
+        : settings.liveSort === "az"
+          ? "za"
+          : settings.liveSort === "za"
+            ? "added"
+            : "default";
+    updateSettings({ liveSort: nextSort });
+
+    const sortLabel =
+      nextSort === "default"
+        ? "Default order"
+        : nextSort === "az"
+          ? "Sort: A-Z"
+          : nextSort === "za"
+            ? "Sort: Z-A"
+            : "Sort: Recently added";
+    showColorAction(sortLabel);
+  }, [settings.liveSort, showColorAction, updateSettings]);
+
+  const toggleFavoriteFilter = useCallback(() => {
+    if (activeCategory === "fav") {
+      const fallbackCategory =
+        lastNonFavoriteCategoryRef.current &&
+        (lastNonFavoriteCategoryRef.current === "all" ||
+          categories.some(
+            (category) =>
+              category.category_id === lastNonFavoriteCategoryRef.current,
+          ))
+          ? lastNonFavoriteCategoryRef.current
+          : categories[0]?.category_id || "all";
+      setActiveCategory(fallbackCategory);
+      showColorAction("Favorites filter off");
+      return;
     }
 
-    const handleResize = () => {
-      if (containerRef.current) {
-        setListHeight(containerRef.current.offsetHeight);
-      }
-    };
+    if (activeCategory !== "all") {
+      lastNonFavoriteCategoryRef.current = activeCategory;
+    }
+    setActiveCategory("fav");
+    showColorAction("Favorites filter on");
+  }, [activeCategory, categories, showColorAction]);
 
-    window.addEventListener("resize", handleResize);
+  const focusSearch = useCallback(() => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    showColorAction(searchQuery ? "Search focused" : "Search ready");
+  }, [searchQuery, showColorAction]);
 
+  useEffect(() => {
     // TV remote navigation
-    const onTVKey = (e) => {
-      const key = e.detail?.key;
-      if (!deferredChannels.length) return;
+    const onTVKey = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key;
+      if (key === "green") {
+        focusSearch();
+        return;
+      }
+      if (key === "yellow") {
+        toggleFavoriteFilter();
+        return;
+      }
+      if (key === "blue") {
+        cycleLiveSort();
+        return;
+      }
+      if (key === "back") {
+        if (selectedChannel) {
+          setSelectedChannel(null);
+        } else {
+          navigate("/");
+        }
+        return;
+      }
+
+      if (!displayedChannels.length) return;
+
       if (["down", "up"].includes(key)) {
         setFocusIndex((prev) => {
           let next = key === "down" ? prev + 1 : prev - 1;
           if (next < 0) next = 0;
-          if (next >= deferredChannels.length)
-            next = deferredChannels.length - 1;
-          setHoveredChannel(deferredChannels[next]);
+          if (next >= displayedChannels.length)
+            next = displayedChannels.length - 1;
+          // Load more if navigating near the end
+          if (next >= displayLimit - 5 && displayLimit < deferredChannels.length) {
+            loadMoreChannels();
+          }
+          setHoveredChannel(displayedChannels[next]);
           return next;
         });
       } else if (key === "enter") {
-        setSelectedChannel(deferredChannels[focusIndex]);
+        setSelectedChannel(displayedChannels[focusIndex]);
       } else if (key === "red") {
-        // Add/remove favorite
-        const ch = deferredChannels[focusIndex];
+        const ch = displayedChannels[focusIndex];
         if (ch) {
           toggleFavorite("live", ch.stream_id);
-          setColorAction(
+          showColorAction(
             favorites.live.includes(ch.stream_id)
               ? "Removed from Favorites"
               : "Added to Favorites",
           );
-          setTimeout(() => setColorAction(""), 1200);
         }
-      } else if (["green", "yellow", "blue"].includes(key)) {
-        setColorAction("Coming soon");
-        setTimeout(() => setColorAction(""), 1200);
       }
     };
     window.addEventListener("tv-remote-key", onTVKey);
     return () => {
-      window.removeEventListener("resize", handleResize);
       window.removeEventListener("tv-remote-key", onTVKey);
     };
-  }, [filteredChannels.length, deferredChannels, focusIndex, favorites.live]);
+  }, [
+    cycleLiveSort,
+    displayedChannels,
+    deferredChannels.length,
+    displayLimit,
+    favorites.live,
+    focusIndex,
+    focusSearch,
+    navigate,
+    selectedChannel,
+    showColorAction,
+    toggleFavoriteFilter,
+  ]);
+
+  useEffect(() => {
+    if (activeCategory !== "fav") {
+      lastNonFavoriteCategoryRef.current = normalizeCategoryId(activeCategory);
+    }
+  }, [activeCategory]);
+
+  useEffect(() => {
+    return () => {
+      if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    };
+  }, []);
 
   const buildLiveChannelUrl = useCallback(
     (channel: LiveStream | null) => {
@@ -1698,74 +1807,38 @@ export default function LiveTV() {
     [activePlaylist],
   );
 
-  useEffect(() => {
-    const currentIndex = selectedChannel
-      ? filteredChannels.findIndex(
-          (c) => c.stream_id === selectedChannel.stream_id,
-        )
-      : -1;
 
-    const channelToWarm =
-      hoveredChannel ||
-      (currentIndex >= 0 ? (filteredChannels[currentIndex + 1] ?? null) : null);
-
-    const url = buildLiveChannelUrl(channelToWarm);
-    if (!url || warmedChannelUrlsRef.current.has(url)) return;
-
-    warmedChannelUrlsRef.current.add(url);
-    const controller = new AbortController();
-    warmAbortRef.current?.abort();
-    warmAbortRef.current = controller;
-
-    fetch(
-      `${window.location.origin}/api/proxy?url=${encodeURIComponent(url)}`,
-      {
-        signal: controller.signal,
-        cache: "force-cache",
-      },
-    ).catch(() => {});
-
-    return () => controller.abort();
-  }, [hoveredChannel, selectedChannel, filteredChannels, buildLiveChannelUrl]);
-
-  const itemData = useMemo(
-    () => ({
-      filteredChannels: deferredChannels,
-      selectedChannelId: selectedChannel?.stream_id,
-      favorites: favorites.live,
-      setSelectedChannel,
-      setHoveredChannel,
-      focusIndex,
-    }),
-    [deferredChannels, selectedChannel?.stream_id, favorites.live, focusIndex],
-  );
 
   const sidebarItems = useMemo(() => {
-    if (!Array.isArray(streams))
+    if (!Array.isArray(listableChannels))
       return [
         { id: "all", name: t.allChannels, count: 0 },
         { id: "fav", name: t.favorites, count: favorites.live.length },
       ];
-    const counts: Record<string, number> = {};
-    for (let i = 0; i < streams.length; i++) {
-      const catId = streams[i].category_id;
-      counts[catId] = (counts[catId] || 0) + 1;
-    }
 
     return [
-      { id: "all", name: t.allChannels, count: streams.length },
+      { id: "all", name: t.allChannels, count: listableChannels.length },
       { id: "fav", name: t.favorites, count: favorites.live.length },
       ...(categories || []).map((cat) => ({
-        id: cat.category_id,
+        id: normalizeCategoryId(cat.category_id),
         name: cat.category_name,
-        count: counts[cat.category_id] || 0,
+        count: categoryCounts[normalizeCategoryId(cat.category_id)] || 0,
         locked:
           (settings.parentalLockedCategories?.live || []).includes(
-            cat.category_id,
+            normalizeCategoryId(cat.category_id),
           ) && !isParentalUnlocked,
       })),
     ];
-  }, [streams, categories, favorites.live.length]);
+  }, [
+    listableChannels,
+    t.allChannels,
+    t.favorites,
+    favorites.live.length,
+    categories,
+    categoryCounts,
+    settings.parentalLockedCategories?.live,
+    isParentalUnlocked,
+  ]);
 
   const handlePinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1784,39 +1857,42 @@ export default function LiveTV() {
   };
 
   const handleCategorySelect = (catId: string) => {
+    const normalizedCategoryId = normalizeCategoryId(catId);
     const locked = settings.parentalLockedCategories?.live || [];
-    if (locked.includes(catId) && !isParentalUnlocked && settings.parentalPin) {
-      setPendingLockedCategoryId(catId);
+    if (
+      locked.includes(normalizedCategoryId) &&
+      !isParentalUnlocked &&
+      settings.parentalPin
+    ) {
+      setPendingLockedCategoryId(normalizedCategoryId);
       setShowPinModal(true);
     } else {
-      setActiveCategory(catId);
+      setActiveCategory(normalizedCategoryId);
     }
   };
-
-  const VirtualList = List as any;
 
   return (
     <div className="flex flex-col h-screen relative">
       {/* TV Color Buttons Bar */}
-      <div className="fixed bottom-4 left-4 z-[100] flex flex-col items-start gap-2 pointer-events-none select-none">
-        <div className="flex gap-2">
+      <div className="fixed bottom-4 right-4 z-[100] flex flex-col items-end gap-2 pointer-events-none select-none">
+        <div className="flex flex-wrap justify-end gap-2 rounded-2xl border border-white/10 bg-black/70 px-3 py-2 backdrop-blur-sm">
           <div className="flex items-center gap-1">
             <span className="w-4 h-4 rounded bg-red-600" />
             <span className="text-xs text-white/80 font-bold">
-              Add/Remove Fav
+              Favorite
             </span>
           </div>
           <div className="flex items-center gap-1">
             <span className="w-4 h-4 rounded bg-green-600" />
-            <span className="text-xs text-white/60 font-bold">Action</span>
+            <span className="text-xs text-white/80 font-bold">Search</span>
           </div>
           <div className="flex items-center gap-1">
             <span className="w-4 h-4 rounded bg-yellow-400" />
-            <span className="text-xs text-white/60 font-bold">Action</span>
+            <span className="text-xs text-white/80 font-bold">Favorites</span>
           </div>
           <div className="flex items-center gap-1">
             <span className="w-4 h-4 rounded bg-blue-600" />
-            <span className="text-xs text-white/60 font-bold">Action</span>
+            <span className="text-xs text-white/80 font-bold">Sort</span>
           </div>
         </div>
         {colorAction && (
@@ -1959,6 +2035,7 @@ export default function LiveTV() {
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
             <input
+              ref={searchInputRef}
               type="text"
               placeholder={t.search}
               value={searchQuery}
@@ -2003,16 +2080,29 @@ export default function LiveTV() {
               </button>
             </div>
           ) : deferredChannels.length > 0 ? (
-            <div className="flex-1">
-              <VirtualList
-                height={listHeight}
-                width="100%"
-                rowCount={deferredChannels.length}
-                rowHeight={72}
-                rowProps={itemData}
-                rowComponent={ChannelRow}
-                className="scrollbar-hide"
-              />
+            <div
+              ref={scrollContainerRef}
+              onScroll={handleChannelListScroll}
+              className="flex-1 overflow-y-auto scrollbar-hide min-h-0"
+            >
+              {displayedChannels.map((channel, index) => (
+                <ChannelRow
+                  key={channel.stream_id}
+                  channel={channel}
+                  isSelected={selectedChannel?.stream_id === channel.stream_id}
+                  isFavorite={favorites.live.includes(channel.stream_id)}
+                  onSelect={setSelectedChannel}
+                  onHover={setHoveredChannel}
+                />
+              ))}
+              {displayLimit < deferredChannels.length && (
+                <div ref={sentinelRef} className="flex items-center justify-center py-4">
+                  <Loader2 className="w-5 h-5 animate-spin text-white/40" />
+                  <span className="ml-2 text-xs text-white/40">
+                    {displayedChannels.length} / {deferredChannels.length}
+                  </span>
+                </div>
+              )}
             </div>
           ) : (
             <div className="p-8 text-center text-white/40">
@@ -2092,7 +2182,7 @@ export default function LiveTV() {
                   <button
                     onClick={() => {
                       if (playerRef.current) {
-                        if (playerRef.current.requestFullscreen) {
+                        if (playerRef.current.requestFullscreen) { // eslint-disable-line @typescript-eslint/no-unnecessary-condition
                           playerRef.current.requestFullscreen();
                         } else if (
                           (playerRef.current as any).webkitRequestFullscreen

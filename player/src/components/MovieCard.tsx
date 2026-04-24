@@ -1,11 +1,21 @@
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { Play } from "lucide-react";
 import { cn } from "../lib/utils";
 
+const failedImageCache = new Set<string>();
+
+const toProxyAssetUrl = (src?: string) => {
+  if (!src || src.trim() === "") return "";
+  if (/^https?:\/\//i.test(src)) {
+    return `${window.location.origin}/api/proxy?url=${encodeURIComponent(src)}`;
+  }
+  return src;
+};
+
 interface MovieCardProps {
   title: string;
-  poster: string;
+  poster?: string;
   onClick?: () => void;
   progress?: number; // 0-1, undefined = no progress bar
   progressLabel?: string; // e.g. "S2E5"
@@ -18,7 +28,14 @@ const MovieCard = memo(function MovieCard({
   progress,
   progressLabel,
 }: MovieCardProps) {
-  const [imgError, setImgError] = useState(false);
+  const resolvedPoster = toProxyAssetUrl(poster);
+  const [imgError, setImgError] = useState(
+    () => !resolvedPoster || failedImageCache.has(resolvedPoster),
+  );
+
+  useEffect(() => {
+    setImgError(!resolvedPoster || failedImageCache.has(resolvedPoster));
+  }, [resolvedPoster]);
 
   return (
     <motion.button
@@ -28,14 +45,18 @@ const MovieCard = memo(function MovieCard({
       className="flex flex-col gap-2 group text-left w-full"
     >
       <div className="relative aspect-[2/3] w-full rounded-lg overflow-hidden border-2 border-transparent group-hover:border-primary transition-all shadow-lg">
-        {poster && !imgError ? (
+        {resolvedPoster && !imgError ? (
           <img
-            src={poster}
+            src={resolvedPoster}
             alt={title}
             loading="lazy"
+            decoding="async"
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
             referrerPolicy="no-referrer"
-            onError={() => setImgError(true)}
+            onError={() => {
+              failedImageCache.add(resolvedPoster);
+              setImgError(true);
+            }}
           />
         ) : (
           <div className="w-full h-full bg-white/5 flex items-center justify-center">

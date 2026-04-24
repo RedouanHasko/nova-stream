@@ -2,8 +2,20 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="HandheldFriendly" content="true" />
+    <!-- TV app meta: prevent text selection, disable callout menus -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="msapplication-tap-highlight" content="no" />
+    <link rel="icon" type="image/png" href="/images/favicon.png" />
+    <title>Nova Stream</title>
+    <style>
+      /* Prevent FOUC: black background until app mounts */
+      body { background: #000; }
+      /* Disable user selection on TV (prevents blue highlight on Tizen/WebOS) */
+      * { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+      input, textarea { -webkit-user-select: text; user-select: text; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

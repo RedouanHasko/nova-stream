@@ -1,7 +1,15 @@
 const express = require("express");
 const router = express.Router();
 const prisma = require("../db");
+const { buildDeviceProfilePatch, sanitizeDeviceProfile } = require("../lib/device-profile");
 const { auth, requireRole } = require("../middleware/auth");
+const { encrypt, decrypt } = require("../lib/field-encryption");
+const {
+  createPublicActivationGuard,
+  logSecurityEvent,
+} = require("../lib/security-monitor");
+
+const deviceFeedGuard = createPublicActivationGuard("device-feed");
 
 function normalizeMac(value = "") {
   return value.toString().trim().toUpperCase();
@@ -59,11 +67,11 @@ function buildStoredPlaylistContent({
       credentials.host &&
       credentials.username &&
       credentials.password
-        ? {
+        ? encrypt(JSON.stringify({
             host: credentials.host,
             username: credentials.username,
             password: credentials.password,
-          }
+          }))
         : null,
     targetApplicationId:
       targetApplicationId !== undefined &&
@@ -80,9 +88,17 @@ function buildStoredPlaylistContent({
 
 function getPlaylistMetadata(playlist = {}) {
   const parsed = safeJsonParse(playlist.content);
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-    ? parsed
-    : {};
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  // Decrypt credentials if they were stored as an encrypted string
+  if (typeof parsed.credentials === "string") {
+    try {
+      const raw = decrypt(parsed.credentials);
+      parsed.credentials = safeJsonParse(raw) || null;
+    } catch {
+      parsed.credentials = null;
+    }
+  }
+  return parsed;
 }
 
 function buildPlaylistPayload(playlist = {}) {
@@ -160,7 +176,7 @@ async function getDeviceAssignments(deviceId, filters = {}) {
     }));
 }
 
-async function buildDeviceFeed({ mac, deviceKey, applicationId, appName }) {
+async function buildDeviceFeed({ mac, deviceKey, applicationId, appName, deviceProfile }) {
   const normalizedMac = normalizeMac(mac);
   const normalizedKey = (deviceKey || "").toString().trim();
 
@@ -180,10 +196,12 @@ async function buildDeviceFeed({ mac, deviceKey, applicationId, appName }) {
   });
 
   if (!device) {
+    const normalizedProfile = sanitizeDeviceProfile(deviceProfile);
     device = await prisma.device.create({
       data: {
         mac: normalizedMac,
         deviceKey: normalizedKey,
+        ...(normalizedProfile || {}),
         status: "INACTIVE",
       },
     });
@@ -191,6 +209,14 @@ async function buildDeviceFeed({ mac, deviceKey, applicationId, appName }) {
     device = await prisma.device.update({
       where: { id: device.id },
       data: { deviceKey: normalizedKey },
+    });
+  }
+
+  const deviceProfilePatch = buildDeviceProfilePatch(device, deviceProfile);
+  if (deviceProfilePatch) {
+    device = await prisma.device.update({
+      where: { id: device.id },
+      data: deviceProfilePatch,
     });
   }
 
@@ -202,6 +228,7 @@ async function buildDeviceFeed({ mac, deviceKey, applicationId, appName }) {
       device: {
         id: device.id,
         mac: device.mac,
+        deviceKey: device.deviceKey,
         status: device.status,
       },
       activations: [],
@@ -285,9 +312,14 @@ router.get(
 );
 
 // Public device feed for real app-side syncing by MAC + key
-router.get("/device-feed", async (req, res) => {
+router.get("/device-feed", deviceFeedGuard, async (req, res) => {
   try {
     const result = await buildDeviceFeed(req.query || {});
+    if (result?.reason === "device_key_mismatch") {
+      logSecurityEvent("device_key_mismatch", req, {
+        mac: normalizeMac(req.query?.mac || req.query?.macAddress || ""),
+      });
+    }
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -295,9 +327,14 @@ router.get("/device-feed", async (req, res) => {
   }
 });
 
-router.post("/device-feed", async (req, res) => {
+router.post("/device-feed", deviceFeedGuard, async (req, res) => {
   try {
     const result = await buildDeviceFeed(req.body || {});
+    if (result?.reason === "device_key_mismatch") {
+      logSecurityEvent("device_key_mismatch", req, {
+        mac: normalizeMac(req.body?.mac || req.body?.macAddress || ""),
+      });
+    }
     res.json(result);
   } catch (err) {
     console.error(err);

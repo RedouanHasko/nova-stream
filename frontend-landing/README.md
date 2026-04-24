@@ -16,5 +16,6 @@ View your app in AI Studio: https://ai.studio/apps/f6cd7d83-0f8d-4cee-b2cc-332db
 1. Install dependencies:
    `npm install`
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+3. Set `VITE_API_URL` to your HTTPS backend origin for production deployments, for example `https://api.example.com`
+4. Run the app:
    `npm run dev`

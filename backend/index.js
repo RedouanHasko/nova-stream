@@ -33,6 +33,7 @@ const uploadsRoutes = require("./routes/uploads");
 const notificationsRoutes = require("./routes/notifications");
 const searchRoutes = require("./routes/search");
 const whatsappGatewayRoutes = require("./routes/whatsapp-gateway");
+const auditLogsRoutes = require("./routes/audit-logs");
 const { startEmbeddedWhatsAppGateway } = require("./services/whatsapp-gateway");
 
 const app = express();
@@ -68,8 +69,22 @@ function getLanIpAddress() {
   return null;
 }
 
+function resolveTrustProxySetting() {
+  const raw = (process.env.TRUST_PROXY || "1").toString().trim().toLowerCase();
+
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+
+  const parsedNumber = Number(raw);
+  if (Number.isInteger(parsedNumber) && parsedNumber >= 0) {
+    return parsedNumber;
+  }
+
+  return raw || 1;
+}
+
 // Security and performance middlewares
-app.set("trust proxy", 1); // if behind a proxy (e.g., nginx, cloud)
+app.set("trust proxy", resolveTrustProxySetting());
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -120,8 +135,18 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+app.use(
+  "/api/pricing/public/stripe/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
+);
+
 // Limit JSON body size to avoid large payload attacks
-app.use(express.json({ limit: "50kb" }));
+app.use(
+  express.json({
+    limit: "50kb",
+    type: (req) => req.originalUrl !== "/api/pricing/public/stripe/webhook",
+  }),
+);
 app.use(express.urlencoded({ extended: true, limit: "50kb" }));
 
 app.use(
@@ -133,6 +158,7 @@ app.use(
     "/api/debug",
     "/api/search",
     "/api/whatsapp-gateway",
+    "/api/audit-logs",
   ],
   sensitiveNoStore,
 );
@@ -166,6 +192,7 @@ app.use("/api/upload", uploadsRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/search", searchRoutes);
 app.use("/api/whatsapp-gateway", whatsappGatewayRoutes);
+app.use("/api/audit-logs", auditLogsRoutes);
 
 // In production you might serve the frontend build from the backend
 if (process.env.NODE_ENV === "production") {

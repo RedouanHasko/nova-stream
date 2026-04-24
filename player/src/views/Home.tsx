@@ -20,6 +20,7 @@ import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService } from "../services/iptvService";
 import { cn } from "../lib/utils";
 import { useT } from "../lib/i18n";
+import { useEffect, useRef } from "react";
 
 export default function Home() {
   const navigate = useNavigate();
@@ -27,17 +28,35 @@ export default function Home() {
     activePlaylist,
     isConnected,
     playlists,
-    clearCache,
-    isPrefetching,
-    prefetchProgress,
+    fetchLive,
+    refreshAccountInfo,
+    isLiveInitialLoading,
+    isVodInitialLoading,
+    isSeriesInitialLoading,
+    sectionLoadProgress,
   } = usePlaylist();
   const t = useT();
 
   const handleReload = () => {
-    clearCache();
-    toast.promise(new Promise((resolve) => setTimeout(resolve, 1000)), {
+    if (!activePlaylist) {
+      toast.error(t.noPlaylistConnected);
+      return;
+    }
+
+    const reloadPromise = Promise.allSettled([
+      fetchLive(),
+      ...(activePlaylist.type === "xtream"
+        ? [refreshAccountInfo(activePlaylist.id)]
+        : []),
+    ]).then((results) => {
+      if (results.every((result) => result.status === "rejected")) {
+        throw new Error("Playlist refresh failed");
+      }
+    });
+
+    toast.promise(reloadPromise, {
       loading: t.reloadingPlaylist,
-      success: t.playlistCacheCleared,
+      success: t.reload,
       error: t.failedToReloadPlaylist,
     });
   };
@@ -45,6 +64,36 @@ export default function Home() {
   const expiryDate = activePlaylist?.accountInfo?.user.exp_date
     ? IPTVService.formatExpiryDate(activePlaylist.accountInfo.user.exp_date)
     : t.unlimited;
+
+  // TV D-pad navigation for the home grid
+  // Grid layout (4 cols): row0=[Live, Movies, Series, Radio], row1=[Live(span), Settings, Account, ChangePlaylist], row2=[Reload, OpenUrl]
+  // We flatten to a linear index; the grid has 4 columns
+  const GRID_COLS = 4;
+  const tileRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const focusIndexRef = useRef(0);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      const total = tileRefs.current.filter(Boolean).length;
+      if (!total) return;
+
+      let idx = focusIndexRef.current;
+      if (key === "right") idx = Math.min(idx + 1, total - 1);
+      else if (key === "left") idx = Math.max(idx - 1, 0);
+      else if (key === "down") idx = Math.min(idx + GRID_COLS, total - 1);
+      else if (key === "up") idx = Math.max(idx - GRID_COLS, 0);
+      else if (key === "enter") {
+        tileRefs.current[idx]?.click();
+        return;
+      } else return;
+
+      focusIndexRef.current = idx;
+      tileRefs.current[idx]?.focus();
+    };
+    window.addEventListener("tv-remote-key", handler);
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, []);
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-8 gap-12 relative">
@@ -67,38 +116,16 @@ export default function Home() {
         <Logo size="lg" />
       </motion.div>
 
-      {/* Prefetch progress */}
-      {isPrefetching && (
-        <motion.div
-          initial={{ opacity: 0, y: -10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="w-full max-w-md flex flex-col items-center gap-2"
-        >
-          <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-            <motion.div
-              className="h-full bg-primary rounded-full"
-              initial={{ width: 0 }}
-              animate={{
-                width: `${(prefetchProgress.completed / prefetchProgress.total) * 100}%`,
-              }}
-              transition={{ duration: 0.3 }}
-            />
-          </div>
-          <span className="text-white/40 text-xs">
-            Loading {prefetchProgress.label}... ({prefetchProgress.completed}/
-            {prefetchProgress.total})
-          </span>
-        </motion.div>
-      )}
-
       {/* Main Grid */}
       <div className="grid grid-cols-4 gap-6 w-full max-w-6xl">
         {/* Large Live Tile */}
         <div className="col-span-1 row-span-2">
           <Tile
+            ref={(el) => { tileRefs.current[0] = el; }}
             icon={Tv}
             label={t.live}
-            isLoading={isPrefetching}
+            isLoading={isLiveInitialLoading}
+            loadProgress={sectionLoadProgress.live}
             large
             onClick={() => navigate("/live")}
             className="h-full"
@@ -107,19 +134,26 @@ export default function Home() {
 
         {/* Medium Tiles */}
         <Tile
+          ref={(el) => { tileRefs.current[1] = el; }}
           icon={Film}
           label={t.movies}
+          isLoading={isVodInitialLoading}
+          loadProgress={sectionLoadProgress.vod}
           onClick={() => navigate("/movies")}
         />
         <Tile
+          ref={(el) => { tileRefs.current[2] = el; }}
           icon={Clapperboard}
           label={t.series}
+          isLoading={isSeriesInitialLoading}
+          loadProgress={sectionLoadProgress.series}
           onClick={() => navigate("/series")}
         />
-        <Tile icon={Radio} label={t.radio} onClick={() => navigate("/radio")} />
+        <Tile ref={(el) => { tileRefs.current[3] = el; }} icon={Radio} label={t.radio} onClick={() => navigate("/radio")} />
 
         {/* Small Action Tiles */}
         <Tile
+          ref={(el) => { tileRefs.current[4] = el; }}
           icon={Settings}
           label={t.settings}
           onClick={() => navigate("/settings")}
@@ -127,6 +161,7 @@ export default function Home() {
         />
 
         <Tile
+          ref={(el) => { tileRefs.current[5] = el; }}
           icon={User}
           label={t.account}
           onClick={() => navigate("/account")}
@@ -138,6 +173,7 @@ export default function Home() {
           }
         />
         <Tile
+          ref={(el) => { tileRefs.current[6] = el; }}
           icon={ListRestart}
           label={t.changePlaylist}
           onClick={() =>
@@ -146,6 +182,7 @@ export default function Home() {
           className="bg-white/5 hover:bg-white/10"
         />
         <Tile
+          ref={(el) => { tileRefs.current[7] = el; }}
           icon={RefreshCw}
           label={t.reload}
           onClick={handleReload}
@@ -153,6 +190,7 @@ export default function Home() {
         />
 
         <Tile
+          ref={(el) => { tileRefs.current[8] = el; }}
           icon={FolderOpen}
           label={t.openUrlFile}
           onClick={() => {

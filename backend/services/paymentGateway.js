@@ -1,4 +1,12 @@
+const crypto = require("crypto");
+
 const STRIPE_API_BASE = "https://api.stripe.com/v1";
+
+function isTruthyEnv(value) {
+  return ["1", "true", "yes", "on"].includes(
+    (value || "").toString().trim().toLowerCase(),
+  );
+}
 
 function getPaymentProvider() {
   return (process.env.PAYMENT_PROVIDER || "manual")
@@ -11,12 +19,29 @@ function isStripeConfigured() {
   return Boolean(process.env.STRIPE_SECRET_KEY);
 }
 
+function getStripeWebhookSecret() {
+  return (process.env.STRIPE_WEBHOOK_SECRET || "").toString().trim();
+}
+
 function isGatewayConfigured() {
   const provider = getPaymentProvider();
   if (provider === "stripe") {
     return isStripeConfigured();
   }
   return false;
+}
+
+function isManualPaymentTestingEnabled() {
+  const provider = getPaymentProvider();
+  if (provider !== "manual") {
+    return false;
+  }
+
+  if (process.env.ALLOW_MANUAL_PAYMENT_TESTING !== undefined) {
+    return isTruthyEnv(process.env.ALLOW_MANUAL_PAYMENT_TESTING);
+  }
+
+  return (process.env.NODE_ENV || "development") !== "production";
 }
 
 function getPublicOrigin(req) {
@@ -29,11 +54,14 @@ function getPublicOrigin(req) {
 
 function getPaymentConfig() {
   const provider = getPaymentProvider();
+  const gatewayConfigured = isGatewayConfigured();
+  const manualTestingEnabled = isManualPaymentTestingEnabled();
 
   return {
     provider,
-    configured: isGatewayConfigured(),
-    mode: isGatewayConfigured() ? "gateway" : "simulation",
+    configured: gatewayConfigured,
+    mode: gatewayConfigured ? "gateway" : "simulation",
+    manualTestingEnabled,
     publishableKey:
       provider === "stripe" ? process.env.STRIPE_PUBLISHABLE_KEY || null : null,
   };
@@ -55,6 +83,7 @@ async function createStripeCheckoutSession({
 
   const body = new URLSearchParams();
   body.set("mode", "payment");
+  body.set("payment_method_types[0]", "card");
   body.set("success_url", successUrl);
   body.set("cancel_url", cancelUrl);
   body.set("line_items[0][price_data][currency]", currency.toLowerCase());
@@ -106,8 +135,8 @@ async function createCheckoutSession(req, details) {
       description: details.description,
       customerEmail: details.customerEmail,
       metadata: details.metadata,
-      successUrl: `${publicOrigin}/activate?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancelUrl: `${publicOrigin}/activate?checkout=cancelled`,
+      successUrl: `${publicOrigin}/device/activate?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: `${publicOrigin}/device/activate?checkout=cancelled`,
     });
 
     return {
@@ -116,6 +145,12 @@ async function createCheckoutSession(req, details) {
       provider,
       ...session,
     };
+  }
+
+  if (!isManualPaymentTestingEnabled()) {
+    throw new Error(
+      "Manual payment testing is disabled. Configure Stripe or enable ALLOW_MANUAL_PAYMENT_TESTING for development.",
+    );
   }
 
   return {
@@ -165,9 +200,66 @@ async function verifyCheckoutSession(sessionId) {
   };
 }
 
+function verifyStripeWebhookEvent(rawBody, signatureHeader) {
+  const secret = getStripeWebhookSecret();
+  if (!secret) {
+    throw new Error("STRIPE_WEBHOOK_SECRET is not configured");
+  }
+
+  if (!signatureHeader) {
+    throw new Error("Missing Stripe signature header");
+  }
+
+  const parts = String(signatureHeader)
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const timestamp = parts
+    .find((part) => part.startsWith("t="))
+    ?.slice(2);
+  const signatures = parts
+    .filter((part) => part.startsWith("v1="))
+    .map((part) => part.slice(3))
+    .filter(Boolean);
+
+  if (!timestamp || signatures.length === 0) {
+    throw new Error("Invalid Stripe signature header");
+  }
+
+  const bodyBuffer = Buffer.isBuffer(rawBody)
+    ? rawBody
+    : Buffer.from(rawBody || "", "utf8");
+  const payload = `${timestamp}.${bodyBuffer.toString("utf8")}`;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(payload, "utf8")
+    .digest("hex");
+
+  const matched = signatures.some((candidate) => {
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(candidate, "hex"),
+        Buffer.from(expected, "hex"),
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  if (!matched) {
+    throw new Error("Stripe webhook signature verification failed");
+  }
+
+  const event = JSON.parse(bodyBuffer.toString("utf8"));
+  return event;
+}
+
 module.exports = {
   getPaymentConfig,
   isGatewayConfigured,
+  isManualPaymentTestingEnabled,
   createCheckoutSession,
   verifyCheckoutSession,
+  verifyStripeWebhookEvent,
 };

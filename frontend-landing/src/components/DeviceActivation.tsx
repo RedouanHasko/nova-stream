@@ -21,8 +21,8 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useI18n } from "../contexts/I18nContext";
 import {
   checkoutPublicPlan,
-  confirmPublicCheckout,
   getPublicApplications,
+  getPublicCheckoutStatus,
   getPublicPaymentConfig,
   getPublicPricingPlans,
   type CheckoutResponse,
@@ -30,6 +30,7 @@ import {
   type PublicPricingPlan,
   verifyActivation,
 } from "../lib/api";
+import { isSecureNavigationTarget, toSecureUrl } from "../lib/security";
 
 const fallbackPlans = [
   {
@@ -150,7 +151,6 @@ export default function DeviceActivation() {
   const [plans, setPlans] = useState<DisplayPlan[]>([]);
   const [applications, setApplications] = useState<PublicApp[]>([]);
   const [selectedApplicationId, setSelectedApplicationId] = useState("");
-  const [paymentMethod, setPaymentMethod] = useState<"card" | "paypal">("card");
   const [isCaptchaChecked, setIsCaptchaChecked] = useState(false);
   const [isLoadingCatalog, setIsLoadingCatalog] = useState(true);
   const [isSubmittingCheckout, setIsSubmittingCheckout] = useState(false);
@@ -162,6 +162,7 @@ export default function DeviceActivation() {
     provider: string;
     configured: boolean;
     mode: string;
+    manualTestingEnabled: boolean;
     publishableKey: string | null;
   } | null>(null);
 
@@ -173,23 +174,56 @@ export default function DeviceActivation() {
     const sessionId = searchParams.get("session_id");
 
     if (checkoutStatus === "success" && sessionId) {
-      setIsConfirmingCheckout(true);
-      confirmPublicCheckout(sessionId)
-        .then((result) => {
+      const pollCheckoutStatus = async (attempt = 0) => {
+        if (!active) return;
+
+        setIsConfirmingCheckout(true);
+        try {
+          const result = await getPublicCheckoutStatus(sessionId);
           if (!active) return;
-          setActivationComplete(result);
-        })
-        .catch((err) => {
+
+          const state = (result.checkoutState || "PENDING").toUpperCase();
+          if (result.activated || state === "PAID") {
+            setActivationComplete(result);
+            if (result.mac) {
+              setMacAddress(result.mac);
+            }
+            setIsConfirmingCheckout(false);
+            return;
+          }
+
+          if (state === "FAILED" || state === "EXPIRED") {
+            setNotice(
+              state === "EXPIRED"
+                ? "The Stripe checkout session expired. Please start the payment again."
+                : "The payment was not completed. Please try again or contact support.",
+            );
+            setIsConfirmingCheckout(false);
+            return;
+          }
+
+          if (attempt >= 14) {
+            setNotice(
+              "Payment received. We are still finalizing activation on the server. Please wait a few seconds and reopen this page if needed.",
+            );
+            setIsConfirmingCheckout(false);
+            return;
+          }
+
+          window.setTimeout(() => {
+            void pollCheckoutStatus(attempt + 1);
+          }, 2000);
+        } catch (err: any) {
           if (!active) return;
           setNotice(
             err?.message ||
-              "Could not confirm your payment. Please contact support.",
+              "Could not retrieve your payment status. Please contact support if this continues.",
           );
-        })
-        .finally(() => {
-          if (!active) return;
           setIsConfirmingCheckout(false);
-        });
+        }
+      };
+
+      void pollCheckoutStatus();
       return () => {
         active = false;
       };
@@ -205,7 +239,8 @@ export default function DeviceActivation() {
       getPublicPaymentConfig().catch(() => ({
         provider: "manual",
         configured: false,
-        mode: "manual",
+        mode: "simulation",
+        manualTestingEnabled: true,
         publishableKey: null,
       })),
     ])
@@ -370,7 +405,7 @@ export default function DeviceActivation() {
       return;
     }
 
-    if (!paymentConfig?.configured) {
+    if (!paymentConfig?.configured && !paymentConfig?.manualTestingEnabled) {
       handleManualContact(SUPPORT_WHATSAPP ? "whatsapp" : "email");
       return;
     }
@@ -385,8 +420,12 @@ export default function DeviceActivation() {
       });
 
       if (response.mode === "redirect" && response.checkoutUrl) {
-        // Real payment gateway — redirect to Stripe/external checkout
-        window.location.href = response.checkoutUrl;
+        if (!isSecureNavigationTarget(response.checkoutUrl)) {
+          throw new Error(
+            "Blocked insecure checkout redirect. Configure the payment gateway to return an HTTPS checkout URL.",
+          );
+        }
+        window.location.href = toSecureUrl(response.checkoutUrl);
         return;
       }
 
@@ -400,25 +439,30 @@ export default function DeviceActivation() {
 
   const displayPlans = plans.length > 0 ? plans : fallbackPlans;
 
-  // Stripe is confirming payment on return from gateway
+  // Backend webhook is finalizing payment on return from Stripe Checkout
   if (isConfirmingCheckout) {
     return (
       <div className="pt-24 min-h-screen bg-black flex items-center justify-center">
         <div className="text-center">
           <div className="w-16 h-16 border-4 border-red-600 border-t-transparent rounded-full animate-spin mx-auto mb-6" />
           <p className="text-white text-lg font-semibold">
-            Confirming your payment…
+            Securing your payment confirmation...
           </p>
           <p className="text-gray-500 text-sm mt-2">
-            Please wait, do not refresh.
+            Stripe has accepted the payment. Our backend is finishing activation.
           </p>
         </div>
       </div>
     );
   }
 
-  // Activation completed (simulation or post Stripe confirmation)
+  // Activation completed after backend confirmation
   if (activationComplete) {
+    const resolvedMac =
+      activationComplete.mac ||
+      ((activationComplete.device as { mac?: string } | null)?.mac ?? null) ||
+      macAddress;
+
     return (
       <div className="pt-24 min-h-screen bg-black selection:bg-red-500/30 selection:text-red-200 flex items-center justify-center">
         <motion.div
@@ -434,7 +478,9 @@ export default function DeviceActivation() {
           </h2>
           <p className="text-gray-400 mb-2">
             Your device{" "}
-            <span className="text-white font-mono font-bold">{macAddress}</span>{" "}
+            <span className="text-white font-mono font-bold">
+              {resolvedMac || "Unknown device"}
+            </span>{" "}
             is now active.
           </p>
           {activationComplete.mode === "simulation" && (
@@ -452,6 +498,16 @@ export default function DeviceActivation() {
             className="w-full py-3 rounded-2xl bg-red-600 hover:bg-red-700 text-white font-bold transition-all"
           >
             Back to Home
+          </button>
+          <button
+            onClick={() =>
+              navigate(
+                `/device/playlists${resolvedMac ? `?mac=${encodeURIComponent(resolvedMac)}` : ""}`,
+              )
+            }
+            className="w-full mt-3 py-3 rounded-2xl border border-white/20 bg-white/5 hover:bg-white/10 text-white font-bold transition-all"
+          >
+            Open Client Dashboard
           </button>
         </motion.div>
       </div>
@@ -550,13 +606,20 @@ export default function DeviceActivation() {
                       <CreditCard size={20} className="text-red-600" />
                       {paymentConfig?.configured
                         ? "2. Payment Method"
-                        : "2. Contact For Activation"}
+                        : paymentConfig?.manualTestingEnabled
+                          ? "2. Manual Test Checkout"
+                          : "2. Contact For Activation"}
                     </h3>
                     <div className="mb-6 space-y-2">
-                      <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-1">
+                      <label
+                        htmlFor="selected-application"
+                        className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-1"
+                      >
                         Application
                       </label>
                       <select
+                        id="selected-application"
+                        title="Application"
                         value={selectedApplicationId}
                         onChange={(event) =>
                           setSelectedApplicationId(event.target.value)
@@ -580,113 +643,42 @@ export default function DeviceActivation() {
                       </select>
                     </div>
                     {paymentConfig?.configured ? (
-                      <>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <button
-                            onClick={() => setPaymentMethod("card")}
-                            className={`p-6 rounded-2xl border-2 transition-all flex items-center gap-4 ${
-                              paymentMethod === "card"
-                                ? "bg-red-600/10 border-red-600 shadow-lg shadow-red-600/10"
-                                : "bg-white/5 border-white/5 hover:border-white/20"
-                            }`}
-                          >
-                            <div
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
-                                paymentMethod === "card"
-                                  ? "border-red-600 bg-red-600"
-                                  : "border-gray-600"
-                              }`}
-                            >
-                              {paymentMethod === "card" && (
-                                <Check size={12} className="text-white" />
-                              )}
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <CreditCard size={20} className="text-white" />
-                              <span className="font-bold text-white">
-                                Credit Card
-                              </span>
-                            </div>
-                          </button>
-                          <button
-                            onClick={() => setPaymentMethod("paypal")}
-                            className={`p-6 rounded-2xl border-2 transition-all flex items-center gap-4 ${
-                              paymentMethod === "paypal"
-                                ? "bg-red-600/10 border-red-600 shadow-lg shadow-red-600/10"
-                                : "bg-white/5 border-white/5 hover:border-white/20"
-                            }`}
-                          >
-                            <div
-                              className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
-                                paymentMethod === "paypal"
-                                  ? "border-red-600 bg-red-600"
-                                  : "border-gray-600"
-                              }`}
-                            >
-                              {paymentMethod === "paypal" && (
-                                <Check size={12} className="text-white" />
-                              )}
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <img
-                                src="https://www.paypalobjects.com/webstatic/mktg/logo/pp_cc_mark_37x23.jpg"
-                                alt="PayPal"
-                                className="h-5 rounded"
-                              />
-                              <span className="font-bold text-white">
-                                PayPal
-                              </span>
-                            </div>
-                          </button>
+                      <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5 space-y-3">
+                        <div className="flex items-start gap-3">
+                          <div className="mt-0.5 rounded-xl bg-emerald-500/20 p-2">
+                            <ShieldCheck size={18} className="text-emerald-300" />
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-white">
+                              Stripe hosted checkout only
+                            </p>
+                            <p className="text-sm text-gray-300 leading-relaxed mt-1">
+                              Card details are entered directly on Stripe and tokenized there. This website and our backend never receive raw credit card numbers, expiry dates, or CVV values.
+                            </p>
+                          </div>
                         </div>
-
-                        {paymentMethod === "card" && (
-                          <motion.div
-                            initial={{ opacity: 0, height: 0 }}
-                            animate={{ opacity: 1, height: "auto" }}
-                            className="mt-8 space-y-4"
-                          >
-                            <div className="space-y-2">
-                              <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-1">
-                                Card Number
-                              </label>
-                              <div className="relative">
-                                <CreditCard
-                                  className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-600"
-                                  size={18}
-                                />
-                                <input
-                                  type="text"
-                                  placeholder="0000 0000 0000 0000"
-                                  className="w-full bg-white/5 border border-white/10 rounded-xl pl-12 pr-5 py-3.5 text-white placeholder:text-gray-700 focus:outline-none focus:border-red-500 transition-all font-mono"
-                                />
-                              </div>
-                            </div>
-                            <div className="grid grid-cols-2 gap-4">
-                              <div className="space-y-2">
-                                <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-1">
-                                  Expiry Date
-                                </label>
-                                <input
-                                  type="text"
-                                  placeholder="MM/YY"
-                                  className="w-full bg-white/5 border border-white/10 rounded-xl px-5 py-3.5 text-white placeholder:text-gray-700 focus:outline-none focus:border-red-500 transition-all font-mono"
-                                />
-                              </div>
-                              <div className="space-y-2">
-                                <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-1">
-                                  CVV
-                                </label>
-                                <input
-                                  type="text"
-                                  placeholder="•••"
-                                  className="w-full bg-white/5 border border-white/10 rounded-xl px-5 py-3.5 text-white placeholder:text-gray-700 focus:outline-none focus:border-red-500 transition-all font-mono"
-                                />
-                              </div>
-                            </div>
-                          </motion.div>
-                        )}
-                      </>
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-xs text-gray-300 leading-relaxed">
+                          After payment, Stripe sends the result to our backend webhook. Activation is completed server-side before this page shows success.
+                        </div>
+                      </div>
+                    ) : paymentConfig?.manualTestingEnabled ? (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: "auto" }}
+                        className="mt-2 space-y-4"
+                      >
+                        <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-5">
+                          <p className="text-sm font-semibold text-white mb-2">
+                            Manual test mode is enabled.
+                          </p>
+                          <p className="text-sm text-gray-300 leading-relaxed">
+                            Stripe is not configured yet, so this checkout button will create the activation immediately using the backend's development manual-payment flow.
+                          </p>
+                        </div>
+                        <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-xs text-gray-300 leading-relaxed">
+                          Use this only for development and internal testing. When Stripe is configured later, this same flow will automatically switch to hosted checkout.
+                        </div>
+                      </motion.div>
                     ) : (
                       <motion.div
                         initial={{ opacity: 0, height: 0 }}
@@ -770,9 +762,9 @@ export default function DeviceActivation() {
 
                     {!paymentConfig?.configured && (
                       <p className="mb-4 text-sm text-gray-400 leading-relaxed">
-                        Payments are not live yet. We will prepare your
-                        activation request with the selected plan and
-                        application details.
+                        {paymentConfig?.manualTestingEnabled
+                          ? "Payments are not live yet. The backend will complete this activation in manual test mode so you can validate the flow before Stripe is connected."
+                          : "Payments are not live yet. We will prepare your activation request with the selected plan and application details."}
                       </p>
                     )}
 
@@ -795,12 +787,16 @@ export default function DeviceActivation() {
                       }`}
                     >
                       {isSubmittingCheckout
-                        ? "Processing..."
+                        ? paymentConfig?.configured
+                          ? "Redirecting to Stripe..."
+                          : "Activating..."
                         : paymentConfig?.configured
-                          ? "Complete Payment"
-                          : SUPPORT_WHATSAPP
-                            ? "Contact Us On WhatsApp"
-                            : "Contact Support"}
+                          ? "Pay Securely With Stripe"
+                          : paymentConfig?.manualTestingEnabled
+                            ? "Activate In Manual Test Mode"
+                            : SUPPORT_WHATSAPP
+                              ? "Contact Us On WhatsApp"
+                              : "Contact Support"}
                     </button>
 
                     <button
@@ -826,11 +822,9 @@ export default function DeviceActivation() {
                           alt="Mastercard"
                           className="h-5"
                         />
-                        <img
-                          src="https://upload.wikimedia.org/wikipedia/commons/b/b5/PayPal.svg"
-                          alt="PayPal"
-                          className="h-4"
-                        />
+                        <span className="text-xs font-semibold tracking-[0.25em] text-white/80 uppercase">
+                          Stripe
+                        </span>
                       </div>
                     )}
                   </div>

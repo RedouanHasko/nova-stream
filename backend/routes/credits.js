@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const prisma = require("../db");
 const { auth, requireRole } = require("../middleware/auth");
+const { logSecurityEvent } = require("../lib/security-monitor");
 const {
   notifyUsersByRole,
   notifyResellerUsers,
@@ -157,6 +158,20 @@ async function safeNotify(callback) {
   }
 }
 
+/**
+ * Extract the real client IP, honouring X-Forwarded-For when the app is
+ * behind a reverse proxy.  The value is used only for audit logging — it
+ * is never used in any authorization decision.
+ */
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    const first = forwarded.split(",")[0].trim();
+    if (first) return first;
+  }
+  return req.socket?.remoteAddress || req.ip || null;
+}
+
 // Transfer or revoke credits
 router.post(
   "/transfer",
@@ -179,8 +194,8 @@ router.post(
         return res.status(404).json({ error: "Recipient reseller not found" });
 
       const role = (req.user.role || "").toString().toLowerCase();
-      const supportsTx = typeof prisma.$transaction === "function";
       const actorName = req.user?.name || req.user?.email || "System";
+      const ipAddress = getClientIp(req);
 
       // if requester is a reseller, ensure they can only transfer to their own sub-resellers or themselves
       if (role === "reseller") {
@@ -189,11 +204,6 @@ router.post(
           return res.status(403).json({ error: "Forbidden" });
         }
       }
-
-      // Helper: create transaction record via client/adapter
-      const createTransaction = async (data) => {
-        return prisma.creditTransaction.create({ data });
-      };
 
       // Handle revoke
       if (action === "revoke") {
@@ -208,181 +218,90 @@ router.post(
           });
         }
 
-        if (supportsTx) {
-          const result = await prisma.$transaction(async (tx) => {
-            const target = await tx.reseller.findUnique({
-              where: { id: to.id },
-            });
-            if (!target) throw new Error("NOT_FOUND");
-            if (Number(target.credits) < amt) throw new Error("INSUFFICIENT");
+        const result = await prisma.$transaction(async (tx) => {
+          const target = await tx.reseller.findUnique({ where: { id: to.id } });
+          if (!target) throw new Error("NOT_FOUND");
+          if (Number(target.credits) < amt) throw new Error("INSUFFICIENT");
 
-            let fromBefore = null;
-            let fromAfter = null;
+          let fromBefore = null;
+          let fromAfter = null;
 
-            if (fromId) {
-              fromBefore = await tx.reseller.findUnique({
-                where: { id: fromId },
-              });
-              if (!fromBefore) throw new Error("SENDER_NOT_FOUND");
-            }
-
-            const toAfter = await tx.reseller.update({
-              where: { id: to.id },
-              data: { credits: { decrement: amt } },
-            });
-
-            if (fromId) {
-              fromAfter = await tx.reseller.update({
-                where: { id: fromId },
-                data: { credits: { increment: amt } },
-              });
-            }
-
-            if (fromId) {
-              assertExactCreditTransfer({
-                amount: amt,
-                fromBefore: fromBefore?.credits,
-                fromAfter: fromAfter?.credits,
-                toBefore: target?.credits,
-                toAfter: toAfter?.credits,
-              });
-            } else {
-              assertBurnedCredits({
-                amount: amt,
-                before: target?.credits,
-                after: toAfter?.credits,
-              });
-            }
-
-            const txrec = await tx.creditTransaction.create({
-              data: {
-                type: "REVOKE",
-                status: "COMPLETED",
-                amount: amt,
-                fromResellerId: fromId,
-                toResellerId: to.id,
-                performedById: req.user.id,
-                notes,
-                fromBeforeBalance: fromBefore
-                  ? Number(fromBefore.credits)
-                  : null,
-                fromAfterBalance: fromAfter ? Number(fromAfter.credits) : null,
-                toBeforeBalance: Number(target.credits),
-                toAfterBalance: Number(toAfter.credits),
-              },
-            });
-            return txrec;
-          });
-          await safeNotify(async () => {
-            await notifyResellerUsers(to.id, {
-              type: "CREDITS_REVOKED",
-              title: "Credits revoked",
-              message: `${formatCredits(amt)} credits were removed from your account by ${actorName}.`,
-              link: "/credits",
-            });
-
-            if (fromId) {
-              await notifyResellerUsers(fromId, {
-                type: "CREDITS_RETURNED",
-                title: "Credits restored",
-                message: `${formatCredits(amt)} credits were returned to your account from ${to.name || "your sub-reseller"}.`,
-                link: "/credits",
-              });
-            }
-          });
-          return res.json(result);
-        } else {
-          // adapter fallback
-          const target = await prisma.reseller.findUnique({
-            where: { id: to.id },
-          });
-          if (!target) return res.status(404).json({ error: "Not found" });
-          if (Number(target.credits) < amt)
-            return res.status(400).json({ error: "Insufficient credits" });
-
-          let senderBefore = null;
           if (fromId) {
-            senderBefore = await prisma.reseller.findUnique({
-              where: { id: fromId },
-            });
-            if (!senderBefore) {
-              return res
-                .status(404)
-                .json({ error: "Sender reseller not found" });
-            }
+            fromBefore = await tx.reseller.findUnique({ where: { id: fromId } });
+            if (!fromBefore) throw new Error("SENDER_NOT_FOUND");
           }
 
-          await prisma.reseller.update({
+          const toAfter = await tx.reseller.update({
             where: { id: to.id },
             data: { credits: { decrement: amt } },
           });
 
           if (fromId) {
-            await prisma.reseller.update({
+            fromAfter = await tx.reseller.update({
               where: { id: fromId },
               data: { credits: { increment: amt } },
             });
           }
 
-          const after = await prisma.reseller.findUnique({
-            where: { id: to.id },
-          });
-          const senderAfter = fromId
-            ? await prisma.reseller.findUnique({
-                where: { id: fromId },
-              })
-            : null;
-
           if (fromId) {
             assertExactCreditTransfer({
               amount: amt,
-              fromBefore: senderBefore?.credits,
-              fromAfter: senderAfter?.credits,
+              fromBefore: fromBefore?.credits,
+              fromAfter: fromAfter?.credits,
               toBefore: target?.credits,
-              toAfter: after?.credits,
+              toAfter: toAfter?.credits,
             });
           } else {
             assertBurnedCredits({
               amount: amt,
               before: target?.credits,
-              after: after?.credits,
+              after: toAfter?.credits,
             });
           }
 
-          const txrec = await createTransaction({
-            type: "REVOKE",
-            status: "COMPLETED",
-            amount: amt,
-            fromResellerId: fromId,
-            toResellerId: to.id,
-            performedById: req.user.id,
-            notes,
-            fromBeforeBalance: senderBefore
-              ? Number(senderBefore.credits)
-              : null,
-            fromAfterBalance: senderAfter ? Number(senderAfter.credits) : null,
-            toBeforeBalance: Number(target.credits),
-            toAfterBalance: Number(after.credits),
+          const txrec = await tx.creditTransaction.create({
+            data: {
+              type: "REVOKE",
+              status: "COMPLETED",
+              amount: amt,
+              fromResellerId: fromId,
+              toResellerId: to.id,
+              performedById: req.user.id,
+              notes,
+              ipAddress,
+              fromBeforeBalance: fromBefore ? Number(fromBefore.credits) : null,
+              fromAfterBalance: fromAfter ? Number(fromAfter.credits) : null,
+              toBeforeBalance: Number(target.credits),
+              toAfterBalance: Number(toAfter.credits),
+            },
           });
-          await safeNotify(async () => {
-            await notifyResellerUsers(to.id, {
-              type: "CREDITS_REVOKED",
-              title: "Credits revoked",
-              message: `${formatCredits(amt)} credits were removed from your account by ${actorName}.`,
+          return txrec;
+        });
+
+        await safeNotify(async () => {
+          await notifyResellerUsers(to.id, {
+            type: "CREDITS_REVOKED",
+            title: "Credits revoked",
+            message: `${formatCredits(amt)} credits were removed from your account by ${actorName}.`,
+            link: "/credits",
+          });
+          if (fromId) {
+            await notifyResellerUsers(fromId, {
+              type: "CREDITS_RETURNED",
+              title: "Credits restored",
+              message: `${formatCredits(amt)} credits were returned to your account from ${to.name || "your sub-reseller"}.`,
               link: "/credits",
             });
-
-            if (fromId) {
-              await notifyResellerUsers(fromId, {
-                type: "CREDITS_RETURNED",
-                title: "Credits restored",
-                message: `${formatCredits(amt)} credits were returned to your account from ${to.name || "your sub-reseller"}.`,
-                link: "/credits",
-              });
-            }
-          });
-          return res.json(txrec);
-        }
+          }
+        });
+        logSecurityEvent("credit_revoke", req, {
+          userId: req.user?.id,
+          email: req.user?.email,
+          amount: amt,
+          targetResellerId: to.id,
+          transactionId: result?.id,
+        });
+        return res.json(result);
       }
 
       // Transfer / Topup flows
@@ -390,27 +309,87 @@ router.post(
         const fromId = Number(req.user.resellerId || 0);
         if (!fromId || Number(fromId) === Number(to.id)) {
           return res.status(400).json({
-            error:
-              "Credits can only be sent to a different sub-reseller account.",
+            error: "Credits can only be sent to a different sub-reseller account.",
           });
         }
 
-        const from = await prisma.reseller.findUnique({
-          where: { id: fromId },
-        });
-        if (!from)
-          return res.status(404).json({ error: "Sender reseller not found" });
-        if (Number(from.credits) < amt)
-          return res.status(400).json({ error: "Insufficient credits" });
+        const result = await prisma.$transaction(async (tx) => {
+          const fromBefore = await tx.reseller.findUnique({ where: { id: fromId } });
+          const toBefore = await tx.reseller.findUnique({ where: { id: to.id } });
+          if (!fromBefore) throw new Error("SENDER_NOT_FOUND");
+          if (!toBefore) throw new Error("RECIPIENT_NOT_FOUND");
+          if (Number(fromBefore.credits) < amt) throw new Error("INSUFFICIENT");
 
-        if (supportsTx) {
+          const fromAfter = await tx.reseller.update({
+            where: { id: fromId },
+            data: { credits: { decrement: amt } },
+          });
+          const toAfter = await tx.reseller.update({
+            where: { id: to.id },
+            data: { credits: { increment: amt } },
+          });
+
+          assertExactCreditTransfer({
+            amount: amt,
+            fromBefore: fromBefore?.credits,
+            fromAfter: fromAfter?.credits,
+            toBefore: toBefore?.credits,
+            toAfter: toAfter?.credits,
+          });
+
+          const txrec = await tx.creditTransaction.create({
+            data: {
+              type: "TRANSFER",
+              status: "COMPLETED",
+              amount: amt,
+              fromResellerId: fromId,
+              toResellerId: to.id,
+              performedById: req.user.id,
+              notes,
+              ipAddress,
+              fromBeforeBalance: Number(fromBefore.credits),
+              fromAfterBalance: Number(fromAfter.credits),
+              toBeforeBalance: Number(toBefore.credits),
+              toAfterBalance: Number(toAfter.credits),
+            },
+          });
+          return txrec;
+        });
+
+        await safeNotify(() =>
+          notifyResellerUsers(to.id, {
+            type: "CREDITS_RECEIVED",
+            title: "Credits received",
+            message: `You received ${formatCredits(amt)} credits from ${actorName}.`,
+            link: "/credits",
+          }),
+        );
+        logSecurityEvent("credit_transfer", req, {
+          userId: req.user?.id,
+          email: req.user?.email,
+          amount: amt,
+          toResellerId: to.id,
+          transactionId: result?.id,
+        });
+        return res.json(result);
+      }
+
+      if (role === "superadmin") {
+        if (senderId) {
+          const fromId = Number(senderId);
+          if (!fromId || Number(fromId) === Number(to.id)) {
+            return res.status(400).json({
+              error: "Admin credit moves must target a different reseller account.",
+            });
+          }
+
           const result = await prisma.$transaction(async (tx) => {
-            const fromBefore = await tx.reseller.findUnique({
-              where: { id: fromId },
-            });
-            const toBefore = await tx.reseller.findUnique({
-              where: { id: to.id },
-            });
+            const fromBefore = await tx.reseller.findUnique({ where: { id: fromId } });
+            const toBefore = await tx.reseller.findUnique({ where: { id: to.id } });
+            if (!fromBefore) throw new Error("SENDER_NOT_FOUND");
+            if (!toBefore) throw new Error("RECIPIENT_NOT_FOUND");
+            if (Number(fromBefore.credits) < amt) throw new Error("INSUFFICIENT");
+
             const fromAfter = await tx.reseller.update({
               where: { id: fromId },
               data: { credits: { decrement: amt } },
@@ -419,6 +398,15 @@ router.post(
               where: { id: to.id },
               data: { credits: { increment: amt } },
             });
+
+            assertExactCreditTransfer({
+              amount: amt,
+              fromBefore: fromBefore?.credits,
+              fromAfter: fromAfter?.credits,
+              toBefore: toBefore?.credits,
+              toAfter: toAfter?.credits,
+            });
+
             const txrec = await tx.creditTransaction.create({
               data: {
                 type: "TRANSFER",
@@ -428,6 +416,7 @@ router.post(
                 toResellerId: to.id,
                 performedById: req.user.id,
                 notes,
+                ipAddress,
                 fromBeforeBalance: Number(fromBefore.credits),
                 fromAfterBalance: Number(fromAfter.credits),
                 toBeforeBalance: Number(toBefore.credits),
@@ -436,253 +425,38 @@ router.post(
             });
             return txrec;
           });
-          await safeNotify(() =>
-            notifyResellerUsers(to.id, {
+
+          await safeNotify(async () => {
+            await notifyResellerUsers(to.id, {
               type: "CREDITS_RECEIVED",
               title: "Credits received",
-              message: `You received ${formatCredits(amt)} credits from ${actorName}.`,
+              message: `You received ${formatCredits(amt)} credits via an admin transfer.`,
               link: "/credits",
-            }),
-          );
-          return res.json(result);
-        } else {
-          // adapter fallback: sequential updates
-          const toBefore = await prisma.reseller.findUnique({
-            where: { id: to.id },
+            });
+            await notifyResellerUsers(Number(senderId), {
+              type: "CREDITS_SENT",
+              title: "Credits transferred out",
+              message: `An admin moved ${formatCredits(amt)} credits from your account to ${to.name || `#${to.id}`}.`,
+              link: "/credits",
+            });
           });
-          await prisma.reseller.update({
-            where: { id: from.id || fromId },
-            data: { credits: { decrement: amt } },
-          });
-          await prisma.reseller.update({
-            where: { id: to.id },
-            data: { credits: { increment: amt } },
-          });
-          const fromAfter = await prisma.reseller.findUnique({
-            where: { id: fromId },
-          });
-          const toAfter = await prisma.reseller.findUnique({
-            where: { id: to.id },
-          });
-
-          assertExactCreditTransfer({
+          logSecurityEvent("credit_admin_transfer", req, {
+            userId: req.user?.id,
+            email: req.user?.email,
             amount: amt,
-            fromBefore: from?.credits,
-            fromAfter: fromAfter?.credits,
-            toBefore: toBefore?.credits,
-            toAfter: toAfter?.credits,
-          });
-
-          const txrec = await createTransaction({
-            type: "TRANSFER",
-            status: "COMPLETED",
-            amount: amt,
-            fromResellerId: fromId,
+            fromResellerId: senderId,
             toResellerId: to.id,
-            performedById: req.user.id,
-            notes,
-            fromBeforeBalance: Number(from.credits),
-            fromAfterBalance: Number(fromAfter.credits),
-            toBeforeBalance: Number(toBefore.credits),
-            toAfterBalance: Number(toAfter.credits),
+            transactionId: result?.id,
           });
-          await safeNotify(() =>
-            notifyResellerUsers(to.id, {
-              type: "CREDITS_RECEIVED",
-              title: "Credits received",
-              message: `You received ${formatCredits(amt)} credits from ${actorName}.`,
-              link: "/credits",
-            }),
-          );
-          return res.json(txrec);
-        }
-      }
-
-      if (role === "superadmin") {
-        if (senderId) {
-          const fromId = Number(senderId);
-          if (!fromId || Number(fromId) === Number(to.id)) {
-            return res.status(400).json({
-              error:
-                "Admin credit moves must target a different reseller account.",
-            });
-          }
-
-          const from = await prisma.reseller.findUnique({
-            where: { id: fromId },
-          });
-          if (!from)
-            return res.status(404).json({ error: "Sender reseller not found" });
-          if (Number(from.credits) < amt)
-            return res
-              .status(400)
-              .json({ error: "Insufficient credits on sender" });
-
-          if (supportsTx) {
-            const result = await prisma.$transaction(async (tx) => {
-              const fromBefore = await tx.reseller.findUnique({
-                where: { id: fromId },
-              });
-              const toBefore = await tx.reseller.findUnique({
-                where: { id: to.id },
-              });
-              const fromAfter = await tx.reseller.update({
-                where: { id: fromId },
-                data: { credits: { decrement: amt } },
-              });
-              const toAfter = await tx.reseller.update({
-                where: { id: to.id },
-                data: { credits: { increment: amt } },
-              });
-
-              assertExactCreditTransfer({
-                amount: amt,
-                fromBefore: fromBefore?.credits,
-                fromAfter: fromAfter?.credits,
-                toBefore: toBefore?.credits,
-                toAfter: toAfter?.credits,
-              });
-
-              const txrec = await tx.creditTransaction.create({
-                data: {
-                  type: "TRANSFER",
-                  status: "COMPLETED",
-                  amount: amt,
-                  fromResellerId: fromId,
-                  toResellerId: to.id,
-                  performedById: req.user.id,
-                  notes,
-                  fromBeforeBalance: Number(fromBefore.credits),
-                  fromAfterBalance: Number(fromAfter.credits),
-                  toBeforeBalance: Number(toBefore.credits),
-                  toAfterBalance: Number(toAfter.credits),
-                },
-              });
-              return txrec;
-            });
-            await safeNotify(async () => {
-              await notifyResellerUsers(to.id, {
-                type: "CREDITS_RECEIVED",
-                title: "Credits received",
-                message: `You received ${formatCredits(amt)} credits via an admin transfer.`,
-                link: "/credits",
-              });
-              await notifyResellerUsers(fromId, {
-                type: "CREDITS_SENT",
-                title: "Credits transferred out",
-                message: `An admin moved ${formatCredits(amt)} credits from your account to ${to.name || `#${to.id}`}.`,
-                link: "/credits",
-              });
-            });
-            return res.json(result);
-          } else {
-            const toBefore = await prisma.reseller.findUnique({
-              where: { id: to.id },
-            });
-            await prisma.reseller.update({
-              where: { id: fromId },
-              data: { credits: { decrement: amt } },
-            });
-            await prisma.reseller.update({
-              where: { id: to.id },
-              data: { credits: { increment: amt } },
-            });
-            const fromAfter = await prisma.reseller.findUnique({
-              where: { id: fromId },
-            });
-            const toAfter = await prisma.reseller.findUnique({
-              where: { id: to.id },
-            });
-
-            assertExactCreditTransfer({
-              amount: amt,
-              fromBefore: from?.credits,
-              fromAfter: fromAfter?.credits,
-              toBefore: toBefore?.credits,
-              toAfter: toAfter?.credits,
-            });
-
-            const txrec = await createTransaction({
-              type: "TRANSFER",
-              status: "COMPLETED",
-              amount: amt,
-              fromResellerId: fromId,
-              toResellerId: to.id,
-              performedById: req.user.id,
-              notes,
-              fromBeforeBalance: Number(from.credits),
-              fromAfterBalance: Number(fromAfter.credits),
-              toBeforeBalance: Number(toBefore.credits),
-              toAfterBalance: Number(toAfter.credits),
-            });
-            await safeNotify(async () => {
-              await notifyResellerUsers(to.id, {
-                type: "CREDITS_RECEIVED",
-                title: "Credits received",
-                message: `You received ${formatCredits(amt)} credits via an admin transfer.`,
-                link: "/credits",
-              });
-              await notifyResellerUsers(fromId, {
-                type: "CREDITS_SENT",
-                title: "Credits transferred out",
-                message: `An admin moved ${formatCredits(amt)} credits from your account to ${to.name || `#${to.id}`}.`,
-                link: "/credits",
-              });
-            });
-            return res.json(txrec);
-          }
-        }
-
-        // top-up by admin
-        if (supportsTx) {
-          const result = await prisma.$transaction(async (tx) => {
-            const toBefore = await tx.reseller.findUnique({
-              where: { id: to.id },
-            });
-            const toAfter = await tx.reseller.update({
-              where: { id: to.id },
-              data: { credits: { increment: amt } },
-            });
-
-            assertMintedCredits({
-              amount: amt,
-              before: toBefore?.credits,
-              after: toAfter?.credits,
-            });
-
-            const txrec = await tx.creditTransaction.create({
-              data: {
-                type: "TOPUP",
-                status: "COMPLETED",
-                amount: amt,
-                toResellerId: to.id,
-                performedById: req.user.id,
-                notes,
-                toBeforeBalance: Number(toBefore.credits),
-                toAfterBalance: Number(toAfter.credits),
-              },
-            });
-            return txrec;
-          });
-          await safeNotify(() =>
-            notifyResellerUsers(to.id, {
-              type: "CREDITS_ADDED",
-              title: "Credits added",
-              message: `${formatCredits(amt)} credits were added to your account by ${actorName}.`,
-              link: "/credits",
-            }),
-          );
           return res.json(result);
-        } else {
-          const toBefore = await prisma.reseller.findUnique({
-            where: { id: to.id },
-          });
-          await prisma.reseller.update({
+        }
+
+        // top-up by admin (minting)
+        const result = await prisma.$transaction(async (tx) => {
+          const toBefore = await tx.reseller.findUnique({ where: { id: to.id } });
+          const toAfter = await tx.reseller.update({
             where: { id: to.id },
             data: { credits: { increment: amt } },
-          });
-          const toAfter = await prisma.reseller.findUnique({
-            where: { id: to.id },
           });
 
           assertMintedCredits({
@@ -691,36 +465,51 @@ router.post(
             after: toAfter?.credits,
           });
 
-          const txrec = await createTransaction({
-            type: "TOPUP",
-            status: "COMPLETED",
-            amount: amt,
-            toResellerId: to.id,
-            performedById: req.user.id,
-            notes,
-            toBeforeBalance: Number(toBefore.credits),
-            toAfterBalance: Number(toAfter.credits),
+          const txrec = await tx.creditTransaction.create({
+            data: {
+              type: "TOPUP",
+              status: "COMPLETED",
+              amount: amt,
+              toResellerId: to.id,
+              performedById: req.user.id,
+              notes,
+              ipAddress,
+              toBeforeBalance: Number(toBefore.credits),
+              toAfterBalance: Number(toAfter.credits),
+            },
           });
-          await safeNotify(() =>
-            notifyResellerUsers(to.id, {
-              type: "CREDITS_ADDED",
-              title: "Credits added",
-              message: `${formatCredits(amt)} credits were added to your account by ${actorName}.`,
-              link: "/credits",
-            }),
-          );
-          return res.json(txrec);
-        }
+          return txrec;
+        });
+        await safeNotify(() =>
+          notifyResellerUsers(to.id, {
+            type: "CREDITS_ADDED",
+            title: "Credits added",
+            message: `${formatCredits(amt)} credits were added to your account by ${actorName}.`,
+            link: "/credits",
+          }),
+        );
+        logSecurityEvent("credit_topup", req, {
+          userId: req.user?.id,
+          email: req.user?.email,
+          amount: amt,
+          toResellerId: to.id,
+          transactionId: result?.id,
+        });
+        return res.json(result);
       }
     } catch (err) {
       console.error(err);
 
       const message = (err?.message || "").toString();
       if (
+        message === "INSUFFICIENT" ||
         message === "Insufficient credits" ||
         message === "Invalid reseller credit operation"
       ) {
-        return res.status(400).json({ error: message });
+        return res.status(400).json({ error: "Insufficient credits" });
+      }
+      if (message === "SENDER_NOT_FOUND" || message === "RECIPIENT_NOT_FOUND") {
+        return res.status(404).json({ error: "Reseller not found" });
       }
       if (
         message.includes("Credit balance verification failed") ||
@@ -803,10 +592,14 @@ router.get(
             ? { skip: (page - 1) * pageSize, take: pageSize }
             : { take: 300 }),
         }),
-        prisma.creditTransaction.findMany({ where }),
+        // Count efficiently — use prisma.creditTransaction.count when available,
+        // otherwise fall back to fetching all matching rows just for the length.
+        typeof prisma.creditTransaction.count === "function"
+          ? prisma.creditTransaction.count({ where })
+          : prisma.creditTransaction.findMany({ where }),
       ]);
 
-      const total = Array.isArray(allMatching) ? allMatching.length : 0;
+      const total = typeof allMatching === "number" ? allMatching : Array.isArray(allMatching) ? allMatching.length : 0;
 
       const resellerIds = [
         ...new Set(
@@ -1026,6 +819,7 @@ router.post(
       const amount = parseCreditAmount(req.body?.amount);
       const notes = req.body?.notes || null;
       const requestedType = (req.body?.type || "").toString().toUpperCase();
+      const ipAddress = getClientIp(req);
 
       if (!myResellerId) {
         return res.status(400).json({ error: "No reseller account linked" });
@@ -1085,7 +879,12 @@ router.post(
         }
       }
 
-      const created = await prisma.creditTransaction.create({ data });
+      const created = await prisma.creditTransaction.create({
+        data: {
+          ...data,
+          ipAddress,
+        },
+      });
 
       await safeNotify(async () => {
         const requestTitle =
@@ -1158,6 +957,13 @@ router.post(
         }
       });
 
+      logSecurityEvent("credit_request_submitted", req, {
+        userId: req.user?.id,
+        email: req.user?.email,
+        amount,
+        requestType: created.type,
+        transactionId: created.id,
+      });
       res.json(created);
     } catch (err) {
       console.error("credits request create error", err);
@@ -1180,7 +986,7 @@ router.post(
       const id = Number(req.params.id);
       const role = (req.user.role || "").toString().toLowerCase();
       const myResellerId = Number(req.user.resellerId || 0);
-      const supportsTx = typeof prisma.$transaction === "function";
+      const ipAddress = getClientIp(req);
       const request = await prisma.creditTransaction.findUnique({
         where: { id },
       });
@@ -1212,51 +1018,35 @@ router.post(
       }
 
       if (request.type === "RECHARGE_REQUEST") {
-        const approveRecharge = async (client) => {
-          const currentRequest = await client.creditTransaction.findUnique({
-            where: { id },
-          });
-
-          if (!currentRequest) {
-            throw new Error("REQUEST_NOT_FOUND");
-          }
-          if (currentRequest.status !== "PENDING") {
-            throw new Error("REQUEST_ALREADY_PROCESSED");
-          }
-
-          const target = await client.reseller.findUnique({
-            where: { id: currentRequest.toResellerId },
-          });
-          if (!target) {
-            throw new Error("TARGET_NOT_FOUND");
-          }
-
-          const after = await client.reseller.update({
-            where: { id: currentRequest.toResellerId },
-            data: { credits: { increment: amount } },
-          });
-
-          assertMintedCredits({
-            amount,
-            before: target?.credits,
-            after: after?.credits,
-          });
-
-          return client.creditTransaction.update({
-            where: { id },
-            data: {
-              status: "COMPLETED",
-              processedAt: new Date(),
-              toBeforeBalance: Number(target.credits || 0),
-              toAfterBalance: Number(after?.credits || 0),
-            },
-          });
-        };
-
         try {
-          const updated = supportsTx
-            ? await prisma.$transaction((tx) => approveRecharge(tx))
-            : await approveRecharge(prisma);
+          const updated = await prisma.$transaction(async (tx) => {
+            const currentRequest = await tx.creditTransaction.findUnique({ where: { id } });
+            if (!currentRequest) throw new Error("REQUEST_NOT_FOUND");
+            if (currentRequest.status !== "PENDING") throw new Error("REQUEST_ALREADY_PROCESSED");
+
+            const target = await tx.reseller.findUnique({
+              where: { id: currentRequest.toResellerId },
+            });
+            if (!target) throw new Error("TARGET_NOT_FOUND");
+
+            const after = await tx.reseller.update({
+              where: { id: currentRequest.toResellerId },
+              data: { credits: { increment: amount } },
+            });
+
+            assertMintedCredits({ amount, before: target?.credits, after: after?.credits });
+
+            return tx.creditTransaction.update({
+              where: { id },
+              data: {
+                status: "COMPLETED",
+                processedAt: new Date(),
+                toBeforeBalance: Number(target.credits || 0),
+                toAfterBalance: Number(after?.credits || 0),
+                ipAddress,
+              },
+            });
+          });
 
           await safeNotify(() =>
             notifyResellerUsers(Number(request.toResellerId), {
@@ -1289,52 +1079,31 @@ router.post(
         }
       }
 
-      const approveTransferRequest = async (client) => {
-        const currentRequest = await client.creditTransaction.findUnique({
-          where: { id },
-        });
+      const approveTransferRequest = async (tx) => {
+        const currentRequest = await tx.creditTransaction.findUnique({ where: { id } });
+        if (!currentRequest) throw new Error("REQUEST_NOT_FOUND");
+        if (currentRequest.status !== "PENDING") throw new Error("REQUEST_ALREADY_PROCESSED");
 
-        if (!currentRequest) {
-          throw new Error("REQUEST_NOT_FOUND");
-        }
-        if (currentRequest.status !== "PENDING") {
-          throw new Error("REQUEST_ALREADY_PROCESSED");
-        }
+        const from = await tx.reseller.findUnique({ where: { id: currentRequest.fromResellerId } });
+        const to = await tx.reseller.findUnique({ where: { id: currentRequest.toResellerId } });
 
-        const from = await client.reseller.findUnique({
-          where: { id: currentRequest.fromResellerId },
-        });
-        const to = await client.reseller.findUnique({
-          where: { id: currentRequest.toResellerId },
-        });
-
-        if (!from || !to) {
-          throw new Error("LINKED_RESELLER_NOT_FOUND");
-        }
-        if (Number(from.id) === Number(to.id)) {
-          throw new Error("SAME_RESELLER_REQUEST");
-        }
+        if (!from || !to) throw new Error("LINKED_RESELLER_NOT_FOUND");
+        if (Number(from.id) === Number(to.id)) throw new Error("SAME_RESELLER_REQUEST");
         if (
           currentRequest.type === "CREDIT_REQUEST" &&
           Number(to.parentId || 0) !== Number(from.id)
-        ) {
-          throw new Error("REQUEST_HIERARCHY_CHANGED");
-        }
+        ) throw new Error("REQUEST_HIERARCHY_CHANGED");
         if (
           currentRequest.type === "CREDIT_RETURN" &&
           Number(from.parentId || 0) !== Number(to.id)
-        ) {
-          throw new Error("REQUEST_HIERARCHY_CHANGED");
-        }
-        if (Number(from.credits || 0) < amount) {
-          throw new Error("INSUFFICIENT_CREDITS");
-        }
+        ) throw new Error("REQUEST_HIERARCHY_CHANGED");
+        if (Number(from.credits || 0) < amount) throw new Error("INSUFFICIENT_CREDITS");
 
-        const fromAfter = await client.reseller.update({
+        const fromAfter = await tx.reseller.update({
           where: { id: from.id },
           data: { credits: { decrement: amount } },
         });
-        const toAfter = await client.reseller.update({
+        const toAfter = await tx.reseller.update({
           where: { id: to.id },
           data: { credits: { increment: amount } },
         });
@@ -1347,11 +1116,12 @@ router.post(
           toAfter: toAfter?.credits,
         });
 
-        return client.creditTransaction.update({
+        return tx.creditTransaction.update({
           where: { id },
           data: {
             status: "COMPLETED",
             processedAt: new Date(),
+            ipAddress,
             fromBeforeBalance: Number(from.credits || 0),
             fromAfterBalance: Number(fromAfter?.credits || 0),
             toBeforeBalance: Number(to.credits || 0),
@@ -1362,9 +1132,7 @@ router.post(
 
       let updated;
       try {
-        updated = supportsTx
-          ? await prisma.$transaction((tx) => approveTransferRequest(tx))
-          : await approveTransferRequest(prisma);
+        updated = await prisma.$transaction((tx) => approveTransferRequest(tx));
       } catch (error) {
         if (error?.message === "REQUEST_NOT_FOUND") {
           return res.status(404).json({ error: "Request not found" });
@@ -1411,6 +1179,13 @@ router.post(
         }),
       );
 
+      logSecurityEvent("credit_request_approved", req, {
+        userId: req.user?.id,
+        email: req.user?.email,
+        transactionId: id,
+        requestType: request.type,
+        amount: request.amount,
+      });
       res.json(updated);
     } catch (err) {
       console.error("credits request approve error", err);
@@ -1475,7 +1250,7 @@ router.post(
 
       const updated = await prisma.creditTransaction.update({
         where: { id },
-        data: { status: "REJECTED", processedAt: new Date() },
+        data: { status: "REJECTED", processedAt: new Date(), ipAddress: getClientIp(req) },
       });
       const requesterResellerId =
         request.type === "CREDIT_RETURN"
@@ -1495,6 +1270,13 @@ router.post(
           },
         }),
       );
+      logSecurityEvent("credit_request_rejected", req, {
+        userId: req.user?.id,
+        email: req.user?.email,
+        transactionId: id,
+        requestType: request.type,
+        amount: request.amount,
+      });
       res.json(updated);
     } catch (err) {
       console.error("credits request reject error", err);
@@ -1503,6 +1285,63 @@ router.post(
           .status(500)
           .json({ error: err.message || "Server error", stack: err.stack });
       }
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Fetch a single transaction by id — for the detail modal
+router.get(
+  "/transactions/:id",
+  auth,
+  requireRole("superadmin", "reseller", "subreseller"),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: "Invalid transaction id" });
+      }
+
+      const role = (req.user.role || "").toString().toLowerCase();
+      const myResellerId = Number(req.user.resellerId || 0);
+
+      const tx = await prisma.creditTransaction.findUnique({ where: { id } });
+      if (!tx) return res.status(404).json({ error: "Transaction not found" });
+
+      // Scope check — non-admins can only view their own transactions
+      if (role !== "superadmin") {
+        const involved =
+          Number(tx.fromResellerId || 0) === myResellerId ||
+          Number(tx.toResellerId || 0) === myResellerId;
+        if (!involved) return res.status(403).json({ error: "Forbidden" });
+      }
+
+      const [resellers, user] = await Promise.all([
+        prisma.reseller.findMany({
+          where: {
+            id: {
+              in: [tx.fromResellerId, tx.toResellerId].filter(Boolean),
+            },
+          },
+        }),
+        tx.performedById
+          ? prisma.user.findUnique({
+              where: { id: tx.performedById },
+              select: { id: true, name: true, email: true, role: true, resellerId: true },
+            })
+          : Promise.resolve(null),
+      ]);
+
+      const resellerMap = new Map(resellers.map((r) => [Number(r.id), r]));
+
+      res.json({
+        ...tx,
+        fromReseller: resellerMap.get(Number(tx.fromResellerId || 0)) || null,
+        toReseller: resellerMap.get(Number(tx.toResellerId || 0)) || null,
+        performedBy: user,
+      });
+    } catch (err) {
+      console.error("credit transaction detail error", err);
       res.status(500).json({ error: "Server error" });
     }
   },

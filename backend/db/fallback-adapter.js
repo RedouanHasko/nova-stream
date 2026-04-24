@@ -1,3 +1,4 @@
+const { init, getDb } = require("./connection");
 const helpers = require("./helpers");
 const {
   createUserRepository,
@@ -22,10 +23,61 @@ const {
   createCreditTransactionRepository,
 } = require("./repositories/operations.repository");
 
+// Serialization lock — ensures only one $transaction runs at a time on the
+// in-process sql.js database.  This prevents a second request from issuing
+// BEGIN IMMEDIATE while the first transaction is still in-flight.
+let _txLocked = false;
+const _txWaiters = [];
+
+function _acquireTxLock() {
+  if (!_txLocked) {
+    _txLocked = true;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => _txWaiters.push(resolve));
+}
+
+function _releaseTxLock() {
+  if (_txWaiters.length > 0) {
+    _txWaiters.shift()(); // wake next waiter
+  } else {
+    _txLocked = false;
+  }
+}
+
 function createFallbackAdapter() {
   const adapter = {
     $disconnect: async () => {
       helpers.persist();
+    },
+
+    /**
+     * Atomic credit transaction wrapper backed by SQLite BEGIN IMMEDIATE.
+     * The callback receives the same adapter so all operations share the
+     * open transaction context.  A serialization mutex guards concurrent
+     * requests — essential because Node.js yields between `await` calls
+     * and a second request could otherwise slip in before COMMIT.
+     */
+    $transaction: async (callback) => {
+      await init();
+      await _acquireTxLock();
+      const db = getDb();
+      db.run("BEGIN IMMEDIATE");
+      try {
+        const result = await callback(adapter);
+        db.run("COMMIT");
+        helpers.persist();
+        return result;
+      } catch (err) {
+        try {
+          db.run("ROLLBACK");
+        } catch (_) {
+          // ignore rollback errors — db may already be in an error state
+        }
+        throw err;
+      } finally {
+        _releaseTxLock();
+      }
     },
   };
 

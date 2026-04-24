@@ -331,13 +331,17 @@ function createActivatedAppRepository(
     create: async ({ data }) => {
       const now = new Date().toISOString();
       const id = await runInsert(
-        "INSERT INTO activatedApps (deviceId, applicationId, appName, duration, expiresAt, status, activatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO activatedApps (deviceId, applicationId, appName, activationKind, duration, expiresAt, trialStartedAt, trialEndsAt, trialConsumedAt, status, activatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           data.deviceId,
           data.applicationId ?? null,
           data.appName,
+          data.activationKind || "PAID",
           data.duration || "1_year",
           data.expiresAt || null,
+          data.trialStartedAt || null,
+          data.trialEndsAt || null,
+          data.trialConsumedAt || null,
           data.status || "ACTIVE",
           data.activatedAt || now,
         ],
@@ -366,6 +370,10 @@ function createActivatedAppRepository(
         fields.push("appName = ?");
         params.push(data.appName);
       }
+      if (data.activationKind !== undefined) {
+        fields.push("activationKind = ?");
+        params.push(data.activationKind);
+      }
       if (data.duration !== undefined) {
         fields.push("duration = ?");
         params.push(data.duration);
@@ -373,6 +381,18 @@ function createActivatedAppRepository(
       if (data.expiresAt !== undefined) {
         fields.push("expiresAt = ?");
         params.push(data.expiresAt);
+      }
+      if (data.trialStartedAt !== undefined) {
+        fields.push("trialStartedAt = ?");
+        params.push(data.trialStartedAt);
+      }
+      if (data.trialEndsAt !== undefined) {
+        fields.push("trialEndsAt = ?");
+        params.push(data.trialEndsAt);
+      }
+      if (data.trialConsumedAt !== undefined) {
+        fields.push("trialConsumedAt = ?");
+        params.push(data.trialConsumedAt);
       }
       if (data.status !== undefined) {
         fields.push("status = ?");

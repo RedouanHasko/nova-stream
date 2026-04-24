@@ -28,6 +28,10 @@ import {
 import { useNavigate, useLocation } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
 import Logo from "../components/Logo";
+import {
+  getDeviceIdentity,
+  type DeviceIdentity,
+} from "../lib/deviceIdentity";
 import { cn } from "../lib/utils";
 import { toast } from "sonner";
 import { usePlaylist } from "../context/PlaylistContext";
@@ -90,6 +94,7 @@ export default function Settings() {
     activePlaylist,
     isConnected,
     logout,
+    clearCache,
     playlists,
     settings,
     updateSettings,
@@ -99,6 +104,9 @@ export default function Settings() {
     removePlaylist,
   } = usePlaylist();
   const t = useT();
+  const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity | null>(
+    null,
+  );
 
   const [activeModal, setActiveModal] = useState<
     | "none"
@@ -127,6 +135,24 @@ export default function Settings() {
   >("live");
 
   useEffect(() => {
+    let active = true;
+
+    getDeviceIdentity()
+      .then((identity) => {
+        if (active) {
+          setDeviceIdentity(identity);
+        }
+      })
+      .catch((error) => {
+        console.error("device identity resolution failed", error);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (location.state?.openModal) {
       setActiveModal(location.state.openModal);
       // Clear state to avoid reopening on back navigation
@@ -147,6 +173,15 @@ export default function Settings() {
       logout();
       toast.success(t.loggedOutSuccess);
       navigate("/playlist-setup");
+      return;
+    }
+    if (label === "Clear App Cache") {
+      const confirmed = window.confirm(
+        "Clear cached player data? The app will reload playlists and catalog data.",
+      );
+      if (!confirmed) return;
+      clearCache();
+      toast.success(t.playlistCacheCleared);
       return;
     }
 
@@ -350,6 +385,7 @@ export default function Settings() {
     },
     { icon: Trash2, label: t.clearHistoryMovies, id: "Clear History Movies" },
     { icon: Trash2, label: t.clearHistorySeries, id: "Clear History Series" },
+    { icon: Trash2, label: "Clear App Cache", id: "Clear App Cache" },
     { icon: SortAsc, label: t.liveChannelSort, id: "Live Channel Sort" },
     { icon: MonitorPlay, label: t.streamFormat, id: "Stream Format (HLS/TS)" },
     { icon: Zap, label: t.automatic, id: "Automatic" },
@@ -358,6 +394,16 @@ export default function Settings() {
     { icon: Subtitles, label: t.subtitleSettings, id: "Subtitle Settings" },
     { icon: PictureInPicture, label: t.pipSettings, id: "PIP Settings" },
   ];
+
+  // TV remote: back key navigates home
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (key === "back" || key === "backspace") navigate("/");
+    };
+    window.addEventListener("tv-remote-key", handler);
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, [navigate]);
 
   return (
     <div className="flex flex-col min-h-screen p-8">
@@ -1217,7 +1263,14 @@ export default function Settings() {
                             <User className="w-5 h-5 text-primary" />
                           </div>
                           <div>
-                            <p className="font-bold">{playlist.name}</p>
+                            <div className="flex items-center gap-2">
+                              <p className="font-bold">{playlist.name}</p>
+                              {playlist.managedByBackend && (
+                                <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-sky-300 bg-sky-500/15 border border-sky-400/20 px-2 py-1 rounded-md">
+                                  Managed
+                                </span>
+                              )}
+                            </div>
                             <p className="text-xs text-white/40">
                               {playlist.type === "xtream"
                                 ? playlist.host
@@ -1232,17 +1285,23 @@ export default function Settings() {
                               {t.active_playlist}
                             </span>
                           )}
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              removePlaylist(playlist.id);
-                              toast.success(t.playlistRemovedMsg);
-                            }}
-                            className="p-2 hover:bg-red-500/20 text-red-500 rounded-full transition-colors"
-                            title="Remove Playlist"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          {playlist.managedByBackend ? (
+                            <span className="text-[11px] text-white/35 px-2 py-1">
+                              Synced from backend
+                            </span>
+                          ) : (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removePlaylist(playlist.id);
+                                toast.success(t.playlistRemovedMsg);
+                              }}
+                              className="p-2 hover:bg-red-500/20 text-red-500 rounded-full transition-colors"
+                              title="Remove Playlist"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -1267,8 +1326,8 @@ export default function Settings() {
 
       {/* Footer Info */}
       <div className="mt-auto flex flex-col items-center gap-1 text-white/40 text-sm">
-        <span>Mac Address: 70:c4:4d:58:c5:d8</span>
-        <span>Device Key: 352212</span>
+        <span>Mac Address: {deviceIdentity?.macAddress || "Loading..."}</span>
+        <span>Device Key: {deviceIdentity?.deviceKey || "Loading..."}</span>
         <span className="mt-2">Version : 1.7.2.0</span>
       </div>
     </div>
