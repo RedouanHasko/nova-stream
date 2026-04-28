@@ -45,13 +45,36 @@ function getApiBase() {
 
   const { protocol, hostname } = window.location;
   if (isLocalHostname(hostname)) {
-    return `${protocol}//${hostname}:5000`;
+    const localPort = window.location.port || "4000";
+    return `${protocol}//${hostname}:${localPort}`;
   }
 
   return "";
 }
 
+function getApiBaseCandidates() {
+  if (typeof window === "undefined") return [""];
+
+  const configuredBase = ((import.meta as any).env?.VITE_API_URL || "").trim();
+  if (configuredBase) {
+    return [toSecureUrl(configuredBase).replace(/\/$/, "")];
+  }
+
+  const { protocol, hostname } = window.location;
+  if (!isLocalHostname(hostname)) {
+    return [""];
+  }
+
+  const candidates: string[] = [];
+  const localPort = window.location.port || "4000";
+  candidates.push(`${protocol}//${hostname}:${localPort}`);
+  candidates.push(`${protocol}//${hostname}:5000`);
+
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
 const API_BASE = getApiBase();
+const API_BASE_CANDIDATES = getApiBaseCandidates();
 const APPLICATION_ID = ((import.meta as any).env?.VITE_APPLICATION_ID || "")
   .toString()
   .trim();
@@ -136,27 +159,45 @@ type DeviceRequestBody = {
 };
 
 async function request<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const bases = API_BASE_CANDIDATES.length > 0 ? API_BASE_CANDIDATES : [API_BASE];
+  let lastError: Error | null = null;
 
-  const text = await response.text();
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
+  for (const base of bases) {
+    try {
+      const response = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const text = await response.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+
+      if (!response.ok) {
+        const err = new Error(
+          json?.error || json?.message || text || response.statusText || "Request failed",
+        );
+        // Local dev may run player on :4000 while backend APIs live on :5000.
+        // If route is missing, try next base before failing.
+        if (response.status === 404 && bases.length > 1) {
+          lastError = err;
+          continue;
+        }
+        throw err;
+      }
+
+      return json as T;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error || "Request failed"));
+    }
   }
 
-  if (!response.ok) {
-    throw new Error(
-      json?.error || json?.message || text || response.statusText || "Request failed",
-    );
-  }
-
-  return json as T;
+  throw lastError || new Error("Request failed");
 }
 
 export async function buildDeviceRequestBody(

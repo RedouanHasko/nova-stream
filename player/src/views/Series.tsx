@@ -35,6 +35,7 @@ import { toast } from "sonner";
 import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService, SeriesStream } from "../services/iptvService";
 import { getFlagForCategory } from "../lib/flags";
+import { reportPlaybackDebug } from "../lib/playbackDebug";
 
 export default function Series() {
   const navigate = useNavigate();
@@ -366,6 +367,29 @@ export default function Series() {
     const ext = episode.container_extension || "mp4";
 
     const url = `${baseUrl}/series/${user}/${pass}/${id}.${ext}`;
+
+    reportPlaybackDebug("selection.seriesEpisode", {
+      playlistId: activePlaylist.id,
+      playlistType: activePlaylist.type,
+      host: activePlaylist.host,
+      seriesId: selectedSeries?.series_id || null,
+      streamId: id,
+      season: episode.season,
+      episodeNum: episode.episode_num,
+      extension: ext,
+      streamUrl: url,
+      codecHint: episode?.info?.video?.codec_name || null,
+      audioTracksHint: Array.isArray(episode?.info?.audio)
+        ? episode.info.audio.length
+        : episode?.info?.audio
+          ? 1
+          : 0,
+      subtitleTracksHint: Array.isArray(episode?.info?.sub)
+        ? episode.info.sub.length
+        : episode?.info?.sub
+          ? 1
+          : 0,
+    });
 
     navigate("/watch", {
       state: {

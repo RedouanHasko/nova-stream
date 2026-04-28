@@ -19,6 +19,9 @@ import Hls from "hls.js";
 import mpegts from "mpegts.js";
 import { toast } from "sonner";
 import { cn } from "../lib/utils";
+import { isLowPowerTV } from "../lib/tv";
+import { reportPlaybackDebug } from "../lib/playbackDebug";
+import { usePlaylist } from "../context/PlaylistContext";
 
 type TrackItem = {
   id: number;
@@ -33,61 +36,161 @@ type SubtitleCueItem = {
   text: string;
 };
 
+type TrackSummaryItem = {
+  idx: number;
+  type: string;
+  codec: string | null;
+  lang: string | null;
+  title: string | null;
+  default: number;
+  forced: number;
+};
+
+type SubtitleLanguageItem = {
+  code: string;
+  label: string;
+  trackIds: number[];
+};
+
 type SettingsTab = "audio" | "subtitle" | "display";
+type PlaybackMode = "proxy-range" | "stream-ts-fallback" | "remux-fallback";
+
+const resolveTrackIndex = (value: unknown, fallback: number): number => {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const parsed = parseInt(value, 10);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  }
+  return fallback;
+};
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
+const isTimeBuffered = (
+  video: HTMLVideoElement,
+  time: number,
+  tolerance = 0.75,
+): boolean => {
+  const ranges = video.buffered;
+  for (let index = 0; index < ranges.length; index += 1) {
+    const start = ranges.start(index) - tolerance;
+    const end = ranges.end(index) + tolerance;
+    if (time >= start && time <= end) {
+      return true;
+    }
+  }
+  return false;
+};
+
 const parseDurationToSeconds = (raw: unknown): number => {
   if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
-  if (typeof raw !== "string") return 0;
-  const value = raw.trim();
-  if (!value) return 0;
-  if (/^\d+(\.\d+)?$/.test(value)) {
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? n : 0;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    const iso = s.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i);
+    if (iso) {
+      const h = parseFloat(iso[1] || "0");
+      const m = parseFloat(iso[2] || "0");
+      const sec = parseFloat(iso[3] || "0");
+      return h * 3600 + m * 60 + sec;
+    }
+    if (s.includes(":")) {
+      const parts = s.split(":").map((p) => parseFloat(p.replace(",", ".")));
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 1) return parts[0];
+    }
+    const f = parseFloat(s);
+    return Number.isFinite(f) && f > 0 ? f : 0;
   }
-  const parts = value.split(":").map((p) => Number(p));
-  if (parts.some((p) => !Number.isFinite(p) || p < 0)) return 0;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
   return 0;
 };
 
-const parseClock = (raw: string): number => {
-  const v = raw.trim();
-  if (!v) return 0;
-  if (/^\d+:\d{2}:\d{2}\.\d{2}$/.test(v)) {
-    const [h, m, sCs] = v.split(":");
-    const [s, cs] = sCs.split(".");
-    return (
-      parseInt(h, 10) * 3600 +
-      parseInt(m, 10) * 60 +
-      parseInt(s, 10) +
-      parseInt(cs, 10) / 100
-    );
+const toLanguageLabel = (code: string): string => {
+  if (!code) return "Unknown";
+  const normalized = String(code || "").trim().toLowerCase();
+  try {
+    const dn = new Intl.DisplayNames(["en"], { type: "language" });
+    if (/^[a-z]{2}$/.test(normalized)) {
+      return dn.of(normalized) || code;
+    }
+    const map3to2: Record<string, string> = {
+      eng: "en",
+      chi: "zh",
+      zho: "zh",
+      fre: "fr",
+      ger: "de",
+      spa: "es",
+      kor: "ko",
+      jpn: "ja",
+      por: "pt",
+      rus: "ru",
+      ita: "it",
+    };
+    const maybe = map3to2[normalized];
+    if (maybe) return dn.of(maybe) || code;
+    return code;
+  } catch {
+    return code;
   }
-  const normalized = v.replace(",", ".");
-  const parts = normalized.split(":");
-  if (parts.length !== 3) return 0;
-  const [h, m, secPart] = parts;
-  const sec = parseFloat(secPart);
-  if (!Number.isFinite(sec)) return 0;
-  return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + sec;
+};
+
+const parseClock = (input: string): number => {
+  if (!input) return 0;
+  const s = String(input).trim().replace(/,/g, ".");
+  const parts = s.split(":").map((p) => parseFloat(p));
+  if (parts.length === 3) return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  if (parts.length === 2) return (parts[0] || 0) * 60 + (parts[1] || 0);
+  const f = parseFloat(s);
+  return Number.isFinite(f) ? f : 0;
 };
 
 const cleanSubtitleText = (raw: string): string => {
-  return raw
-    .replace(/\{[^}]*\}/g, "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/\\N/g, "\n")
-    .replace(/\r/g, "")
-    .trim();
+  if (!raw) return "";
+  let t = String(raw).replace(/\r/g, "").trim();
+  t = t.replace(/^WEBVTT[^\n]*\n?/, "");
+  t = t.replace(/^\d+\s*\n/, "");
+  t = t.replace(/<[^>]+>/g, "");
+  t = t.replace(/\n{2,}/g, "\n");
+  t = t.split("\n").map((l) => l.trim()).join("\n");
+  return t;
+};
+
+const getAvailableSubtitleLanguages = (
+  summary: TrackSummaryItem[],
+): SubtitleLanguageItem[] => {
+  const byLang = new Map<string, number[]>();
+  for (const stream of summary) {
+    if (stream.type !== "subtitle") continue;
+    const code = String(stream.lang || "und").toUpperCase();
+    const list = byLang.get(code) || [];
+    list.push(stream.idx);
+    byLang.set(code, list);
+  }
+
+  return Array.from(byLang.entries())
+    .map(([code, trackIds]) => ({
+      code,
+      label: toLanguageLabel(code),
+      trackIds,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+};
+
+const getPreferredAudioTrackId = (tracks: TrackItem[], selectedId: number): number => {
+  if (tracks.length === 0) return -1;
+  if (selectedId >= 0 && tracks.some((track) => track.id === selectedId)) {
+    return selectedId;
+  }
+  return tracks[0]?.id ?? -1;
 };
 
 const parseVttOrSrt = (input: string): SubtitleCueItem[] => {
   const text = (input || "").replace(/^\uFEFF/, "");
-  const re = /(\d{1,2}:\d{2}:\d{2}[\.,]\d{2,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[\.,]\d{2,3})(?:[^\n]*)\n([\s\S]*?)(?=\n\n|$)/g;
+  const re = /((?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{2,3})\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{2,3})(?:[^\n]*)\n([\s\S]*?)(?=\n\n|$)/g;
   const cues: SubtitleCueItem[] = [];
   let m: RegExpExecArray | null;
 
@@ -144,6 +247,24 @@ const getCueIndexBinary = (cues: SubtitleCueItem[], time: number): number => {
   return ans;
 };
 
+const waitWithAbort = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
 export default function CinemaPlayer() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -172,10 +293,28 @@ export default function CinemaPlayer() {
   const subtitleLastTimeRef = useRef(0);
   const subtitleLastTextRef = useRef("");
   const subtitleRafRef = useRef<number | null>(null);
+  const subtitleFetchAbortRef = useRef<AbortController | null>(null);
+  const subtitleLoadingRef = useRef(false);
+  // Stable ref so event handlers (useEffect with []) can always call the latest version.
+  const fetchSubtitleCuesRef = useRef<((trackId: number, seekOverride?: number) => Promise<any>) | null>(null);
+  const subtitleResumeAfterLoadRef = useRef(false);
+  const subtitleSwitchSeqRef = useRef(0);
+  const subtitleInterruptionRef = useRef(false);
   const nextEpTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const waitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekApplyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Seek offset for TS streams started via startFastTsPlayback.
+  // Because we removed -copyts from the backend, the TS output PTS always starts from 0.
+  // This ref stores the content position where the current TS stream began so that
+  // effectiveCurrentTime = video.currentTime + streamSeekOffsetRef.current.
+  const streamSeekOffsetRef = useRef(0);
+  // Subtitle refs mirror the corresponding state values so the RAF loop can
+  // read fresh values without being recreated on every state change.
+  const selectedSubtitleRef = useRef(-1);
+  const subtitleCuesRef = useRef<SubtitleCueItem[]>([]);
+  const nativeSubtitleActiveRef = useRef(false);
+  const subtitleOffsetMsRef = useRef(0);
   const fastTsFallbackRef = useRef(false);
   const ffprobeAvailable = useRef(false);
   const originalStreamUrl = useRef(initialUrl);
@@ -183,8 +322,24 @@ export default function CinemaPlayer() {
   const settingsOpenRef = useRef(false);
   const inferredDurationRef = useRef(0);
   const remuxFallbackTriedRef = useRef(false);
-  const startNativePlaybackRef = useRef<(seekSec?: number) => void>(() => {});
+  const startNativePlaybackRef = useRef<(
+    seekSec?: number,
+    preferProxy?: boolean,
+  ) => void>(() => {});
+  const startFastTsPlaybackRef = useRef<(seekSec?: number, audioIdx?: number) => void>(() => {});
   const isLiveStreamRef = useRef(false);
+  const forceProxyPlaybackRef = useRef(false);
+  const usingDirectPlaybackRef = useRef(false);
+  const userPausedRef = useRef(false);
+  const failingOverToProxyRef = useRef(false);
+  const selectedAudioRef = useRef(-1);
+  const currentFastTsAudioRef = useRef(-1);
+  const audioTracksRef = useRef<TrackItem[]>([]);
+  const isMkvSourceRef = useRef(false);
+  const preferNativeMkvRef = useRef(false);
+  const playbackModeRef = useRef<PlaybackMode | null>(null);
+
+  const { settings, updateSettings } = usePlaylist();
 
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -193,15 +348,19 @@ export default function CinemaPlayer() {
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [duration, setDuration] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [audioTracks, setAudioTracks] = useState<TrackItem[]>([]);
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const [subtitleTracks, setSubtitleTracks] = useState<TrackItem[]>([]);
+  const [trackSummary, setTrackSummary] = useState<TrackSummaryItem[]>([]);
   const [selectedSubtitle, setSelectedSubtitle] = useState(-1);
   const [nativeSubtitleActive, setNativeSubtitleActive] = useState(false);
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCueItem[]>([]);
   const [subtitleText, setSubtitleText] = useState("");
+  const [subtitleLoading, setSubtitleLoading] = useState(false);
   const [subtitleOffsetMs, setSubtitleOffsetMs] = useState(0);
   const [audioOffsetMs, setAudioOffsetMs] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -211,17 +370,68 @@ export default function CinemaPlayer() {
 
   const proxiedUrl = useMemo(() => {
     if (!initialUrl) return "";
-    return `${window.location.origin}/api/proxy?url=${encodeURIComponent(initialUrl)}`;
+    return `${window.location.origin}/api/proxy?url=${encodeURIComponent(initialUrl)}&owner=1`;
   }, [initialUrl]);
 
   const fastTsBaseUrl = useMemo(() => {
     if (!initialUrl) return "";
-    return `${window.location.origin}/api/stream-ts?url=${encodeURIComponent(initialUrl)}`;
+    return `${window.location.origin}/api/stream-ts?url=${encodeURIComponent(initialUrl)}&owner=1`;
   }, [initialUrl]);
 
   const isLiveStream = initialUrl.includes("/live/");
   const isHlsStream =
     initialUrl.includes(".m3u8") || initialUrl.includes("/hls/") || isLiveStream;
+
+  const reportPlaybackMode = useCallback(
+    (mode: PlaybackMode, level: "info" | "warn" = "info") => {
+      if (playbackModeRef.current === mode) return;
+      playbackModeRef.current = mode;
+      reportPlaybackDebug(
+        "player.playbackMode",
+        {
+          mode,
+          extension,
+          url: initialUrl,
+          isLiveStream,
+          isHlsStream,
+        },
+        level,
+      );
+    },
+    [extension, initialUrl, isHlsStream, isLiveStream],
+  );
+
+  useEffect(() => {
+    if (!initialUrl) return;
+    reportPlaybackDebug("player.sessionStart", {
+      title: initialTitle,
+      url: initialUrl,
+      extension,
+      isLiveStream,
+      isHlsStream,
+      seriesId,
+      playlistId,
+      episodeSeason,
+      episodeNum,
+      episodeTitle,
+      currentIndex,
+    });
+  }, [
+    currentIndex,
+    episodeNum,
+    episodeSeason,
+    episodeTitle,
+    extension,
+    fastTsBaseUrl,
+    initialTitle,
+    initialUrl,
+    isHlsStream,
+    isLiveStream,
+    location.state,
+    playlistId,
+    proxiedUrl,
+    seriesId,
+  ]);
 
   const inferredDuration = useMemo(() => {
     const candidates = [
@@ -264,30 +474,89 @@ export default function CinemaPlayer() {
     }
     if (mpegtsRef.current) {
       try {
+        if (typeof mpegtsRef.current.pause === "function") {
+          mpegtsRef.current.pause();
+        }
+      } catch {}
+      try {
+        if (typeof mpegtsRef.current.unload === "function") {
+          mpegtsRef.current.unload();
+        }
+      } catch {}
+      try {
+        if (typeof mpegtsRef.current.detachMediaElement === "function") {
+          mpegtsRef.current.detachMediaElement();
+        }
+      } catch {}
+      try {
         mpegtsRef.current.destroy();
       } catch {}
       mpegtsRef.current = null;
     }
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
   }, []);
 
   const startNativePlayback = useCallback(
-    (seekSec = 0) => {
+    (seekSec = 0, preferProxy = false) => {
       const video = videoRef.current;
-      if (!video || !proxiedUrl) return;
+      if (!video) return;
       teardownPlayers();
       setIsLoading(true);
-      video.src = proxiedUrl;
+
+      let sourceUrl = proxiedUrl;
+      if (!isLiveStream && !isHlsStream) {
+        const mustUseProxy =
+          preferProxy ||
+          forceProxyPlaybackRef.current ||
+          (isMkvSourceRef.current && preferNativeMkvRef.current);
+        sourceUrl = mustUseProxy ? proxiedUrl : initialUrl;
+        usingDirectPlaybackRef.current =
+          !mustUseProxy && sourceUrl === initialUrl;
+      } else {
+        usingDirectPlaybackRef.current = false;
+      }
+
+      if (!sourceUrl) return;
+      video.src = sourceUrl;
       video.load();
+      const waitForBufferTarget = async (targetSeconds: number, maxWaitMs = 9000) => {
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+          if (!video) return false;
+          try {
+            if (isTimeBuffered(video, (video.currentTime || 0) + targetSeconds, 0.75)) return true;
+          } catch {}
+          // small delay
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return false;
+      };
+
       const onLoaded = () => {
         video.removeEventListener("loadedmetadata", onLoaded);
         if (seekSec > 0 && Number.isFinite(video.duration) && video.duration > 0) {
           video.currentTime = clamp(seekSec, 0, video.duration);
         }
-        video.play().catch(() => {});
+        (async () => {
+          // Try to prebuffer 30s (up to ~9s) before starting playback for smooth experience
+          const ok = await waitForBufferTarget(30, 9000);
+          if (!ok) {
+            // fallback: start playback anyway
+            try { await video.play(); } catch {}
+            return;
+          }
+          try { await video.play(); } catch {}
+        })();
       };
       video.addEventListener("loadedmetadata", onLoaded);
     },
-    [proxiedUrl, teardownPlayers],
+    [initialUrl, isHlsStream, isLiveStream, proxiedUrl, teardownPlayers],
   );
 
   const startRemuxPlayback = useCallback(
@@ -299,6 +568,7 @@ export default function CinemaPlayer() {
     ) => {
       const video = videoRef.current;
       if (!video || !initialUrl) return;
+      reportPlaybackMode("remux-fallback", "warn");
 
       teardownPlayers(); // Ensure HLS/mpegts players are destroyed
       setIsLoading(true);
@@ -314,96 +584,264 @@ export default function CinemaPlayer() {
       setNativeSubtitleActive(false); // Remuxed subtitles are handled by server/mov_text or custom engine or custom engine if extracted
       setSubtitleCues([]); // Clear custom cues if remuxing
       setSubtitleText("");
-    }, [initialUrl, teardownPlayers]);
+    }, [initialUrl, reportPlaybackMode, teardownPlayers]);
 
   const parseTrackInfo = useCallback((streams: any[]) => {
-    const audios = streams.filter((s) => s.codec_type === "audio").map((s, i) => {
+    const streamList = streams.map((s, idx) => ({ ...s, __idx: idx }));
+
+    const audioStreams = streamList.filter((s) => s.codec_type === "audio");
+    const audios = audioStreams.map((s) => {
       const lang = (s.tags?.language || "und").toUpperCase();
       const codec = (s.codec_name || "audio").toUpperCase();
       const title = s.tags?.title || `${lang} ${codec}`;
-      return { id: i, name: title, lang, codec } as TrackItem;
+      return { id: s.__idx, name: title, lang, codec } as TrackItem;
     });
-    const subtitles = streams.filter((s) => s.codec_type === "subtitle").map((s, i) => {
+
+    const subtitleStreams = streamList.filter((s) => s.codec_type === "subtitle");
+    const subtitles = subtitleStreams.map((s) => {
       const lang = (s.tags?.language || "und").toUpperCase();
       const codec = (s.codec_name || "subtitle").toUpperCase();
       const title = s.tags?.title || `${lang} ${codec}`;
-      return { id: i, name: title, lang, codec } as TrackItem;
+      return { id: s.__idx, name: title, lang, codec } as TrackItem;
     });
+
+    const defaultAudioStream =
+      audioStreams.find((s) => Number(s?.disposition?.default) === 1) ||
+      audioStreams[0] ||
+      null;
+    const defaultAudioId = defaultAudioStream ? defaultAudioStream.__idx : -1;
+
     setAudioTracks(audios);
     setSubtitleTracks(subtitles);
-    setSelectedAudio(audios.length > 0 ? 0 : -1);
+    setSelectedAudio(defaultAudioId);
     setSelectedSubtitle(-1); // Default to no subtitle
+    return defaultAudioId;
   }, []);
 
-  const loadTrackMetadata = useCallback(async () => {
-    if (!initialUrl || isHlsStream || isLiveStream) return;
+  const loadTrackMetadata = useCallback(async (): Promise<number | null> => {
+    if (!initialUrl || isHlsStream || isLiveStream) return null;
     try {
       const res = await fetch(`${window.location.origin}/api/tracks?url=${encodeURIComponent(initialUrl)}`);
       if (!res.ok) {
         ffprobeAvailable.current = false; // Explicitly set to false on failure
-        return;
+        return null;
       }
       const data = await res.json();
-      if (!data.available || !Array.isArray(data.streams)) { ffprobeAvailable.current = false; return; }
+      if (!data.available || !Array.isArray(data.streams)) { ffprobeAvailable.current = false; return null; }
       ffprobeAvailable.current = true; // Set to true only on success
-      parseTrackInfo(data.streams);
-    } catch {}
+
+      const summary = data.streams.map((s: any, idx: number) => ({
+        idx,
+        type: s.codec_type,
+        codec: s.codec_name,
+        lang: s?.tags?.language || null,
+        title: s?.tags?.title || null,
+        default: s?.disposition?.default || 0,
+        forced: s?.disposition?.forced || 0,
+      }));
+      setTrackSummary(summary);
+      reportPlaybackDebug("player.trackMetadata", {
+        url: initialUrl,
+        streamCount: data.streams.length,
+        audioCount: summary.filter((s: any) => s.type === "audio").length,
+        subtitleCount: summary.filter((s: any) => s.type === "subtitle").length,
+        summary,
+      });
+
+      return parseTrackInfo(data.streams);
+    } catch {
+      return null;
+    }
   }, [initialUrl, isHlsStream, isLiveStream, parseTrackInfo]);
+
+
+  const subtitleLanguages = useMemo(() => {
+    if (trackSummary.length > 0) {
+      return getAvailableSubtitleLanguages(trackSummary);
+    }
+
+    const byLang = new Map<string, number[]>();
+    for (const track of subtitleTracks) {
+      const code = String(track.lang || "und").toUpperCase();
+      const list = byLang.get(code) || [];
+      list.push(track.id);
+      byLang.set(code, list);
+    }
+    return Array.from(byLang.entries())
+      .map(([code, trackIds]) => ({
+        code,
+        label: toLanguageLabel(code),
+        trackIds,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [subtitleTracks, trackSummary]);
+
+  const trySwitchNativeAudioTrack = useCallback((trackId: number): boolean => {
+    const v = videoRef.current as any;
+    const nativeAudioTracks = v?.audioTracks;
+    if (!nativeAudioTracks || typeof nativeAudioTracks.length !== "number") {
+      return false;
+    }
+
+    const safeIndex = clamp(trackId, 0, Math.max(0, nativeAudioTracks.length - 1));
+
+    try {
+      for (let i = 0; i < nativeAudioTracks.length; i++) {
+        nativeAudioTracks[i].enabled = i === safeIndex;
+      }
+      setSelectedAudio(safeIndex);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const trySwitchNativeSubtitleTrack = useCallback((trackId: number): boolean => {
+    const v = videoRef.current as any;
+    const textTracks = v?.textTracks;
+    if (!textTracks || typeof textTracks.length !== "number" || textTracks.length === 0) {
+      return false;
+    }
+
+    if (trackId < 0) {
+      try {
+        for (let i = 0; i < textTracks.length; i++) {
+          textTracks[i].mode = "disabled";
+        }
+        setNativeSubtitleActive(false);
+        setSubtitleText("");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const safeIndex = clamp(trackId, 0, Math.max(0, textTracks.length - 1));
+    try {
+      for (let i = 0; i < textTracks.length; i++) {
+        textTracks[i].mode = i === safeIndex ? "hidden" : "disabled";
+      }
+      setNativeSubtitleActive(true);
+      setSubtitleCues([]);
+      setSubtitleText("");
+      subtitlePointerRef.current = 0;
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const failoverToProxy = useCallback((seekSec = 0) => {
+    if (forceProxyPlaybackRef.current || failingOverToProxyRef.current) return;
+    if (isLiveStreamRef.current || hlsRef.current) return;
+    failingOverToProxyRef.current = true;
+    forceProxyPlaybackRef.current = true;
+    usingDirectPlaybackRef.current = false;
+    reportPlaybackDebug(
+      "player.failoverToProxy",
+      { seekSec, url: initialUrl },
+      "warn",
+    );
+    startNativePlaybackRef.current(Math.max(0, seekSec));
+    setTimeout(() => {
+      failingOverToProxyRef.current = false;
+    }, 1200);
+  }, [initialUrl]);
 
   const startFastTsPlayback = useCallback(
     (seekSec = 0, audioIdx = 0) => {
       const video = videoRef.current;
       if (!video || !fastTsBaseUrl) return;
+      reportPlaybackMode("stream-ts-fallback", "warn");
       if (!(mpegts.getFeatureList().msePlayback || mpegts.getFeatureList().mseLivePlayback)) {
         startNativePlayback(seekSec);
         return;
       }
 
+      // Record the content offset for this stream instance. Because -copyts is
+      // NOT used in the backend, the TS output PTS always starts from 0. All
+      // effective-time calculations add streamSeekOffsetRef.current to
+      // video.currentTime to get the real playback position.
+      streamSeekOffsetRef.current = Math.max(0, seekSec);
       setIsLoading(true);
       teardownPlayers();
-      const url = `${fastTsBaseUrl}&seek=${Math.max(0, seekSec).toFixed(3)}&audio=${Math.max(0, audioIdx)}`;
+      const requestedAudio = audioIdx >= 0 ? audioIdx : selectedAudioRef.current;
+      const fallbackAudio = getPreferredAudioTrackId(audioTracksRef.current, selectedAudioRef.current);
+      const safeAudio = requestedAudio >= 0 ? requestedAudio : fallbackAudio >= 0 ? fallbackAudio : 0;
+      currentFastTsAudioRef.current = safeAudio;
+      const url = `${fastTsBaseUrl}&seek=${Math.max(0, seekSec).toFixed(3)}&audio=${safeAudio}`;
       const player = mpegts.createPlayer(
         { type: "mpegts", url, isLive: false },
         {
           enableWorker: true,
           autoCleanupSourceBuffer: true,
-          lazyLoad: false,
-          stashInitialSize: 128,
+          lazyLoad: isLowPowerTV,
+          lazyLoadMaxDuration: isLowPowerTV ? 30 : 120,
+          lazyLoadRecoverDuration: isLowPowerTV ? 10 : 30,
+          stashInitialSize: isLowPowerTV ? 96 * 1024 : 256 * 1024,
+          enableStashBuffer: true,
+          fixAudioTimestampGap: true,
         },
       );
       mpegtsRef.current = player;
       player.attachMediaElement(video);
       player.load();
-      const playRet = player.play();
-      if (playRet && typeof (playRet as Promise<void>).catch === "function") {
-        (playRet as Promise<void>).catch((err: any) => {
-          if (String(err?.name || "") === "AbortError") return;
-        });
-      }
+      // Try to prebuffer 30s before starting playback for smooth continuous play.
+      (async () => {
+        const waitForBufferTarget = async (targetSeconds: number, maxWaitMs = 9000) => {
+          const start = Date.now();
+          while (Date.now() - start < maxWaitMs) {
+            if (!video) return false;
+            try {
+              if (isTimeBuffered(video, (video.currentTime || 0) + targetSeconds, 0.75)) return true;
+            } catch {}
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => setTimeout(r, 200));
+          }
+          return false;
+        };
+        const ok = await waitForBufferTarget(30, 9000);
+        try {
+          const playRet = player.play();
+          if (playRet && typeof (playRet as Promise<void>).catch === "function") {
+            (playRet as Promise<void>).catch(() => {});
+          }
+        } catch {}
+        if (!ok) {
+          // if we couldn't prebuffer enough, ensure playback continues; mpegts player will keep loading
+        }
+      })();
       player.on(mpegts.Events.ERROR, () => {
         if (!fastTsFallbackRef.current) {
           fastTsFallbackRef.current = true;
-          startNativePlayback(seekSec);
+          setTimeout(() => {
+            fastTsFallbackRef.current = false;
+            startFastTsPlayback(seekSec, audioIdx);
+          }, 450);
           return;
         }
-        setError("MPEG-TS playback failed");
-        setIsLoading(false);
+        // If TS transmux fails repeatedly, recover with native proxy playback.
+        startNativePlaybackRef.current(Math.max(0, seekSec), true);
       });
     },
-    [fastTsBaseUrl, startNativePlayback, teardownPlayers],
+    [fastTsBaseUrl, reportPlaybackMode, startNativePlayback, teardownPlayers],
   );
 
   const initPlayback = useCallback(async () => { // Made async
     const video = videoRef.current;
-    if (!video || !proxiedUrl) return;
+    if (!video || (!proxiedUrl && !initialUrl)) return;
     setError(null);
     setIsLoading(true);
     remuxFallbackTriedRef.current = false;
+    userPausedRef.current = false;
     originalStreamUrl.current = initialUrl;
     ffprobeAvailable.current = false;
     teardownPlayers();
     const cleanUrl = initialUrl.split("?")[0].toLowerCase();
     const ext = (extension || cleanUrl.match(/\.([a-z0-9]+)$/)?.[1] || "").toLowerCase();
+    const isMkvSource = ext === "mkv";
+    isMkvSourceRef.current = isMkvSource;
+    preferNativeMkvRef.current = false; // [Professional] Prefer FastTS for stability
 
     if (isHlsStream && Hls.isSupported()) {
       const hls = new Hls({
@@ -415,13 +853,22 @@ export default function CinemaPlayer() {
       });
       hlsRef.current = hls;
       hls.loadSource(proxiedUrl);
+      usingDirectPlaybackRef.current = false;
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         const hlsAudio = (hls.audioTracks || []).map((t, i) => ({ id: i, name: t.name || t.lang || `Audio ${i + 1}`, lang: t.lang }));
         const hlsSubs = (hls.subtitleTracks || []).map((t, i) => ({ id: i, name: t.name || t.lang || `Subtitle ${i + 1}`, lang: t.lang }));
         setAudioTracks(hlsAudio);
         setSubtitleTracks(hlsSubs);
-        setSelectedAudio(hlsAudio.length > 0 ? hls.audioTrack : -1);
+        if (hlsAudio.length > 0) {
+          const safeHlsAudio = clamp(hls.audioTrack, 0, hlsAudio.length - 1);
+          try {
+            hls.audioTrack = safeHlsAudio;
+          } catch {}
+          setSelectedAudio(safeHlsAudio);
+        } else {
+          setSelectedAudio(-1);
+        }
         setIsLoading(false);
         video.play().catch(() => {});
       });
@@ -446,13 +893,14 @@ export default function CinemaPlayer() {
       return;
     }
 
-    // For non-HLS VOD, try to load track metadata first
+    // TS sources use mpegts.js directly.
     if (ext === "ts") {
       if (mpegts.getFeatureList().msePlayback || mpegts.getFeatureList().mseLivePlayback) {
         const player = mpegts.createPlayer(
           { type: "mpegts", url: proxiedUrl, isLive: false },
           { enableWorker: true, autoCleanupSourceBuffer: true, lazyLoad: false },
         );
+        usingDirectPlaybackRef.current = false;
         mpegtsRef.current = player;
         player.attachMediaElement(video);
         player.load();
@@ -465,27 +913,50 @@ export default function CinemaPlayer() {
       return;
     }
 
-    if (!isLiveStream && !isHlsStream) {
-      await loadTrackMetadata(); // Wait for track metadata
-      if (ffprobeAvailable.current) {
-        // If ffprobe is available, start with remux playback to enable track switching
-        startRemuxPlayback(0, 0, -1, audioOffsetMs);
+    // Dedicated MKV path: use backend stream-ts transmux for compatibility and
+    // lower memory pressure on constrained TVs while keeping subtitle/audio
+    // metadata fetched separately.
+    if (!isLiveStream && !isHlsStream && isMkvSource) {
+      const defaultAudioId = await loadTrackMetadata();
+      if (preferNativeMkvRef.current) {
+        usingDirectPlaybackRef.current = false;
+        reportPlaybackMode("proxy-range");
+        video.src = proxiedUrl;
+        video.load();
         return;
       }
-      // If ffprobe failed, fall through to native playback
-      console.warn("ffprobe not available for VOD, falling back to native playback.");
+      // Use FastTS (MPEG-TS) which is more "IPTV-safe" for 1-connection accounts
+      startFastTsPlayback(0, defaultAudioId ?? selectedAudioRef.current);
+      return;
     }
 
+    if (!isLiveStream && !isHlsStream) {
+      // Direct-first for VOD/series to reduce proxy overhead and startup delay.
+      // If direct playback fails, we auto-switch this session to proxy fallback.
+      const sourceUrl = forceProxyPlaybackRef.current ? proxiedUrl : initialUrl;
+      usingDirectPlaybackRef.current =
+        !forceProxyPlaybackRef.current && sourceUrl === initialUrl;
+      if (sourceUrl === proxiedUrl) {
+        reportPlaybackMode("proxy-range");
+      }
+      video.src = sourceUrl;
+      video.load();
+      void loadTrackMetadata();
+      return;
+    }
+
+    usingDirectPlaybackRef.current = false;
     video.src = proxiedUrl;
     video.load();
   }, [
-    audioOffsetMs,
     extension,
+    startFastTsPlayback,
     initialUrl,
     isHlsStream,
     isLiveStream,
     proxiedUrl,
     loadTrackMetadata,
+    reportPlaybackMode,
     startRemuxPlayback,
     teardownPlayers,
   ]);
@@ -495,16 +966,54 @@ export default function CinemaPlayer() {
   }, [startNativePlayback]);
 
   useEffect(() => {
+    startFastTsPlaybackRef.current = startFastTsPlayback;
+  }, [startFastTsPlayback]);
+
+  useEffect(() => {
     isLiveStreamRef.current = isLiveStream;
   }, [isLiveStream]);
 
+  useEffect(() => {
+    // Reset direct/proxy preference on each new title/episode.
+    forceProxyPlaybackRef.current = false;
+    usingDirectPlaybackRef.current = false;
+    userPausedRef.current = false;
+    failingOverToProxyRef.current = false;
+    isMkvSourceRef.current = false;
+    preferNativeMkvRef.current = false;
+    playbackModeRef.current = null;
+    streamSeekOffsetRef.current = 0;
+  }, [initialUrl]);
+
+  useEffect(() => {
+    selectedAudioRef.current = selectedAudio;
+  }, [selectedAudio]);
+
+  useEffect(() => {
+    audioTracksRef.current = audioTracks;
+  }, [audioTracks]);
+
+  useEffect(() => {
+    subtitleLoadingRef.current = subtitleLoading;
+  }, [subtitleLoading]);
+
+  // Keep subtitle-related refs in sync with state so the RAF loop can read
+  // them without being recreated (avoids stale-closure subtitle display bugs).
+  useEffect(() => { selectedSubtitleRef.current = selectedSubtitle; }, [selectedSubtitle]);
+  useEffect(() => { subtitleCuesRef.current = subtitleCues; }, [subtitleCues]);
+  useEffect(() => { nativeSubtitleActiveRef.current = nativeSubtitleActive; }, [nativeSubtitleActive]);
+  useEffect(() => { subtitleOffsetMsRef.current = subtitleOffsetMs; }, [subtitleOffsetMs]);
+
+  // RAF subtitle engine — uses refs exclusively so the loop NEVER needs to
+  // restart when selectedSubtitle / subtitleCues / offsets change.
   const runSubtitleEngineFrame = useCallback(() => {
-    if (nativeSubtitleActive) {
+    if (nativeSubtitleActiveRef.current) {
       subtitleRafRef.current = requestAnimationFrame(runSubtitleEngineFrame);
       return;
     }
     const v = videoRef.current;
-    if (!v || selectedSubtitle < 0 || subtitleCues.length === 0) {
+    const cues = subtitleCuesRef.current;
+    if (!v || selectedSubtitleRef.current < 0 || cues.length === 0) {
       if (subtitleLastTextRef.current !== "") {
         subtitleLastTextRef.current = "";
         setSubtitleText("");
@@ -512,21 +1021,22 @@ export default function CinemaPlayer() {
       subtitleRafRef.current = requestAnimationFrame(runSubtitleEngineFrame);
       return;
     }
-    const now = v.currentTime + subtitleOffsetMs / 1000;
+    // Use effective time: video.currentTime + stream seek offset + subtitle offset
+    const now = v.currentTime + streamSeekOffsetRef.current + subtitleOffsetMsRef.current / 1000;
     const last = subtitleLastTimeRef.current;
     subtitleLastTimeRef.current = now;
     let idx = subtitlePointerRef.current;
-    if (Math.abs(now - last) > 1.2 || idx >= subtitleCues.length) {
-      idx = getCueIndexBinary(subtitleCues, now);
+    if (Math.abs(now - last) > 1.2 || idx >= cues.length) {
+      idx = getCueIndexBinary(cues, now);
       subtitlePointerRef.current = idx < 0 ? 0 : idx;
     } else {
-      while (idx < subtitleCues.length && subtitleCues[idx].end < now) idx++;
-      while (idx > 0 && subtitleCues[idx - 1].start > now) idx--;
+      while (idx < cues.length && cues[idx].end < now) idx++;
+      while (idx > 0 && cues[idx - 1].start > now) idx--;
       subtitlePointerRef.current = idx;
     }
     let nextText = "";
-    if (idx >= 0 && idx < subtitleCues.length) {
-      const cue = subtitleCues[idx];
+    if (idx >= 0 && idx < cues.length) {
+      const cue = cues[idx];
       if (now >= cue.start && now <= cue.end) nextText = cue.text;
     }
     if (nextText !== subtitleLastTextRef.current) {
@@ -534,7 +1044,7 @@ export default function CinemaPlayer() {
       setSubtitleText(nextText);
     }
     subtitleRafRef.current = requestAnimationFrame(runSubtitleEngineFrame);
-  }, [nativeSubtitleActive, selectedSubtitle, subtitleCues, subtitleOffsetMs]);
+  }, []); // Empty deps — reads all values from refs, never stale
 
   const stopSubtitleEngine = useCallback(() => {
     if (subtitleRafRef.current != null) {
@@ -551,54 +1061,162 @@ export default function CinemaPlayer() {
     subtitleRafRef.current = requestAnimationFrame(runSubtitleEngineFrame);
   }, [runSubtitleEngineFrame, stopSubtitleEngine]);
 
-  const fetchSubtitleCues = useCallback(async (trackId: number): Promise<"success" | "failed_extraction" | "not_text_based"> => {
+  const fetchSubtitleCues = useCallback(async (trackId: number, seekOverride?: number): Promise<"success" | "failed_extraction" | "not_text_based" | "aborted"> => {
+    subtitleFetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    subtitleFetchAbortRef.current = controller;
+
     if (trackId < 0) {
       setSubtitleCues([]);
       setSubtitleText("");
       return "success"; // Turning off is a "success" in this context
     }
-    const endpoints = [
-      `${window.location.origin}/api/subtitle?url=${encodeURIComponent(originalStreamUrl.current)}&index=${trackId}&format=vtt&delayMs=0`,
-      `${window.location.origin}/api/subtitle?url=${encodeURIComponent(originalStreamUrl.current)}&index=${trackId}&format=srt&delayMs=0`,
-    ];
-    let payload = "";
-    let ok = false;
-    for (const url of endpoints) {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) {
-          const errorText = await res.text();
-          if (errorText.includes("Subtitle track is empty or not text-based")) { return "not_text_based"; }
-          continue; }
-        payload = await res.text();
-        const normalized = (payload || "").trim();
-        const hasTimelineData =
-          normalized.includes("-->") ||
-          normalized.includes("Dialogue:") ||
-          normalized.includes("[Script Info]");
-        if (normalized && hasTimelineData) {
-          ok = true;
-          break;
+
+    const v = videoRef.current;
+    const effectiveSeek = seekOverride ?? (v && Number.isFinite(v.currentTime) ? Math.floor(v.currentTime + streamSeekOffsetRef.current) : 0);
+    const trackMeta = subtitleTracks.find(t => t.id === trackId);
+    const codecHint = trackMeta?.codec ? `&codec=${encodeURIComponent(trackMeta.codec)}` : "";
+
+    const subtitleBaseUrl =
+      `${window.location.origin}/api/subtitle?url=${encodeURIComponent(originalStreamUrl.current)}` +
+      `&index=${trackId}&format=vtt&delayMs=0&title=${encodeURIComponent(initialTitle)}${codecHint}` +
+      (effectiveSeek > 2 ? `&seek=${effectiveSeek}` : "");
+
+    const applyPayload = (payload: string): boolean => {
+      const normalized = (payload || "").trim();
+      const hasTimelineData =
+        normalized.includes("-->") ||
+        normalized.includes("Dialogue:") ||
+        normalized.includes("[Script Info]");
+      if (!normalized || !hasTimelineData) return false;
+      const cues = parseSubtitlePayload(normalized);
+      if (cues.length === 0) return false;
+      setSubtitleCues(cues);
+      subtitlePointerRef.current = 0;
+      subtitleLastTimeRef.current = 0;
+      subtitleLastTextRef.current = "";
+      return true;
+    };
+
+    const fetchAndApply = async (): Promise<string> => {
+      const subtitleRes = await fetch(`${subtitleBaseUrl}&t=${Date.now()}`, {
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      if (!subtitleRes.ok) return "";
+      return subtitleRes.text();
+    };
+
+    try {
+      const prefetchRes = await fetch(`${subtitleBaseUrl}&prefetch=1&background=1`, {
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      if (!prefetchRes.ok && prefetchRes.status !== 202 && prefetchRes.status !== 204) {
+        return "failed_extraction";
+      }
+
+      let isCached = false;
+      let isPartial = false;
+      const pollDeadline = Date.now() + 300_000;
+      const quickPollDeadline = Date.now() + 6000; // try quick polling for ~6s before doing a fast blocking extract
+      let needsRetrigger = false;
+      let pollCount = 0;
+      const maxAttempts = 600; // 600 * 500ms = 300s max wait for new extraction
+
+      // Quick polling window: try to get something within 6s via background prefetch
+      while (!isCached && Date.now() < quickPollDeadline && pollCount < maxAttempts) {
+        pollCount++;
+        const checkRes = await fetch(`${subtitleBaseUrl}&check=1`, {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (checkRes.ok) {
+          const checkData = await checkRes.json();
+          isCached = Boolean(checkData?.cached);
+          isPartial = Boolean(checkData?.partial);
+          if (isPartial && !isCached) {
+            console.log("[subtitle] partial data available, fetching immediately without waiting for full extraction");
+            break;
+          }
+          if (isCached) break;
+          needsRetrigger = !checkData?.extracting;
         }
-      } catch {}
-    }
-    if (!ok) {
-      setSubtitleCues([]);
-      setSubtitleText("");
-      console.warn("Subtitle extraction failed for selected track", trackId); // eslint-disable-line no-console
+        if (needsRetrigger) {
+          await fetch(`${subtitleBaseUrl}&prefetch=1&background=1`, {
+            signal: controller.signal,
+            cache: "no-store",
+          }).catch(() => {});
+          needsRetrigger = false;
+        }
+        await waitWithAbort(500, controller.signal);
+      }
+
+      // If still not cached after quick window, try a short blocking extract (low-bandwidth mode)
+      if (!isCached) {
+        const extractRes = await fetch(`${subtitleBaseUrl}&mode=extract&lowBandwidth=1`, {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (!extractRes.ok) {
+          const errorText = await extractRes.text();
+          if (errorText.includes("Subtitle track is empty or not text-based")) {
+            return "not_text_based";
+          }
+          return "failed_extraction";
+        }
+        const extractData = await extractRes.json();
+        if (!extractData?.ok || extractData?.status !== "Done") {
+          return "failed_extraction";
+        }
+        isPartial = Boolean(extractData?.partial);
+      }
+
+      // Fetch and apply whatever we have (could be partial or full).
+      const payload = await fetchAndApply();
+      if (!applyPayload(payload)) {
+        return "failed_extraction";
+      }
+
+      // If we got partial data (header extraction only got first ~46s), keep
+      // polling in the background. When the full extraction finishes, update.
+      if (isPartial && !controller.signal.aborted) {
+        void (async () => {
+          const upgradeDeadline = Date.now() + 600_000; // 10 min max wait
+          let upgraded = false;
+          while (!upgraded && Date.now() < upgradeDeadline && !controller.signal.aborted) {
+            await waitWithAbort(5000, controller.signal).catch(() => {});
+            if (controller.signal.aborted) break;
+            try {
+              const checkRes = await fetch(`${subtitleBaseUrl}&check=1`, {
+                signal: controller.signal,
+                cache: "no-store",
+              });
+              if (!checkRes.ok) continue;
+              const checkData = await checkRes.json();
+              // When the server writes a full (non-partial) result, upgrade.
+              if (checkData?.cached && !checkData?.partial) {
+                const fullPayload = await fetchAndApply();
+                if (applyPayload(fullPayload)) {
+                  upgraded = true;
+                  toast.success("Subtitles upgraded to full version");
+                }
+              }
+            } catch { break; }
+          }
+        })();
+        return "success"; // Partial data already applied above
+      }
+
+      return "success";
+    } catch (err: any) {
+      if (err?.name === "AbortError") return "aborted";
       return "failed_extraction";
     }
-    const cues = parseSubtitlePayload(payload);
-    if (cues.length === 0) {
-      setSubtitleCues([]);
-      setSubtitleText("");
-      console.warn("Subtitle payload parsed with zero cues", trackId); // eslint-disable-line no-console
-      return "failed_extraction";
-    }
-    setSubtitleCues(cues);
-    subtitlePointerRef.current = 0;
-    return "success";
-  }, []);
+  }, [initialTitle, subtitleTracks]);
+
+  // Keep a stable ref so event handlers in empty-dep useEffects can call latest version.
+  useEffect(() => { fetchSubtitleCuesRef.current = fetchSubtitleCues; }, [fetchSubtitleCues]);
 
   const switchAudioTrack = useCallback((trackId: number) => {
     const v = videoRef.current;
@@ -608,51 +1226,80 @@ export default function CinemaPlayer() {
       try {
         hls.audioTrack = trackId;
         setSelectedAudio(trackId);
+        reportPlaybackDebug("player.audioTrackSelected", {
+          mode: "hls",
+          trackId,
+          track: audioTracks.find((t) => t.id === trackId) || null,
+        });
       } catch {
         setError("Failed to switch HLS audio track");
       }
       return;
     }
-    // For non-HLS VOD (MP4, MKV, etc.), use remuxing if ffprobe is available
-    if (!isLiveStream && ffprobeAvailable.current) {
-      const seek = Number.isFinite(v.currentTime) ? v.currentTime : 0;
-      const currentSubId = selectedSubtitle >= 0 ? selectedSubtitle : -1;
-      startRemuxPlayback(seek, trackId, currentSubId, audioOffsetMs);
+
+    if (mpegtsRef.current) {
+      // Use effective time so the restarted stream begins at the right position.
+      const seek = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
+      reportPlaybackDebug("player.audioTrackSelected", { mode: "fast-ts", trackId, seek });
+      setSelectedAudio(trackId);
+      startFastTsPlayback(seek, trackId);
       return;
     }
 
-    // For live TS or other native-only streams, just update state (no actual switch)
-    setSelectedAudio(trackId);
-  }, [audioOffsetMs, isLiveStream, selectedSubtitle, startRemuxPlayback]);
+    if (trySwitchNativeAudioTrack(trackId)) {
+      reportPlaybackDebug("player.audioTrackSelected", {
+        mode: "native",
+        trackId,
+        track: audioTracks.find((t) => t.id === trackId) || null,
+      });
+      return;
+    }
 
-  const switchSubtitleTrack = useCallback(async (trackId: number) => {
+    // Fallback only when the browser cannot expose native audio-track switching.
+    if (!isLiveStream && ffprobeAvailable.current) {
+      const seek = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+      reportPlaybackDebug("player.audioTrackSelected", {
+        mode: "remux-fallback",
+        trackId,
+        track: audioTracks.find((t) => t.id === trackId) || null,
+        seek,
+      });
+      startRemuxPlayback(seek, trackId, -1, audioOffsetMs);
+      return;
+    }
+
+    setSelectedAudio(trackId);
+  }, [audioOffsetMs, audioTracks, isLiveStream, startRemuxPlayback, trySwitchNativeAudioTrack]);
+
+  const handleSubtitleChange = useCallback(async (trackId: number) => {
+    // If a previous subtitle extraction is running, abort it so the new
+    // selection takes effect immediately instead of being silently dropped.
+    if (subtitleLoadingRef.current) {
+      subtitleFetchAbortRef.current?.abort();
+      subtitleLoadingRef.current = false;
+      setSubtitleLoading(false);
+    }
+
+    const requestSeq = ++subtitleSwitchSeqRef.current;
     setSelectedSubtitle(trackId);
     const v = videoRef.current as any;
 
+    reportPlaybackDebug("player.subtitleTrackSelected", {
+      trackId,
+      track: subtitleTracks.find((t) => t.id === trackId) || null,
+    });
+
     if (trackId < 0) {
-      setNativeSubtitleActive(false);
+      subtitleFetchAbortRef.current?.abort();
+      subtitleResumeAfterLoadRef.current = false;
+      subtitleInterruptionRef.current = false;
+      subtitleLoadingRef.current = false;
+      setSubtitleLoading(false);
       setSubtitleCues([]);
       setSubtitleText("");
       subtitlePointerRef.current = 0;
-      const textTracks = v?.textTracks;
-      if (textTracks && typeof textTracks.length === "number") {
-        for (let i = 0; i < textTracks.length; i++) {
-          try {
-            textTracks[i].mode = "disabled";
-          } catch {}
-        }
-      }
-      return;
-    }
-
-    // For non-HLS VOD (MP4, MKV, etc.), use remuxing if ffprobe is available
-    if (!isLiveStream && ffprobeAvailable.current) {
-      const seek = Number.isFinite(v.currentTime) ? v.currentTime : 0;
-      const currentAudioId = selectedAudio >= 0 ? selectedAudio : 0;
-      startRemuxPlayback(seek, currentAudioId, trackId, audioOffsetMs);
+      if (trySwitchNativeSubtitleTrack(-1)) return;
       setNativeSubtitleActive(false);
-      setSubtitleCues([]);
-      setSubtitleText("");
       return;
     }
 
@@ -666,27 +1313,94 @@ export default function CinemaPlayer() {
       return;
     }
 
-    // For other native-only streams (e.g., live TS), try fetching cues for custom engine
-    if (trackId >= 0) {
-      const extractionResult = await fetchSubtitleCues(trackId);
-      if (extractionResult === "success") {
-        setNativeSubtitleActive(false);
-      } else {
-        setNativeSubtitleActive(false);
-        setSubtitleCues([]);
-        setSubtitleText("");
-        if (extractionResult === "not_text_based") {
-          toast.warning("Selected subtitle track is not text-based and cannot be displayed.");
-        } else {
-          toast.error("Failed to extract subtitles for the selected track.");
-        }
-      }
-    } else {
+    // For non-HLS streams, we always prefer our Custom Subtitle Engine 
+    // to support professional features like Top/Bottom positioning and Size scaling.
+    // Native tracks are only used as a fallback if extraction is not possible.
+
+    const selectedSubtitleMeta = subtitleTracks.find((track) => track.id === trackId);
+    const codec = String(selectedSubtitleMeta?.codec || "").toLowerCase();
+    const unsupportedSubtitleCodecs = new Set([
+      "hdmv_pgs_subtitle",
+      "pgs",
+      "dvd_subtitle",
+      "dvb_subtitle",
+      "xsub",
+      "vobsub",
+      "eia_608",
+      "eia_708",
+      "arib_caption",
+      "bin_data",
+      "teletext",
+    ]);
+    if (codec && unsupportedSubtitleCodecs.has(codec)) {
       setNativeSubtitleActive(false);
       setSubtitleCues([]);
       setSubtitleText("");
+      toast.warning(`Subtitle codec not supported for extraction: ${codec}`);
+      return;
     }
-  }, [audioOffsetMs, isLiveStream, selectedAudio, startRemuxPlayback, fetchSubtitleCues]);
+
+    // Hard-stop active playback connection before extraction so IPTV 1-connection
+    // accounts free the slot for subtitle extraction.
+    if (trackId >= 0) {
+      // Professional Connection-Safe Flow: 
+      // 1. Don't stop the stream immediately.
+      // 2. Try to fetch subtitles in background.
+      
+      setSubtitleLoading(true);
+      subtitleLoadingRef.current = true;
+
+      const extractionResult = await fetchSubtitleCues(trackId);
+      
+      if (subtitleSwitchSeqRef.current === requestSeq) {
+        setSubtitleLoading(false);
+        subtitleLoadingRef.current = false;
+        
+        if (extractionResult === "success") {
+          setNativeSubtitleActive(false);
+          toast.success("Subtitles loaded");
+        } else if (extractionResult !== "aborted") {
+          if (trySwitchNativeSubtitleTrack(trackId)) {
+            toast.success("Native subtitles enabled");
+          } else {
+            toast.error("Subtitle extraction failed");
+          }
+        }
+      }
+    }
+  }, [
+    fetchSubtitleCues,
+    subtitleTracks,
+    trySwitchNativeSubtitleTrack,
+  ]);
+
+  const switchSubtitleLanguage = useCallback(
+    (langCode: string) => {
+      const code = String(langCode || "und").toUpperCase();
+      const candidates = subtitleTracks.filter(
+        (track) => String(track.lang || "und").toUpperCase() === code,
+      );
+      if (candidates.length === 0) return;
+
+      const preferred =
+        candidates.find((track) => !/\b(sdh|cc|forced)\b/i.test(track.name)) ||
+        candidates.find((track) => /\bforced\b/i.test(track.name)) ||
+        candidates[0];
+
+      void handleSubtitleChange(preferred.id);
+    },
+    [handleSubtitleChange, subtitleTracks],
+  );
+
+  useEffect(() => {
+    if (selectedSubtitle < 0) return;
+    if (!subtitleText) return;
+    const preview = subtitleText.replace(/\s+/g, " ").trim().slice(0, 200);
+    reportPlaybackDebug("player.subtitleCue", {
+      trackId: selectedSubtitle,
+      text: preview,
+    });
+  }, [selectedSubtitle, subtitleText]);
 
   useEffect(() => {
     const hls = hlsRef.current;
@@ -762,52 +1476,138 @@ export default function CinemaPlayer() {
   const togglePlay = () => {
     const v = videoRef.current;
     if (!v) return;
-    if (v.paused) v.play().catch(() => {});
-    else v.pause();
+    if (v.paused) {
+      userPausedRef.current = false;
+      if (mpegtsRef.current) {
+        try {
+          const playerPlay = mpegtsRef.current.play?.();
+          if (playerPlay && typeof playerPlay.catch === "function") {
+            playerPlay.catch(() => {});
+          }
+        } catch {}
+        const playPromise = v.play();
+        if (playPromise && typeof playPromise.catch === "function") {
+          playPromise.catch(() => {
+            if (!isTimeBuffered(v, v.currentTime, 0.35) && v.readyState < 2) {
+              const resumeAt = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
+              const audioIdx = selectedAudio >= 0 ? selectedAudio : 0;
+              setIsLoading(true);
+              startFastTsPlayback(resumeAt, audioIdx);
+            }
+          });
+        }
+        return;
+      }
+      v.play().catch(() => {});
+    } else {
+      userPausedRef.current = true;
+      v.pause();
+    }
   };
 
   const seekBy = (delta: number) => {
     const v = videoRef.current;
     if (!v) return;
+    // Compute effective current time (video.currentTime + TS stream offset).
+    const effCurrent = v.currentTime + streamSeekOffsetRef.current;
     const baseDuration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : effectiveDuration;
-    if (!Number.isFinite(baseDuration) || baseDuration <= 0) return;
-    const target = clamp(v.currentTime + delta, 0, baseDuration);
-    if (mpegtsRef.current && fastTsBaseUrl) {
-      const audioIdx = selectedAudio >= 0 ? selectedAudio : 0;
-      if (seekApplyTimerRef.current) clearTimeout(seekApplyTimerRef.current);
-      seekApplyTimerRef.current = setTimeout(() => {
-        startFastTsPlayback(target, audioIdx);
-      }, 120);
-      setCurrentTime(target);
+    const effTarget =
+      baseDuration > 0
+        ? clamp(effCurrent + delta, 0, baseDuration)
+        : Math.max(0, effCurrent + delta);
+
+    if (mpegtsRef.current) {
+      // Convert to video-local time (0-based within this TS stream instance).
+      const videoTarget = effTarget - streamSeekOffsetRef.current;
+      if (videoTarget >= 0 && isTimeBuffered(v, videoTarget, 1.5)) {
+        // Target is within buffered range — seek directly.
+        v.currentTime = videoTarget;
+        setCurrentTime(effTarget);
+        if (!userPausedRef.current) v.play().catch(() => {});
+        setIsLoading(false);
+      } else {
+        // Target is outside buffer — restart stream at the new effective position.
+        const audioIdx = selectedAudioRef.current >= 0 ? selectedAudioRef.current : 0;
+        setCurrentTime(effTarget);
+        startFastTsPlayback(effTarget, audioIdx);
+      }
       return;
     }
-    v.currentTime = target;
+
+    // Non-TS streams: seek natively.
+    v.currentTime = effTarget;
+    setCurrentTime(effTarget);
+    if (isTimeBuffered(v, effTarget, 1.5)) {
+      if (!userPausedRef.current) v.play().catch(() => {});
+      setIsLoading(false);
+      return;
+    }
+    if (!userPausedRef.current) v.play().catch(() => {});
+    setIsLoading(true);
+    if (seekApplyTimerRef.current) clearTimeout(seekApplyTimerRef.current);
+    seekApplyTimerRef.current = setTimeout(() => {
+      if (v.readyState >= 2) setIsLoading(false);
+    }, 1500);
   };
 
   const handleSeekChange = (value: number) => {
     const v = videoRef.current;
     if (!v) return;
-    const maxDuration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : effectiveDuration || 0;
-    if (!Number.isFinite(maxDuration) || maxDuration <= 0) return;
-    const target = clamp(value, 0, maxDuration);
+    // value is effective time (video.currentTime + stream offset space)
+    const maxDuration = effectiveDuration || 0;
+    const effTarget = maxDuration > 0 ? clamp(value, 0, maxDuration) : Math.max(0, value);
 
-    if (mpegtsRef.current && fastTsBaseUrl) {
-      const audioIdx = selectedAudio >= 0 ? selectedAudio : 0;
-      if (seekApplyTimerRef.current) clearTimeout(seekApplyTimerRef.current);
-      seekApplyTimerRef.current = setTimeout(() => {
-        startFastTsPlayback(target, audioIdx);
-      }, 220);
-      setCurrentTime(target);
+    if (mpegtsRef.current) {
+      const videoTarget = effTarget - streamSeekOffsetRef.current;
+      if (videoTarget >= 0 && isTimeBuffered(v, videoTarget, 1.5)) {
+        v.currentTime = videoTarget;
+        setCurrentTime(effTarget);
+        if (!userPausedRef.current) v.play().catch(() => {});
+        setIsLoading(false);
+      } else {
+        const audioIdx = selectedAudioRef.current >= 0 ? selectedAudioRef.current : 0;
+        setCurrentTime(effTarget);
+        startFastTsPlayback(effTarget, audioIdx);
+      }
       return;
     }
 
-    setIsLoading(true);
-    v.currentTime = target;
-    if (hlsRef.current) {
-      try {
-        hlsRef.current.startLoad(-1);
-      } catch {}
+    // Non-TS streams: seek natively.
+    v.currentTime = effTarget;
+    setCurrentTime(effTarget);
+    if (isTimeBuffered(v, effTarget, 1.5)) {
+      if (!userPausedRef.current) v.play().catch(() => {});
+      setIsLoading(false);
+      return;
     }
+    if (!userPausedRef.current) v.play().catch(() => {});
+    setIsLoading(true);
+    if (seekApplyTimerRef.current) clearTimeout(seekApplyTimerRef.current);
+    seekApplyTimerRef.current = setTimeout(() => {
+      if (v.readyState >= 2) setIsLoading(false);
+    }, 1500);
+    if (hlsRef.current) {
+      try { hlsRef.current.startLoad(-1); } catch {}
+    }
+  };
+
+  const handleSeekScrubStart = () => {
+    setIsScrubbing(true);
+    setScrubTime(currentTime);
+  };
+
+  const handleSeekScrubMove = (value: number) => {
+    if (!Number.isFinite(value)) return;
+    if (!isScrubbing) setIsScrubbing(true);
+    setScrubTime(Math.max(0, value));
+  };
+
+  const handleSeekScrubCommit = () => {
+    const target = scrubTime;
+    setIsScrubbing(false);
+    setScrubTime(null);
+    if (target === null || !Number.isFinite(target)) return;
+    handleSeekChange(target);
   };
 
   const toggleMute = () => {
@@ -870,7 +1670,7 @@ export default function CinemaPlayer() {
     if (!seriesId || !playlistId) return;
     const v = videoRef.current;
     if (!v) return;
-    const ct = Math.floor(v.currentTime || 0);
+    const ct = Math.floor((v.currentTime || 0) + streamSeekOffsetRef.current);
     const rawDuration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : effectiveDuration;
     const dur = Math.floor(rawDuration || 0);
     if (!Number.isFinite(dur) || dur <= 0) return;
@@ -933,8 +1733,16 @@ export default function CinemaPlayer() {
         const subtitleLimit = Math.max(0, subtitleTracks.length - 1);
         if (settingsTab === "audio" && audioTracks.length > 0) switchAudioTrack(clamp(focusIndex, 0, audioLimit));
         if (settingsTab === "subtitle") {
-          if (focusIndex === 0) switchSubtitleTrack(-1);
-          else if (subtitleTracks.length > 0) switchSubtitleTrack(clamp(focusIndex - 1, 0, subtitleLimit));
+          if (focusIndex === 0) handleSubtitleChange(-1);
+          else if (subtitleTracks.length > 0) handleSubtitleChange(clamp(focusIndex - 1, 0, subtitleLimit));
+        }
+        if (settingsTab === "display") {
+          const entry = settingsEntries[focusIndex];
+          if (entry === "Subtitle Top") updateSettings({ subtitlePosition: "top" });
+          else if (entry === "Subtitle Bottom") updateSettings({ subtitlePosition: "bottom" });
+          else if (entry === "Subtitle Large") updateSettings({ subtitleSize: "large" });
+          else if (entry === "Subtitle Medium") updateSettings({ subtitleSize: "medium" });
+          return;
         }
         return;
       }
@@ -957,7 +1765,7 @@ export default function CinemaPlayer() {
       return;
     }
     if (key === "down") setPlayerVolume(volume - 0.06);
-  }, [audioOffsetMs, audioTracks.length, focusIndex, navigate, settingsOpen, settingsTab, subtitleTracks.length, updateAudioDelay, volume, switchAudioTrack, switchSubtitleTrack]);
+  }, [audioOffsetMs, audioTracks.length, focusIndex, handleSubtitleChange, navigate, settingsOpen, settingsTab, subtitleTracks.length, updateAudioDelay, volume, switchAudioTrack]);
 
   useEffect(() => {
     settingsOpenRef.current = settingsOpen;
@@ -978,7 +1786,7 @@ export default function CinemaPlayer() {
     });
     if (preAudio.length > 0) {
       setAudioTracks(preAudio);
-      setSelectedAudio(0);
+      setSelectedAudio(preAudio[0]?.id ?? 0);
     }
     if (preSub.length > 0) setSubtitleTracks(preSub);
   }, [streamInfo]);
@@ -1038,11 +1846,16 @@ export default function CinemaPlayer() {
     const onPlaying = () => {
       clearWaitingTimer();
       clearSeekRecoveryTimer();
+      if (seekApplyTimerRef.current) {
+        clearTimeout(seekApplyTimerRef.current);
+        seekApplyTimerRef.current = null;
+      }
       setIsPlaying(true);
       setIsLoading(false);
     };
     const onPause = () => setIsPlaying(false);
     const onSeeking = () => {
+      if (subtitleInterruptionRef.current) return;
       clearWaitingTimer();
       clearSeekRecoveryTimer();
       setIsLoading(true);
@@ -1051,14 +1864,34 @@ export default function CinemaPlayer() {
       }, 5000);
     };
     const onSeeked = () => {
+      if (subtitleInterruptionRef.current) return;
       clearWaitingTimer();
       clearSeekRecoveryTimer();
+      if (seekApplyTimerRef.current && v.readyState >= 2) {
+        clearTimeout(seekApplyTimerRef.current);
+        seekApplyTimerRef.current = null;
+      }
       setIsLoading(false);
-      if (v.paused && !document.hidden) {
+      if (v.paused && !document.hidden && !userPausedRef.current) {
         v.play().catch(() => {});
+      }
+      // Re-fetch subtitles if current cues don't cover the new seek position.
+      // This handles the case where seek-based partial results don't reach the new position.
+      const trackId = selectedSubtitleRef.current;
+      if (trackId >= 0) {
+        const effTime = v.currentTime + streamSeekOffsetRef.current;
+        const cues = subtitleCuesRef.current;
+        // Check if any cue exists near the current position (within 60s)
+        const hasCoverageNearby = cues.some(c => c.end >= effTime - 5 && c.start <= effTime + 60);
+        if (!hasCoverageNearby && cues.length > 0) {
+          // Cues loaded but none cover current position — re-fetch from seek point
+          console.log(`[subtitle] seek gap detected at ${effTime.toFixed(1)}s, re-fetching track ${trackId}`);
+          fetchSubtitleCuesRef.current?.(trackId, Math.floor(effTime));
+        }
       }
     };
     const onWaiting = () => {
+      if (subtitleInterruptionRef.current) return;
       clearWaitingTimer();
       waitingTimerRef.current = setTimeout(() => {
         if (!v.paused && v.readyState < 3) {
@@ -1081,13 +1914,26 @@ export default function CinemaPlayer() {
       setIsLoading(false);
     };
     const onStalled = () => {
+      if (subtitleInterruptionRef.current) return;
+      if (
+        usingDirectPlaybackRef.current &&
+        !forceProxyPlaybackRef.current &&
+        !failingOverToProxyRef.current
+      ) {
+        const seek = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
+        failoverToProxy(seek);
+        return;
+      }
       setIsLoading(true);
       clearSeekRecoveryTimer();
       seekRecoveryTimerRef.current = setTimeout(() => {
         if (v.readyState < 3) recoverFromStall();
       }, 5000);
     };
-    const onTimeUpdate = () => setCurrentTime(v.currentTime || 0);
+    const onTimeUpdate = () => {
+      // Effective time = video.currentTime (0-based per TS stream) + stream seek offset.
+      setCurrentTime((v.currentTime || 0) + streamSeekOffsetRef.current);
+    };
     const onDuration = () => {
       // Trust native duration only if it's not suspiciously short (e.g. < 1min) 
       // while the API tells us the file is actually long.
@@ -1115,11 +1961,43 @@ export default function CinemaPlayer() {
       } else if (inferredDurationRef.current > 0) {
         setDuration(inferredDurationRef.current);
       }
-      v.play().catch(() => {});
+      if (!userPausedRef.current) {
+        v.play().catch(() => {});
+      }
     };
     const onError = () => {
+      if (subtitleInterruptionRef.current) return;
       clearWaitingTimer();
       clearSeekRecoveryTimer();
+
+      if (
+        isMkvSourceRef.current &&
+        preferNativeMkvRef.current &&
+        !mpegtsRef.current &&
+        !remuxFallbackTriedRef.current
+      ) {
+        remuxFallbackTriedRef.current = true;
+        const fallbackSeek = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
+        startFastTsPlaybackRef.current(
+          Math.max(0, fallbackSeek),
+          selectedAudioRef.current >= 0 ? selectedAudioRef.current : 0,
+        );
+        return;
+      }
+
+      if (
+        !isLiveStreamRef.current &&
+        !hlsRef.current &&
+        usingDirectPlaybackRef.current &&
+        !forceProxyPlaybackRef.current
+      ) {
+        // First failure on direct VOD playback: fail over to proxy for this
+        // playback session without touching playlist/listing fetch behavior.
+        const fallbackSeek = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
+        failoverToProxy(fallbackSeek);
+        return;
+      }
+
       if (
         !isLiveStreamRef.current &&
         !hlsRef.current &&
@@ -1127,7 +2005,7 @@ export default function CinemaPlayer() {
         !remuxFallbackTriedRef.current
       ) {
         remuxFallbackTriedRef.current = true;
-        const fallbackSeek = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+        const fallbackSeek = Number.isFinite(v.currentTime) ? v.currentTime + streamSeekOffsetRef.current : 0;
         startNativePlaybackRef.current(Math.max(0, fallbackSeek));
         return;
       }
@@ -1227,6 +2105,12 @@ export default function CinemaPlayer() {
     }
   }, [selectedSubtitle]);
 
+  useEffect(() => {
+    return () => {
+      subtitleFetchAbortRef.current?.abort();
+    };
+  }, []);
+
   const formatTime = (s: number) => {
     if (!Number.isFinite(s)) return "--:--";
     const h = Math.floor(s / 3600);
@@ -1236,10 +2120,14 @@ export default function CinemaPlayer() {
     return `${m}:${String(sec).padStart(2, "0")}`;
   };
 
+  // When scrubbing, show the drag position; otherwise show effective currentTime
+  // (which already includes the stream seek offset via onTimeUpdate).
+  const displayedSeekTime = isScrubbing && scrubTime !== null ? scrubTime : currentTime;
+
   const settingsEntries = useMemo(() => {
     if (settingsTab === "audio") return audioTracks.map((a) => a.name);
     if (settingsTab === "subtitle") return ["Off", ...subtitleTracks.map((s) => s.name)];
-    return ["Subtitle Top", "Subtitle Bottom", "Subtitle Large"];
+    return ["Subtitle Top", "Subtitle Bottom", "Subtitle Large", "Subtitle Medium"];
   }, [audioTracks, settingsTab, subtitleTracks]);
 
   useEffect(() => {
@@ -1258,14 +2146,29 @@ export default function CinemaPlayer() {
       />
 
       {subtitleText && selectedSubtitle >= 0 && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-8 z-30 flex justify-center px-6">
-          <div className="max-w-[92vw] whitespace-pre-wrap rounded-xl bg-black/55 px-5 py-3 text-center text-xl font-semibold leading-snug text-white shadow-[0_6px_20px_rgba(0,0,0,0.6)] [text-shadow:0_2px_10px_rgba(0,0,0,0.95)] md:text-2xl">
+        <div className={cn(
+          "pointer-events-none absolute inset-x-0 z-30 flex justify-center px-6 transition-all duration-300",
+          settings.subtitlePosition === "top" 
+            ? "top-[calc(6rem+env(safe-area-inset-top,0px))]" 
+            : "bottom-[calc(7.5rem+env(safe-area-inset-bottom,0px))]"
+        )}>
+          <div className={cn(
+            "nova-subtitle-overlay rounded-xl px-5 py-3",
+            settings.subtitleSize === "large" ? "text-3xl md:text-4xl" : "text-xl md:text-2xl"
+          )}>
             {subtitleText}
           </div>
         </div>
       )}
 
-      {isLoading && !error && <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/35"><Loader2 className="h-12 w-12 animate-spin text-white" /></div>}
+      {(isLoading || subtitleLoading) && !error && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/35">
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 className="h-12 w-12 animate-spin text-white" />
+            {subtitleLoading && <div className="text-sm font-medium text-white/85">Fetching subtitles...</div>}
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/80 p-8">
@@ -1296,9 +2199,28 @@ export default function CinemaPlayer() {
 
         <div className="px-4 pb-4">
           <div className="mb-3 flex items-center gap-3 text-sm text-white/85">
-            <span className="w-14 text-right font-mono">{formatTime(currentTime)}</span>
-            <input type="range" min={0} max={effectiveDuration > 0 ? effectiveDuration : 0} step={0.25} value={currentTime} onChange={(e) => handleSeekChange(parseFloat(e.target.value))} disabled={effectiveDuration <= 0} className="h-1.5 flex-1 cursor-pointer accent-primary disabled:cursor-not-allowed disabled:opacity-50" title="Seek" />
-            <span className="w-14 font-mono">{formatTime(effectiveDuration)}</span>
+            <span className="w-14 text-right font-mono">{formatTime(displayedSeekTime)}</span>
+            <input
+              type="range"
+              min={0}
+              max={effectiveDuration > 0 ? effectiveDuration : Math.max(displayedSeekTime + 300, 300)}
+              step={0.25}
+              value={displayedSeekTime}
+              onMouseDown={handleSeekScrubStart}
+              onTouchStart={handleSeekScrubStart}
+              onChange={(e) => handleSeekScrubMove(parseFloat(e.target.value))}
+              onMouseUp={handleSeekScrubCommit}
+              onTouchEnd={handleSeekScrubCommit}
+              onKeyUp={(e) => {
+                if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") {
+                  handleSeekScrubCommit();
+                }
+              }}
+              onBlur={handleSeekScrubCommit}
+              className="h-1.5 flex-1 cursor-pointer accent-primary"
+              title="Seek"
+            />
+             <span className="w-14 font-mono">{effectiveDuration > 0 ? formatTime(effectiveDuration) : "--:--"}</span>
           </div>
 
           <div className="flex items-center justify-between">
@@ -1352,10 +2274,26 @@ export default function CinemaPlayer() {
             {settingsTab === "subtitle" && (
               <div className="space-y-3">
                 <p className="text-xs text-white/60">Dynamic subtitle engine for Teletext, ASS/SSA, VTT, SRT, DVB when the IPTV stream exposes text-convertible subtitles.</p>
+                {subtitleLanguages.length > 0 && (
+                  <div className="rounded-md border border-white/10 bg-white/5 p-2">
+                    <p className="mb-2 text-xs text-white/60">Quick language pick</p>
+                    <div className="flex flex-wrap gap-2">
+                      {subtitleLanguages.map((lang) => (
+                        <button
+                          key={lang.code}
+                          onClick={() => switchSubtitleLanguage(lang.code)}
+                          className="rounded-md bg-white/10 px-2 py-1 text-xs text-white/85 hover:bg-white/20"
+                        >
+                          {lang.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="max-h-[45vh] overflow-y-auto rounded-md border border-white/10 p-2">
-                  <button onClick={() => switchSubtitleTrack(-1)} className={cn("mb-1 w-full rounded-md px-3 py-2 text-left text-sm", selectedSubtitle === -1 ? "bg-primary text-white" : focusIndex === 0 ? "bg-white/20 text-white" : "bg-white/5 text-white/80 hover:bg-white/15")}>Off</button>
+                  <button onClick={() => handleSubtitleChange(-1)} className={cn("mb-1 w-full rounded-md px-3 py-2 text-left text-sm", selectedSubtitle === -1 ? "bg-primary text-white" : focusIndex === 0 ? "bg-white/20 text-white" : "bg-white/5 text-white/80 hover:bg-white/15")}>Off</button>
                   {subtitleTracks.map((s, i) => (
-                    <button key={s.id} onClick={() => switchSubtitleTrack(s.id)} className={cn("mb-1 w-full rounded-md px-3 py-2 text-left text-sm", selectedSubtitle === s.id ? "bg-primary text-white" : i + 1 === focusIndex ? "bg-white/20 text-white" : "bg-white/5 text-white/80 hover:bg-white/15")}>{s.name}</button>
+                    <button key={s.id} onClick={() => handleSubtitleChange(s.id)} className={cn("mb-1 w-full rounded-md px-3 py-2 text-left text-sm", selectedSubtitle === s.id ? "bg-primary text-white" : i + 1 === focusIndex ? "bg-white/20 text-white" : "bg-white/5 text-white/80 hover:bg-white/15")}>{s.name}</button>
                   ))}
                 </div>
                 <div>
@@ -1366,14 +2304,38 @@ export default function CinemaPlayer() {
             )}
 
             {settingsTab === "display" && (
-              <div className="space-y-3 text-sm text-white/80">
-                <div className="rounded-md border border-white/10 bg-white/5 p-3">
-                  <p className="font-semibold">Custom Subtitle Engine</p>
-                  <p className="mt-1 text-xs text-white/60">Pointer-based subtitle renderer overlays text over the stream for TV-grade performance.</p>
+              <div className="space-y-2">
+                <p className="text-xs text-white/60">Configure your viewing experience. Subtitle positioning and size can be adjusted here for better visibility.</p>
+                <div className="max-h-[45vh] overflow-y-auto rounded-md border border-white/10 p-2">
+                  {settingsEntries.map((entry, i) => {
+                    const isActive = 
+                      (entry === "Subtitle Top" && settings.subtitlePosition === "top") ||
+                      (entry === "Subtitle Bottom" && settings.subtitlePosition === "bottom") ||
+                      (entry === "Subtitle Large" && settings.subtitleSize === "large") ||
+                      (entry === "Subtitle Medium" && settings.subtitleSize === "medium");
+                      
+                    return (
+                      <button 
+                        key={entry} 
+                        onClick={() => {
+                          if (entry === "Subtitle Top") updateSettings({ subtitlePosition: "top" });
+                          else if (entry === "Subtitle Bottom") updateSettings({ subtitlePosition: "bottom" });
+                          else if (entry === "Subtitle Large") updateSettings({ subtitleSize: "large" });
+                          else if (entry === "Subtitle Medium") updateSettings({ subtitleSize: "medium" });
+                        }}
+                        className={cn(
+                          "mb-1 w-full rounded-md px-3 py-2 text-left text-sm",
+                          isActive ? "bg-primary text-white" : i === focusIndex ? "bg-white/20 text-white" : "bg-white/5 text-white/80 hover:bg-white/15"
+                        )}
+                      >
+                        {isActive ? "✓ " : ""}{entry}
+                      </button>
+                    );
+                  })}
                 </div>
                 <div className="rounded-md border border-white/10 bg-white/5 p-3">
-                  <p className="font-semibold">TV Remote Shortcuts</p>
-                  <p className="mt-1 text-xs text-white/60">Enter: Play/Pause, Left/Right: Seek, Up/Down: Volume, Green: Settings, Back: Exit.</p>
+                  <p className="text-xs text-white/60 font-semibold">TV Remote Shortcuts</p>
+                  <p className="mt-1 text-[10px] text-white/40">Enter: Select, Up/Down: Navigate, Green: Settings.</p>
                 </div>
               </div>
             )}

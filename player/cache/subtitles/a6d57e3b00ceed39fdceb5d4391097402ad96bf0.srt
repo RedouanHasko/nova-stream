@@ -1,0 +1,8 @@
+1
+00:00:01,560 --> 00:00:03,440
+Équipage : il reste dix minutes
+
+2
+00:00:03,520 --> 00:00:07,600
+avant la descente vers l'Aéroport
+John F. Kennedy. Préparez la cabine.
