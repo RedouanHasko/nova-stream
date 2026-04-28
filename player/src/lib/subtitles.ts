@@ -39,8 +39,15 @@ function parseTimestamp(raw: string): number {
 function normalizeCueText(lines: string[]): string {
   return lines
     .join("\n")
+    // VTT voice spans & inline timestamps
     .replace(/<\/?c(?:\.[^>]+)?>/g, "")
     .replace(/<\d{2}:\d{2}:\d{2}[.,]\d{3}>/g, "")
+    // SRT / HTML formatting tags (<i>, <b>, <u>, <font ...>, etc.)
+    .replace(/<[^>]+>/g, "")
+    // ASS/SSA override blocks
+    .replace(/\{[^}]*\}/g, "")
+    // ASS hard line-break
+    .replace(/\\N/gi, "\n")
     .trim();
 }
 

@@ -1,4 +1,5 @@
 import fs from "fs";
+import crypto from "crypto";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import axios from "axios";
@@ -10,6 +11,7 @@ import zlib from "zlib";
 import dns from "dns";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { pipeline } from "stream/promises";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,6 +22,11 @@ dns.setDefaultResultOrder("ipv4first");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SUBTITLE_CACHE_DIR = path.join(__dirname, "cache", "subtitles");
+
+try {
+  fs.mkdirSync(SUBTITLE_CACHE_DIR, { recursive: true });
+} catch {}
 
 const httpsAgent = new https.Agent({
   rejectUnauthorized: false,
@@ -123,9 +130,13 @@ function srtToVttText(srt: string): string {
   const cleaned = (srt || "").replace(/^\uFEFF/, "").replace(/\r/g, "").trim();
   if (!cleaned) return "WEBVTT\n\n";
   if (cleaned.startsWith("WEBVTT")) return cleaned;
+  // Accept 1-2 digit hours as well as fully-padded 2-digit HH:MM:SS timestamps.
   const body = cleaned.replace(
-    /(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})/g,
-    "$1.$2 --> $3.$4",
+    /(\d{1,2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2}),(\d{3})/g,
+    (_, s1, s2, e1, e2) => {
+      const pad = (t: string) => t.length === 7 ? `0${t}` : t; // ensure HH:MM:SS
+      return `${pad(s1)}.${s2} --> ${pad(e1)}.${e2}`;
+    },
   );
   return `WEBVTT\n\n${body}\n`;
 }
@@ -134,10 +145,26 @@ function vttToSrtText(vtt: string): string {
   const cleaned = (vtt || "").replace(/^\uFEFF/, "").replace(/\r/g, "").trim();
   if (!cleaned) return "";
   const withoutHeader = cleaned.replace(/^WEBVTT[^\n]*\n+/i, "");
+  // Accept 1-2 digit hours.
   return withoutHeader.replace(
-    /(\d{2}:\d{2}:\d{2})\.(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2})\.(\d{3})/g,
-    "$1,$2 --> $3,$4",
+    /(\d{1,2}:\d{2}:\d{2})\.(\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2})\.(\d{3})/g,
+    (_, s1, s2, e1, e2) => {
+      const pad = (t: string) => t.length === 7 ? `0${t}` : t;
+      return `${pad(s1)},${s2} --> ${pad(e1)},${e2}`;
+    },
   );
+}
+
+function getSubtitleCachePaths(rawUrl: string, subIdx: number) {
+  const digest = crypto
+    .createHash("sha1")
+    .update(`${rawUrl}::${subIdx}`)
+    .digest("hex");
+  return {
+    digest,
+    vttPath: path.join(SUBTITLE_CACHE_DIR, `${digest}.vtt`),
+    srtPath: path.join(SUBTITLE_CACHE_DIR, `${digest}.srt`),
+  };
 }
 
 // Persist cache to disk so a dev-server restart doesn't cold-start every session
@@ -180,6 +207,55 @@ async function startServer() {
   const PORT = parseInt(process.env.PORT || "4000");
 
   app.use(express.json());
+  app.use("/cache/subtitles", express.static(SUBTITLE_CACHE_DIR));
+
+  const redactStreamUrl = (value: string) => {
+    try {
+      const parsed = new URL(value);
+      // Hide sensitive path tokens while preserving host + rough shape.
+      const maskedPath = parsed.pathname
+        .replace(/\/[A-Za-z0-9+/=]{16,}(?=\/|$)/g, "/<token>")
+        .replace(/\/(\d{5,})(?=\/|$)/g, "/<id>");
+      return `${parsed.protocol}//${parsed.host}${maskedPath}`;
+    } catch {
+      return value;
+    }
+  };
+
+  app.post("/api/playback-debug", (req, res) => {
+    try {
+      const body = req.body || {};
+      const event = typeof body.event === "string" ? body.event : "unknown";
+      const level =
+        body.level === "warn" || body.level === "error" ? body.level : "info";
+      const payload =
+        body.payload && typeof body.payload === "object"
+          ? { ...(body.payload as Record<string, unknown>) }
+          : {};
+
+      if (typeof payload.url === "string") {
+        payload.url = redactStreamUrl(payload.url);
+      }
+      if (typeof payload.streamUrl === "string") {
+        payload.streamUrl = redactStreamUrl(payload.streamUrl);
+      }
+
+      const serialized = JSON.stringify(payload);
+      const clipped = serialized.length > 2500
+        ? `${serialized.slice(0, 2500)}...<truncated>`
+        : serialized;
+
+      const tag =
+        level === "error" ? "[player-debug][error]" :
+        level === "warn" ? "[player-debug][warn]" :
+        "[player-debug][info]";
+
+      console.log(`${tag} ${event} ${clipped}`);
+      res.status(204).end();
+    } catch {
+      res.status(204).end();
+    }
+  });
 
   // Diagnostic endpoint to test reachability
   app.get("/api/test-reach", (req, res) => {
@@ -236,8 +312,12 @@ async function startServer() {
     let activeProxyRes: http.IncomingMessage | null = null;
     const retryTimers = new Set<ReturnType<typeof setTimeout>>();
 
-    const isLiveStreamRequest = /\/live\//i.test(targetUrl);
-    const dedupKey = !isApiCall && isLiveStreamRequest ? targetUrl : null;
+    // Only treat requests explicitly marked with owner=1 as the dedup 'owner'.
+    // This prevents background requests (like subtitle prefetch/extract) from
+    // cancelling the active playback connection when upstream providers limit
+    // to a single backend connection.
+    const isOwnerFlag = String(req.query.owner || "") === "1";
+    const dedupKey = !isApiCall && isOwnerFlag ? targetUrl : null;
     const dedupOwnerId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     const isDedupOwnerActive = () => {
@@ -334,12 +414,20 @@ async function startServer() {
     // Small UA fallback list (tried sequentially on empty upstream responses)
     const fallbackUAs = [
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.170 Safari/537.36",
+      "IPTVSmartersPlayer",
       "VLC/3.0.18 LibVLC/3.0.18",
       "Lavf/58.76.100",
       "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
     ];
     let uaFallbackAttempt = 0;
-    const disableUaFallbackRotationForLive = /\/live\//i.test(targetUrl);
+    const isLivePath = /\/live\//i.test(targetUrl);
+    const isVodOrSeriesRequest =
+      /\/(movie|series)\//i.test(targetUrl) ||
+      /\.(mkv|mp4|avi|mov|m4v|wmv|webm|flv)(\?|$)/i.test(targetUrl);
+    // Keep live-TV anti-hammering behavior, but allow VOD/series URLs that
+    // happen to redirect through /live/play token paths to rotate UA profiles.
+    const disableUaFallbackRotationForLive =
+      isLivePath && !isVodOrSeriesRequest;
 
     const makeRequest = (currentUrl: string) => {
       try {
@@ -376,6 +464,7 @@ async function startServer() {
         } else {
           if (req.headers["referer"])
             headers["Referer"] = req.headers["referer"] as string;
+          else headers["Referer"] = `${parsedUrl.protocol}//${parsedUrl.host}/`;
         }
         if (req.headers["accept-language"])
           headers["Accept-Language"] = req.headers["accept-language"] as string;
@@ -392,8 +481,9 @@ async function startServer() {
           // Keep Accept-Encoding as identity for manifests
           headers["Accept-Encoding"] = "identity";
         }
-        if (req.headers["range"]) {
-          headers["Range"] = req.headers["range"];
+        const incomingRange = req.get("range");
+        if (incomingRange) {
+          headers["Range"] = incomingRange;
         }
         if (accumulatedCookies.length > 0) {
           headers["Cookie"] = accumulatedCookies.join("; ");
@@ -711,6 +801,19 @@ async function startServer() {
                 res.setHeader(h, proxyRes.headers[h] as string);
               }
             });
+
+            // Ensure byte-range semantics are explicit for media requests.
+            if (incomingRange) {
+              if (proxyRes.headers["content-range"]) {
+                res.setHeader(
+                  "content-range",
+                  proxyRes.headers["content-range"] as string,
+                );
+              }
+              if (!proxyRes.headers["accept-ranges"]) {
+                res.setHeader("accept-ranges", "bytes");
+              }
+            }
 
             const isImageRequest = /\.(png|jpe?g|gif|webp|svg)(\?|$)/i.test(
               currentUrl,
@@ -1123,7 +1226,26 @@ async function startServer() {
     const rawUrl = req.query.url as string;
     res.setHeader("Access-Control-Allow-Origin", "*");
     if (!rawUrl) return res.status(400).json({ error: "No URL", streams: [], available: false });
-    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}`;
+    
+    const cacheKey = rawUrl.split("?")[0];
+    if (trackCache.has(cacheKey)) {
+      console.log(`[tracks] memory cache hit for ${redactStreamUrl(rawUrl)}`);
+      return res.json(trackCache.get(cacheKey));
+    }
+
+    const { digest } = getSubtitleCachePaths(rawUrl, 0);
+    const diskCachePath = path.join(SUBTITLE_CACHE_DIR, `tracks-${digest}.json`);
+    if (fs.existsSync(diskCachePath)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(diskCachePath, "utf8"));
+        trackCache.set(cacheKey, data);
+        console.log(`[tracks] disk cache hit for ${redactStreamUrl(rawUrl)}`);
+        return res.json(data);
+      } catch {}
+    }
+
+    const ownerFlag = String(req.query.owner || "") === "1" ? "1" : "0";
+    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}&owner=${ownerFlag}`;
     try {
       const { stdout } = await execFileAsync(
         "ffprobe",
@@ -1131,7 +1253,12 @@ async function startServer() {
         { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
       );
       const data = JSON.parse(stdout);
-      res.json({ streams: data.streams || [], available: true });
+      const response = { streams: data.streams || [], available: true };
+      trackCache.set(cacheKey, response);
+      try {
+        fs.writeFileSync(diskCachePath, JSON.stringify(response), "utf8");
+      } catch {}
+      res.json(response);
     } catch (e: any) {
       const isEnoent = e.code === "ENOENT" || String(e).includes("ENOENT");
       res.status(isEnoent ? 503 : 500).json({
@@ -1153,7 +1280,8 @@ async function startServer() {
     res.setHeader("Access-Control-Allow-Origin", "*");
     if (!rawUrl) return res.status(400).send("No URL");
 
-    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}`;
+    const ownerFlag = String(req.query.owner || "") === "1" ? "1" : "0";
+    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}&owner=${ownerFlag}`;
     const args: string[] = [
       "-hide_banner",
       "-loglevel",
@@ -1166,10 +1294,15 @@ async function startServer() {
       "-map",
       "0:v:0?",
       "-map",
-      `0:a:${audioIdx}?`,
-      "-c",
+      `0:${audioIdx}?`,
+      "-c:v",
       "copy",
-      "-copyts",
+      "-c:a",
+      "aac",
+      "-ac",
+      "2",
+      "-b:a",
+      "192k",
       "-muxpreload",
       "0",
       "-muxdelay",
@@ -1254,11 +1387,13 @@ async function startServer() {
         );
 
         const data = JSON.parse(stdout || "{}");
-        const subtitleStreams = Array.isArray(data?.streams)
-          ? data.streams.filter((s: any) => s?.codec_type === "subtitle")
-          : [];
-
-        const pickedSubtitle = subtitleStreams[subtitleIdx];
+        const pickedSubtitle = Array.isArray(data?.streams)
+          ? data.streams.find(
+              (s: any) =>
+                s?.codec_type === "subtitle" &&
+                Number(s?.index) === subtitleIdx,
+            )
+          : null;
         const subtitleCodec = String(pickedSubtitle?.codec_name || "").toLowerCase();
 
         // Only allow subtitle codecs that are known to remux safely to mov_text.
@@ -1325,8 +1460,8 @@ async function startServer() {
       "-map",
       `0:v:${videoIdx}?`,
       "-map",
-      `0:a:${audioIdx}?`,
-      ...(remuxSubtitleIdx >= 0 ? ["-map", `0:s:${remuxSubtitleIdx}?`] : []),
+      `0:${audioIdx}?`,
+      ...(remuxSubtitleIdx >= 0 ? ["-map", `0:${remuxSubtitleIdx}?`] : []),
       ...videoArgs,
       ...(audioFilter ? ["-af", audioFilter] : []),
       "-c:a",
@@ -1376,10 +1511,36 @@ async function startServer() {
     string,
     { text: string; contentType: string; ts: number }
   >();
-  const subtitleInflight = new Map<string, Promise<string>>();
-  const SUBTITLE_CACHE_TTL = 30 * 60 * 1000; // 30 min
+  const trackCache = new Map<string, any>();
+  const subtitleInflight = new Map<
+    string,
+    Promise<{ normalizedVtt: string; normalizedSrt: string }>
+  >();
+  const SUBTITLE_CACHE_TTL = 30 * 60 * 1000; // 30 min in-memory response cache
+
+  // Global semaphore: only 1 FFmpeg subtitle extraction runs at a time.
+  // Multiple parallel processes compete for bandwidth and cause video stuttering.
+  let ffmpegActiveCount = 0;
+  const MAX_FFMPEG_CONCURRENT = 1;
+  const ffmpegWaitQueue: Array<() => void> = [];
+  const acquireFFmpegSlot = (): Promise<void> => {
+    if (ffmpegActiveCount < MAX_FFMPEG_CONCURRENT) {
+      ffmpegActiveCount++;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => ffmpegWaitQueue.push(resolve));
+  };
+  const releaseFFmpegSlot = () => {
+    const next = ffmpegWaitQueue.shift();
+    if (next) {
+      next();
+    } else {
+      ffmpegActiveCount--;
+    }
+  };
   app.get("/api/subtitle", async (req, res) => {
     const rawUrl = req.query.url as string;
+    const contentTitle = req.query.title as string || "Unknown Content";
     const subIdx = Math.max(0, parseInt((req.query.index as string) || "0"));
     const seekSec = parseFloat((req.query.seek as string) || "0") || 0;
     const delayMs = Math.max(
@@ -1390,80 +1551,633 @@ async function startServer() {
       String(req.query.format || "vtt").toLowerCase() === "srt"
         ? "srt"
         : "vtt";
+    const responseMode =
+      String(req.query.mode || "").toLowerCase() === "extract"
+        ? "extract"
+        : "content";
+    const isPrefetchOnly =
+      req.query.prefetch === "1" || req.query.background === "1";
+    
+    if (isPrefetchOnly) {
+      console.log(
+        `[subtitle] PREFETCH request: track ${subIdx} for "${contentTitle}" (${redactStreamUrl(rawUrl)})`,
+      );
+    }
+    
     res.setHeader("Access-Control-Allow-Origin", "*");
     if (!rawUrl) return res.status(400).send("No URL");
-    const cacheKey = `${rawUrl}::${subIdx}::${seekSec.toFixed(3)}::${delayMs}::${format}`;
-    const cached = subtitleCache.get(cacheKey);
+    const extractionKey = `${rawUrl}::${subIdx}`;
+    const responseCacheKey = `${extractionKey}::${format}::${delayMs}`;
+    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}`;
+
+    const parseClockToSeconds = (value: string): number => {
+      const normalized = String(value || "").trim().replace(",", ".");
+      if (!normalized) return 0;
+      const parts = normalized.split(":");
+      if (parts.length === 3) {
+        const [h, m, sec] = parts;
+        const s = parseFloat(sec);
+        if (!Number.isFinite(s)) return 0;
+        return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + s;
+      }
+      if (parts.length === 2) {
+        const [m, sec] = parts;
+        const s = parseFloat(sec);
+        if (!Number.isFinite(s)) return 0;
+        return parseInt(m, 10) * 60 + s;
+      }
+      return 0;
+    };
+
+    const getSubtitleCoverageSeconds = (text: string): number => {
+      const source = String(text || "");
+      const tsRe = /((?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{2,3})\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}[\.,]\d{2,3})/g;
+      let maxEnd = 0;
+      let match: RegExpExecArray | null;
+      while ((match = tsRe.exec(source)) !== null) {
+        const end = parseClockToSeconds(match[2]);
+        if (end > maxEnd) maxEnd = end;
+      }
+      return maxEnd;
+    };
+
+    const parseDurationTagToSeconds = (raw: unknown): number => {
+      if (typeof raw !== "string") return 0;
+      const value = raw.trim();
+      if (!value) return 0;
+      const parts = value.split(":");
+      if (parts.length === 3) {
+        const [h, m, sec] = parts;
+        const s = parseFloat(sec);
+        if (!Number.isFinite(s)) return 0;
+        return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + s;
+      }
+      return 0;
+    };
+
+    const getEstimatedDurationSeconds = (): number => {
+      const key = rawUrl.split("?")[0];
+      const cachedTracks = trackCache.get(key);
+      const streams = Array.isArray(cachedTracks?.streams) ? cachedTracks.streams : [];
+      const videoStream = streams.find((s: any) => s?.codec_type === "video");
+      const audioStream = streams.find((s: any) => s?.codec_type === "audio");
+      const videoDuration = parseDurationTagToSeconds(videoStream?.tags?.DURATION);
+      if (videoDuration > 0) return videoDuration;
+      const audioDuration = parseDurationTagToSeconds(audioStream?.tags?.DURATION);
+      if (audioDuration > 0) return audioDuration;
+      return 0;
+    };
+
+    const isLikelyPartialSubtitleCache = (text: string): boolean => {
+      const coverage = getSubtitleCoverageSeconds(text);
+      const expected = getEstimatedDurationSeconds();
+      if (!(coverage > 0 && expected > 0)) return false;
+      return coverage < Math.max(120, expected * 0.8);
+    };
+
+    const clientSubtitleUa = String(
+      (req.query.ua as string) ||
+        (req.headers["user-agent"] as string) ||
+        "VLC/3.0.18 LibVLC/3.0.18",
+    )
+      .replace(/[\r\n]+/g, " ")
+      .trim();
+    const clientSubtitleReferer = String(
+      req.query.upstreamReferer || req.headers["referer"] || "",
+    )
+      .replace(/[\r\n]+/g, " ")
+      .trim();
+    const requestAbortController = new AbortController();
+    const abortExtraction = () => {
+      if (!requestAbortController.signal.aborted) {
+        requestAbortController.abort();
+      }
+    };
+    req.on("close", abortExtraction);
+
+    const { digest, vttPath, srtPath } = getSubtitleCachePaths(rawUrl, subIdx);
+    const vttUrl = `/cache/subtitles/${digest}.vtt`;
+    const srtUrl = `/cache/subtitles/${digest}.srt`;
+
+    // [New] Cache check mode: returns cached/extracting state without blocking.
+    if (req.query.check === "1") {
+      const fullExists = fs.existsSync(vttPath) || fs.existsSync(srtPath) || subtitleCache.has(responseCacheKey);
+      const partialVttPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.vtt`);
+      const partialSrtPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.srt`);
+      const partialDiskPath = format === "srt" ? partialSrtPath : partialVttPath;
+      const partialExists = !fullExists && fs.existsSync(partialDiskPath);
+      const exists = fullExists || partialExists;
+      const extracting = subtitleInflight.has(extractionKey);
+      return res.json({ ok: true, cached: exists, extracting: extracting || partialExists, partial: partialExists && !fullExists });
+    }
+
+    const cached = subtitleCache.get(responseCacheKey);
     if (cached && Date.now() - cached.ts < SUBTITLE_CACHE_TTL) {
+      if (responseMode === "extract") {
+        return res.json({ ok: true, status: "Done", cached: true, vttUrl, srtUrl });
+      }
+      console.log(`[subtitle] memory cache hit for "${contentTitle}"`);
       res.setHeader("Content-Type", cached.contentType);
       res.setHeader("Cache-Control", "public, max-age=1800");
       return res.send(cached.text);
     }
-    const proxyUrl = `http://127.0.0.1:${PORT}/api/proxy?url=${encodeURIComponent(rawUrl)}`;
-    try {
-      const codecCandidates =
-        format === "srt"
-          ? ["srt", "subrip", "webvtt"]
-          : ["webvtt", "srt"];
 
-      const runExtract = async (codec: string) => {
-        const { stdout } = await execFileAsync(
-          "ffmpeg",
-          [
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            ...(seekSec > 0 ? ["-ss", seekSec.toFixed(3)] : []),
-            "-i",
-            proxyUrl,
-            "-map",
-            `0:s:${subIdx}`,
-            "-c:s",
-            codec,
-            "-f",
-            codec,
-            "pipe:1",
-          ],
-          { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 },
+    const SUBTITLE_HEADER_READ_LIMIT_BYTES = 30 * 1024 * 1024;
+
+    const downloadSubtitleHeaderToTemp = async (
+      signal?: AbortSignal,
+    ): Promise<string> => {
+      const tmpDir = path.join(SUBTITLE_CACHE_DIR, "tmp");
+      try {
+        fs.mkdirSync(tmpDir, { recursive: true });
+      } catch {}
+
+      const tempFilePath = path.join(
+        tmpDir,
+        `temp_header_${digest}_${process.pid}_${Date.now()}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}.mkv`,
+      );
+      const writer = fs.createWriteStream(tempFilePath);
+      try {
+        const response = await axios.get(proxyUrl, {
+          responseType: "stream",
+          timeout: 30_000,
+          maxRedirects: 5,
+          signal,
+          httpAgent,
+          httpsAgent,
+          decompress: false,
+          validateStatus: (status) => status >= 200 && status < 400,
+          headers: {
+            "User-Agent": clientSubtitleUa,
+            Accept: "*/*",
+            Connection: "keep-alive",
+            "Accept-Encoding": "identity",
+            ...(clientSubtitleReferer ? { Referer: clientSubtitleReferer } : {}),
+            Range: `bytes=0-${SUBTITLE_HEADER_READ_LIMIT_BYTES - 1}`,
+          },
+        });
+
+        await pipeline(response.data, writer);
+
+        const stat = fs.statSync(tempFilePath);
+        if (!stat.size) {
+          throw new Error("Empty MKV header download");
+        }
+        return tempFilePath;
+      } catch (error) {
+        try {
+          writer.destroy();
+        } catch {}
+        try {
+          fs.unlinkSync(tempFilePath);
+        } catch {}
+        throw error;
+      }
+    };
+    try {
+      const usePersistentFile = true;
+      if (usePersistentFile) {
+        const diskPath = format === "srt" ? srtPath : vttPath;
+        if (fs.existsSync(diskPath)) {
+          const baseText = fs.readFileSync(diskPath, "utf8");
+          if (!isLikelyPartialSubtitleCache(baseText)) {
+            console.log(`[subtitle] disk cache hit for "${contentTitle}"`);
+            if (responseMode === "extract") {
+              return res.json({ ok: true, status: "Done", cached: true, vttUrl, srtUrl });
+            }
+            const shiftedFromDisk =
+              format === "srt"
+                ? shiftSrt(baseText, delayMs)
+                : shiftWebVtt(baseText, delayMs);
+            const diskContentType =
+              format === "srt"
+                ? "application/x-subrip; charset=utf-8"
+                : "text/vtt; charset=utf-8";
+            subtitleCache.set(responseCacheKey, {
+              text: shiftedFromDisk,
+              contentType: diskContentType,
+              ts: Date.now(),
+            });
+            res.setHeader("Content-Type", diskContentType);
+            res.setHeader("Cache-Control", "public, max-age=1800");
+            return res.send(shiftedFromDisk);
+          }
+          console.warn(`[subtitle] stale partial disk cache ignored for "${contentTitle}"`);
+        }
+
+        const otherPath = format === "srt" ? vttPath : srtPath;
+        if (fs.existsSync(otherPath)) {
+          const otherText = fs.readFileSync(otherPath, "utf8");
+          const converted =
+            format === "srt"
+              ? vttToSrtText(otherText)
+              : otherText.startsWith("WEBVTT")
+                ? otherText
+                : srtToVttText(otherText);
+          if (!isLikelyPartialSubtitleCache(converted)) {
+            console.log(`[subtitle] alternate disk cache hit for "${contentTitle}"`);
+            if (responseMode === "extract") {
+              if (format === "vtt") {
+                try {
+                  fs.writeFileSync(vttPath, converted, "utf8");
+                } catch {}
+              }
+              return res.json({ ok: true, status: "Done", cached: true, vttUrl, srtUrl });
+            }
+            const shiftedFromOther =
+              format === "srt"
+                ? shiftSrt(converted, delayMs)
+                : shiftWebVtt(converted, delayMs);
+            const otherContentType =
+              format === "srt"
+                ? "application/x-subrip; charset=utf-8"
+                : "text/vtt; charset=utf-8";
+            subtitleCache.set(responseCacheKey, {
+              text: shiftedFromOther,
+              contentType: otherContentType,
+              ts: Date.now(),
+            });
+            res.setHeader("Content-Type", otherContentType);
+            res.setHeader("Cache-Control", "public, max-age=1800");
+            return res.send(shiftedFromOther);
+          }
+          console.warn(`[subtitle] stale partial alternate cache ignored for "${contentTitle}"`);
+        }
+
+        // Serve partial subtitle data saved during a previous background extraction
+        // attempt. This gives the client something to display immediately while a
+        // full-stream extraction is still running in the background.
+        const partialVttPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.vtt`);
+        const partialSrtPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.srt`);
+        const partialDiskPath = format === "srt" ? partialSrtPath : partialVttPath;
+        if (fs.existsSync(partialDiskPath)) {
+          const partialText = fs.readFileSync(partialDiskPath, "utf8");
+          if (partialText && (partialText.includes("-->") || partialText.includes("Dialogue:"))) {
+            console.log(`[subtitle] serving partial cache for "${contentTitle}" (full extraction may be running)`);
+            if (responseMode === "extract") {
+              return res.json({ ok: true, status: "Done", cached: true, partial: true, vttUrl, srtUrl });
+            }
+            const shiftedPartial = format === "srt" ? shiftSrt(partialText, delayMs) : shiftWebVtt(partialText, delayMs);
+            const partialContentType = format === "srt" ? "application/x-subrip; charset=utf-8" : "text/vtt; charset=utf-8";
+            res.setHeader("Content-Type", partialContentType);
+            res.setHeader("Cache-Control", "no-cache");
+            return res.send(shiftedPartial);
+          }
+        }
+      }
+
+      const getRelativeSubtitleIndex = async (
+        inputPath: string,
+        signal?: AbortSignal,
+      ): Promise<number> => {
+        try {
+          const { stdout } = await execFileAsync(
+            "ffprobe",
+            [
+              "-v",
+              "quiet",
+              "-probesize",
+              "100M",
+              "-analyzeduration",
+              "100M",
+              "-print_format",
+              "json",
+              "-show_streams",
+              "-i",
+              inputPath,
+            ],
+            { timeout: 60_000, maxBuffer: 2 * 1024 * 1024, signal },
+          );
+          const data = JSON.parse(stdout || "{}");
+          const subtitleStreams = Array.isArray(data?.streams)
+            ? data.streams.filter((s: any) => s?.codec_type === "subtitle")
+            : [];
+          const idx = subtitleStreams.findIndex(
+            (s: any) => Number(s?.index) === subIdx,
+          );
+          if (idx >= 0) return idx;
+        } catch (e: any) {
+          if (e?.name === "AbortError") throw e;
+        }
+        return -1;
+      };
+
+      const runExtract = async (
+        plan: {
+          name: string;
+          inputUrl: string;
+          mapExpr: string;
+          codec: "webvtt" | "srt" | "subrip";
+          format: "webvtt" | "srt";
+          httpSeek?: boolean;
+          seekSec?: number;
+        },
+        options?: { signal?: AbortSignal; lowBandwidth?: boolean },
+      ) => {
+        console.log(`[subtitle] extraction attempt: ${plan.name} for "${contentTitle}"`);
+        // Always use proxy-based input for subtitle extraction to avoid opening a second upstream connection.
+        const lowBandwidthMode = Boolean(options?.lowBandwidth);
+        const lowDur = Math.max(
+          3,
+          Math.min(30, parseInt(String(req.query.duration || "9"), 10) || 9),
         );
+        // If this plan requests an HTTP seek, put -ss before -i so ffmpeg attempts a fast seek
+        const preInputArgs: string[] = [];
+        if (lowBandwidthMode && typeof plan.seekSec === "number" && plan.seekSec > 0) {
+          preInputArgs.push("-ss", plan.seekSec.toFixed(3));
+        }
+        const ffmpegArgs = [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-probesize",
+          lowBandwidthMode ? "8M" : "100M",
+          "-analyzeduration",
+          lowBandwidthMode ? "8M" : "100M",
+          ...preInputArgs,
+          "-i",
+          plan.inputUrl,
+          ...(lowBandwidthMode ? ["-t", String(lowDur)] : []),
+          "-map",
+          plan.mapExpr,
+          "-vn",
+          "-an",
+          "-c:s",
+          plan.codec,
+          "-f",
+          plan.format,
+          "pipe:1",
+        ];
+        const timeoutMs = lowBandwidthMode ? Math.max(30_000, lowDur * 2000) : 600_000; // allow slightly longer for larger lowDur
+        await acquireFFmpegSlot();
+        let stdout = "";
+        let tempHeaderPath: string | null = null;
+        let cleanupTemp = false;
+        try {
+          // For low-bandwidth or httpSeek plans, prefer downloading a small MKV header
+          // and running ffmpeg against the temp file. This avoids long upstream
+          // HTTP connections and speeds up subtitle-only extraction.
+          if (lowBandwidthMode || plan.httpSeek) {
+            try {
+              tempHeaderPath = await downloadSubtitleHeaderToTemp(options?.signal);
+              cleanupTemp = true;
+            } catch (e) {
+              // If header download fails, fall back to using the original inputUrl
+              tempHeaderPath = null;
+              cleanupTemp = false;
+            }
+          }
+          const inputForFfmpeg = tempHeaderPath || plan.inputUrl;
+          // If we downloaded a temp header file, avoid putting -t (duration) or -ss
+          // before input since header file may only contain initial packets. Use
+          // the prepared ffmpegArgs but replace the input value.
+          const finalArgs = ffmpegArgs.map(a => a === plan.inputUrl ? inputForFfmpeg : a);
+          try {
+            const result = await execFileAsync("ffmpeg", finalArgs, {
+              timeout: timeoutMs,
+              maxBuffer: 64 * 1024 * 1024,
+              signal: options?.signal,
+            });
+            stdout = result.stdout;
+          } catch (err: any) {
+            const stderr = typeof err?.stderr === "string" ? err.stderr : String(err?.stderr || err?.message || err || "");
+            console.warn(`[subtitle] ffmpeg extraction failed (plan=${plan.name}) stderr (first 200 chars): ${String(stderr).slice(0,200)}`);
+            throw err;
+          }
+        } finally {
+          releaseFFmpegSlot();
+          if (cleanupTemp && tempHeaderPath) {
+            try {
+              fs.unlinkSync(tempHeaderPath);
+            } catch {}
+          }
+        }
         const normalized = (stdout || "").trim();
         const hasTimelineData =
           normalized.includes("-->") ||
           normalized.includes("Dialogue:") ||
           normalized.includes("[Script Info]");
         if (!normalized || !hasTimelineData) {
-          throw new Error("Subtitle track is empty or not text-based");
+          throw new Error(
+            `Subtitle track is empty or not text-based (output length: ${(stdout || "").length})`,
+          );
         }
         return stdout;
       };
 
-      const extraction =
-        subtitleInflight.get(cacheKey) ||
-        (async () => {
-          let lastErr: unknown;
-          for (const codec of codecCandidates) {
-            try {
-              return await runExtract(codec);
-            } catch (e) {
-              lastErr = e;
+        const runExtractionPipeline = async (options?: {
+          signal?: AbortSignal;
+          lowBandwidth?: boolean;
+        }) => {
+        // Compute relative subtitle index directly from trackCache (already populated by /api/tracks).
+        const relativeSubIdx = (() => {
+          const key = rawUrl.split("?")[0];
+          const cachedTracks = trackCache.get(key);
+          const streams = Array.isArray(cachedTracks?.streams) ? cachedTracks.streams : [];
+          const subtitleStreams = streams.filter((s: any) => s?.codec_type === "subtitle");
+          const idx = subtitleStreams.findIndex((s: any) => Number(s?.index) === subIdx);
+          return idx >= 0 ? idx : -1;
+        })();
+
+        // Prefer explicit stream mapping when available (relative subtitle index).
+        let mapExprs: string[] = [];
+        if (relativeSubIdx >= 0) {
+          mapExprs = [`0:s:${relativeSubIdx}`];
+        } else {
+          console.warn(`[subtitle] relative subtitle index not found for ${redactStreamUrl(rawUrl)}; falling back to raw index ${subIdx}`);
+          mapExprs = [`0:${subIdx}?`, `0:i:${subIdx}?`];
+        }
+
+        const extractionPlans: Array<{
+          name: string;
+          inputUrl: string;
+          mapExpr: string;
+          codec: "webvtt" | "srt" | "subrip";
+          format: "webvtt" | "srt";
+          httpSeek?: boolean;
+          seekSec?: number;
+        }> = [];
+
+        // Determine codec ordering based on hint from client (track metadata).
+        const codecHint = String((req.query.codec as string) || "").toLowerCase();
+        type CodecPlan = { codec: "webvtt" | "srt" | "subrip"; format: "webvtt" | "srt"; tag: string };
+        let codecPlans: CodecPlan[];
+        if (codecHint === "subrip") {
+          codecPlans = [{ codec: "subrip", format: "srt", tag: "subrip->srt" }];
+        } else if (codecHint === "webvtt" || codecHint === "mov_text") {
+          codecPlans = [{ codec: "webvtt", format: "webvtt", tag: "webvtt->vtt" }];
+        } else if (codecHint === "srt") {
+          codecPlans = [{ codec: "srt", format: "srt", tag: "srt->srt" }];
+        } else {
+          codecPlans = [
+            { codec: "subrip", format: "srt", tag: "subrip->srt" },
+            { codec: "webvtt", format: "webvtt", tag: "webvtt->vtt" },
+            { codec: "srt", format: "srt", tag: "srt->srt" },
+          ];
+        }
+
+        // PROXY-ONLY: always fetch via local proxy to avoid a second upstream connection.
+        const inputs: Array<{ label: string; url: string }> = [{ label: "proxy", url: proxyUrl }];
+
+        for (const input of inputs) {
+          for (const mapExpr of mapExprs) {
+            for (const cp of codecPlans) {
+              // Base (full) extraction plan
+              extractionPlans.push({
+                name: `${input.label}|${mapExpr}|${cp.tag}`,
+                inputUrl: input.url,
+                mapExpr,
+                codec: cp.codec,
+                format: cp.format,
+              });
+              // If client requested a seek (to speed up partial/quick extracts), add a seek-based plan
+              if (seekSec > 2) {
+                extractionPlans.push({
+                  name: `seek|${input.label}|${mapExpr}|${cp.tag}`,
+                  inputUrl: input.url,
+                  mapExpr,
+                  codec: cp.codec,
+                  format: cp.format,
+                  httpSeek: true,
+                  seekSec: Math.max(0, Math.floor(seekSec)),
+                });
+              }
             }
           }
-          throw lastErr || new Error("No subtitle codec extraction succeeded");
-        })()
-          .finally(() => {
-            subtitleInflight.delete(cacheKey);
-          });
+        }
 
-      subtitleInflight.set(cacheKey, extraction);
-      const stdout = await extraction;
+        console.log(`[subtitle] plans: ${extractionPlans.length} total, first=${extractionPlans[0]?.name}, seekSec=${seekSec}`);
+
+        let lastErr: unknown;
+        for (const plan of extractionPlans) {
+          try {
+            const isNetworkInput = /^https?:\/\//i.test(plan.inputUrl);
+            if (!isNetworkInput && !fs.existsSync(plan.inputUrl)) {
+              console.error(
+                `[subtitle] Temp file missing! ${plan.inputUrl} for ${redactStreamUrl(rawUrl)}`,
+              );
+              throw new Error("Temp file missing!");
+            }
+            // proxy-only plans in use; skip legacy direct/seek debug logs
+            const extracted = await runExtract(plan, options);
+            console.log(
+              `[subtitle] extraction strategy succeeded: ${plan.name} on "${contentTitle}" (${redactStreamUrl(rawUrl)})`,
+            );
+            const normalizedVtt = extracted.startsWith("WEBVTT")
+              ? extracted
+              : srtToVttText(extracted);
+
+            // Check if extraction is partial:
+            // Seek-based plan starts at seekSec, so it misses cues before that position.
+            const isSeekPlan = plan.name.startsWith("seek|");
+            const looksPartial = isSeekPlan && (plan.seekSec ?? 0) > 2;
+            if (looksPartial) {
+              console.warn(
+                `[subtitle] seek-partial extraction at ${plan.seekSec ?? 0}s for "${contentTitle}", saving partial & continuing with full extraction`,
+              );
+              // Save partial data to disk immediately so check=1 can return
+              // {cached: true, partial: true} and the client can show what we
+              // have while a better extraction runs in the background.
+              const partialVttPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.vtt`);
+              const partialSrtPath = path.join(SUBTITLE_CACHE_DIR, `${digest}.partial.srt`);
+              try {
+                const pVtt = extracted.startsWith("WEBVTT") ? extracted : srtToVttText(extracted);
+                const pSrt = vttToSrtText(pVtt);
+                fs.writeFileSync(partialVttPath, pVtt, "utf8");
+                fs.writeFileSync(partialSrtPath, pSrt, "utf8");
+              } catch {}
+              lastErr = new Error("Partial subtitle extraction from header-only source");
+              continue;
+            }
+
+            const normalizedSrt = vttToSrtText(normalizedVtt);
+            try {
+              fs.writeFileSync(vttPath, normalizedVtt, "utf8");
+              fs.writeFileSync(srtPath, normalizedSrt, "utf8");
+            } catch {}
+            return { normalizedVtt, normalizedSrt };
+          } catch (e: any) {
+            if (e?.name === "AbortError") throw e;
+              lastErr = e;
+              const stderrPart = typeof (e as any)?.stderr === "string" ? `; stderr=${String((e as any).stderr).slice(0,400)}` : "";
+              const errorMsg = String((e as any)?.message || e) + stderrPart;
+              const lower = errorMsg.toLowerCase();
+              const isTimeoutError = lower.includes("timeout") || lower.includes("ffmpeg") || lower.includes("econnreset");
+              console.warn(`[subtitle] extraction strategy failed: ${plan.name} on ${redactStreamUrl(rawUrl)}: ${errorMsg}${isTimeoutError ? " (TIMEOUT/FFMPEG ERROR)" : ""}`);
+              console.warn(`[subtitle] will retry next strategy if available. Plan details: input=${String(plan.inputUrl || "").substring(0, 200)}, httpSeek=${plan.httpSeek}`);
+          }
+        }
+        console.error(
+          `[subtitle] ALL extraction strategies failed after ${extractionPlans.length} attempts for stream ${subIdx} (${redactStreamUrl(rawUrl)})`,
+        );
+        throw lastErr || new Error("No subtitle codec extraction succeeded");
+        };
+
+      // Only allow one extraction at a time, abort all others
+      let extractionAbortController: AbortController | null = null;
+      const getOrStartExtraction = (options?: {
+        signal?: AbortSignal;
+        lowBandwidth?: boolean;
+      }) => {
+        // Abort any previous extraction for this stream
+        if (extractionAbortController) extractionAbortController.abort();
+        extractionAbortController = new AbortController();
+        const mergedSignal = options?.signal
+          ? new AbortController()
+          : extractionAbortController;
+        const created = runExtractionPipeline({ ...options, signal: extractionAbortController.signal }).finally(() => {
+          subtitleInflight.delete(extractionKey);
+        });
+        subtitleInflight.set(extractionKey, created);
+        return created;
+      };
+
+      if (isPrefetchOnly) {
+        if (fs.existsSync(vttPath) || fs.existsSync(srtPath)) {
+          return res.status(204).end();
+        }
+        // Skip prefetch if an active FFmpeg extraction is already running.
+        // We don't want background work competing with either the video player
+        // or a user-triggered subtitle request.
+        if (ffmpegActiveCount >= MAX_FFMPEG_CONCURRENT) {
+          return res.status(202).json({ queued: false, reason: "busy" });
+        }
+        // Also skip if ANY extraction for this stream URL is already inflight.
+        const hasInflightForStream = [...subtitleInflight.keys()].some(k => k.startsWith(rawUrl + "::"));
+        if (hasInflightForStream) {
+          return res.status(202).json({ queued: false, reason: "inflight" });
+        }
+        // Keep background extraction running even after this HTTP request closes.
+        void getOrStartExtraction({
+          lowBandwidth: true,
+        }).catch((e) => {
+          console.warn(
+            `[subtitle] prefetch failed for stream ${subIdx} on ${redactStreamUrl(rawUrl)}: ${String((e as any)?.message || e)}`,
+          );
+        });
+        return res.status(202).json({ queued: true });
+      }
+
+      let extractedPair;
+      try {
+        const requestLowBandwidth = String(req.query.lowBandwidth || "").toLowerCase() === "1" || String(req.query.lowBandwidth || "").toLowerCase() === "true";
+        extractedPair = await Promise.race([
+          getOrStartExtraction({ signal: requestAbortController.signal, lowBandwidth: requestLowBandwidth }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Subtitle extraction timed out after 300s")), 300_000)),
+        ]);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.status(504).json({ ok: false, error: String(err?.message || err) });
+        }
+        return;
+      }
+      if (responseMode === "extract") {
+        return res.json({ ok: true, status: "Done", cached: false, vttUrl, srtUrl });
+      }
       const normalized =
-        format === "srt"
-          ? stdout.startsWith("WEBVTT")
-            ? vttToSrtText(stdout)
-            : stdout
-          : stdout.startsWith("WEBVTT")
-            ? stdout
-            : srtToVttText(stdout);
+        format === "srt" ? extractedPair.normalizedSrt : extractedPair.normalizedVtt;
       const shifted =
         format === "srt"
           ? shiftSrt(normalized, delayMs)
@@ -1472,14 +2186,25 @@ async function startServer() {
         format === "srt"
           ? "application/x-subrip; charset=utf-8"
           : "text/vtt; charset=utf-8";
-      subtitleCache.set(cacheKey, { text: shifted, contentType, ts: Date.now() });
+      subtitleCache.set(responseCacheKey, { text: shifted, contentType, ts: Date.now() });
       res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "public, max-age=1800");
-      res.send(shifted);
+      return res.send(shifted);
     } catch (e: any) {
+      if (requestAbortController.signal.aborted || e?.name === "AbortError") {
+        if (!res.headersSent) {
+          return res.status(499).send("Client closed subtitle request");
+        }
+        return;
+      }
+      console.warn(
+        `[subtitle] extraction failed for stream ${subIdx} (${format}) on ${redactStreamUrl(rawUrl)}: ${String(e?.message || e)}`,
+      );
       res
         .status(500)
         .send("Subtitle extraction failed: " + String(e.message || e));
+    } finally {
+      req.off("close", abortExtraction);
     }
   });
 

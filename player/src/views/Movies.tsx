@@ -35,6 +35,7 @@ import { toast } from "sonner";
 import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService, MovieStream } from "../services/iptvService";
 import { getFlagForCategory } from "../lib/flags";
+import { reportPlaybackDebug } from "../lib/playbackDebug";
 
 export default function Movies() {
   const navigate = useNavigate();
@@ -327,6 +328,27 @@ export default function Movies() {
     // Use the movie's container extension or fallback to mp4
     const ext = movie.container_extension || "mp4";
     const url = `${baseUrl}/movie/${user}/${pass}/${id}.${ext}`;
+
+    reportPlaybackDebug("selection.movie", {
+      playlistId: activePlaylist.id,
+      playlistType: activePlaylist.type,
+      host: activePlaylist.host,
+      streamId: id,
+      extension: ext,
+      streamUrl: url,
+      categoryId: movie.category_id,
+      codecHint: movieInfo?.info?.video?.codec_name || null,
+      audioTracksHint: Array.isArray(movieInfo?.info?.audio)
+        ? movieInfo.info.audio.length
+        : movieInfo?.info?.audio
+          ? 1
+          : 0,
+      subtitleTracksHint: Array.isArray(movieInfo?.info?.sub)
+        ? movieInfo.info.sub.length
+        : movieInfo?.info?.sub
+          ? 1
+          : 0,
+    });
 
     navigate("/watch", {
       state: {

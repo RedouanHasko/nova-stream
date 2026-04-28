@@ -163,11 +163,21 @@ body {
 .nova-subtitle-overlay {
   color: var(--subtitle-color, #ffffff);
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.48));
+  max-width: min(92vw, 1100px);
+  text-align: center;
+  line-height: 1.35;
+  font-weight: 700;
+  white-space: pre-wrap;
   text-shadow:
     0 2px 4px rgba(0, 0, 0, 0.9),
     0 8px 24px rgba(0, 0, 0, 0.7);
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
   backdrop-filter: blur(6px);
+}
+
+[data-tv="true"] .nova-subtitle-overlay {
+  font-size: 1.75rem;
+  padding: 1rem 1.25rem;
 }
 
 .nova-player-chip {

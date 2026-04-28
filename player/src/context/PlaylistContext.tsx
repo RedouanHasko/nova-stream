@@ -104,6 +104,7 @@ interface Settings {
   streamFormat: "hls" | "ts" | "mp4";
   autoPlay: boolean;
   subtitleSize: "small" | "medium" | "large";
+  subtitlePosition: "top" | "bottom";
   subtitleColor: string;
   pipEnabled: boolean;
   accentColor: string;
@@ -225,6 +226,7 @@ const INITIAL_SETTINGS: Settings = {
   streamFormat: "hls",
   autoPlay: true,
   subtitleSize: "medium",
+  subtitlePosition: "bottom",
   subtitleColor: "#ffffff",
   pipEnabled: true,
   accentColor: "#8b0000",
@@ -411,6 +413,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     useState<ActivationStatus>(INITIAL_ACTIVATION_STATUS);
   const [isActivationLoading, setIsActivationLoading] = useState(true);
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activationRefreshInFlightRef = useRef(false);
+  const activationRetryAfterTsRef = useRef(0);
 
   const playlists = [...managedPlaylists, ...localPlaylists];
 
@@ -486,6 +490,16 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
 
   const refreshActivationStatus = useCallback(async (forceNetwork = false) => {
     if (!deviceIdentity) return;
+
+    if (activationRefreshInFlightRef.current) return;
+
+    const now = Date.now();
+    if (now < activationRetryAfterTsRef.current) {
+      setIsActivationLoading(false);
+      return;
+    }
+
+    activationRefreshInFlightRef.current = true;
 
     const cachedActivation = readActivationCache(deviceIdentity);
     const shouldBlockOnNetwork = !cachedActivation;
@@ -577,7 +591,27 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         }
       }
     } catch (error) {
-      console.error("backend activation refresh failed", error);
+      const message =
+        error instanceof Error ? error.message : String(error || "");
+      const backendUnavailable =
+        /failed to fetch|networkerror|not found|econnrefused|err_connection_refused|404/i.test(
+          message,
+        );
+
+      if (/too many requests|too many activation attempts|429/i.test(message)) {
+        activationRetryAfterTsRef.current = Date.now() + 2 * 60 * 1000;
+        console.warn(
+          "backend activation refresh throttled (429), cooling down for 120s",
+        );
+      } else if (backendUnavailable) {
+        activationRetryAfterTsRef.current = Date.now() + 2 * 60 * 1000;
+        console.warn(
+          "backend activation refresh unreachable, keeping offline grace for 120s",
+        );
+      } else {
+        console.error("backend activation refresh failed", error);
+      }
+
       if (cachedActivation) {
         setActivationStatus(
           normalizeActivationStatus(
@@ -589,8 +623,13 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         setActivationStatus((prev) => ({
           ...prev,
           ready: true,
-          activated: false,
-          reason: prev.reason === "loading" ? "unreachable" : prev.reason,
+          activated: prev.activated || hasSavedPlaylists,
+          reason:
+            prev.activated || hasSavedPlaylists
+              ? "offline_grace"
+              : prev.reason === "loading"
+                ? "unreachable"
+                : prev.reason,
           device:
             prev.device ||
             (deviceIdentity
@@ -606,6 +645,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       }
     } finally {
       setIsActivationLoading(false);
+      activationRefreshInFlightRef.current = false;
     }
   }, [deviceIdentity, localPlaylists]);
 
