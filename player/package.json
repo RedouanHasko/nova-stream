@@ -22,7 +22,7 @@
     "express": "^4.21.2",
     "hls.js": "^1.6.15",
     "http-proxy-middleware": "^3.0.5",
-    "lucide-react": "^0.546.0",
+    "lucide-react": "^1.14.0",
     "motion": "^12.23.24",
     "mpegts.js": "^1.8.0",
     "mux.js": "^6.3.0",
