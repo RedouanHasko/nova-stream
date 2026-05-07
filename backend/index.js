@@ -114,6 +114,7 @@ const corsOptions = {
   origin: function (origin, callback) {
     // allow non-browser clients (curl, server-to-server)
     if (!origin) return callback(null, true);
+    if (origin === "null") return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
     if (allowPrivateNetworkOrigins && isPrivateNetworkOrigin(origin)) {
       return callback(null, true);

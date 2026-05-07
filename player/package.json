@@ -6,13 +6,19 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
+    "verify:bundle": "node scripts/verify-bundle-parity.mjs",
+    "build:parity": "npm run build && npm run verify:bundle",
+    "package:webos": "npm run build:parity && ares-package dist -o .",
+    "deploy:webos": "npm run package:webos && ares-install -d TV17 com.novaplayer.app_0.2.5_all.ipk && ares-launch -d TV17 com.novaplayer.app",
+    "preview:parity": "npm run build:parity && vite preview",
+    "simulator:open": "ares-launch -s 24 -sp \"C:\\TV\\Simulator\\webOS_TV_24_Simulator_1.4.1\" \"C:\\Users\\red-h\\Downloads\\iptvpanel\\player\\dist\"",
+    "simulator:run": "npm run build && npm run simulator:open",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
-    "@tailwindcss/vite": "^4.1.14",
     "@types/react-window": "^1.8.8",
     "@types/video.js": "^7.3.58",
     "@vitejs/plugin-react": "^5.0.4",
@@ -42,7 +48,7 @@
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
-    "tailwindcss": "^4.1.14",
+    "tailwindcss": "^3.4.17",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

@@ -1,4 +1,3 @@
-import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 import { defineConfig, loadEnv } from "vite";
@@ -6,7 +5,21 @@ import { defineConfig, loadEnv } from "vite";
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
   return {
-    plugins: [react(), tailwindcss()],
+    base: './',
+    plugins: [
+      react(),
+      {
+        name: "tv-strip-crossorigin",
+        transformIndexHtml: {
+          order: "post",
+          handler(html) {
+            // Some webOS engines in packaged file:// mode fail stylesheet/script
+            // loads when crossorigin is present even for same-origin files.
+            return html.replace(/\s+crossorigin(?:=("|').*?\1)?/g, "");
+          },
+        },
+      },
+    ],
     define: {
       "process.env.GEMINI_API_KEY": JSON.stringify(env.GEMINI_API_KEY),
     },
@@ -20,6 +33,12 @@ export default defineConfig(({ mode }) => {
       target: "es2017",
       rollupOptions: {
         output: {
+          assetFileNames: (assetInfo) => {
+            if ((assetInfo.name || "").endsWith(".css")) {
+              return "assets/index.css";
+            }
+            return "assets/[name]-[hash][extname]";
+          },
           // Split heavy libraries into separate chunks for better caching
           manualChunks: {
             "vendor-player": ["hls.js", "mpegts.js"],

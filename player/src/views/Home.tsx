@@ -8,9 +8,12 @@ import {
   RefreshCw,
   FolderOpen,
   Radio,
+  X,
+  Link,
+  Upload,
+  ChevronRight,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import Tile from "../components/Tile";
 import Logo from "../components/Logo";
 import WeatherWidget from "../components/WeatherWidget";
 import DigitalClock from "../components/DigitalClock";
@@ -20,20 +23,134 @@ import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService } from "../services/iptvService";
 import { cn } from "../lib/utils";
 import { useT } from "../lib/i18n";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { focusNext } from "../lib/remote";
+
+type DeckCardProps = {
+  icon: any;
+  title: string;
+  metric?: string;
+  subMetric?: string;
+  description?: string;
+  badge?: string;
+  accent?: "gold" | "blue" | "violet" | "mint";
+  onClick?: () => void;
+};
+
+function DeckCard({
+  icon: Icon,
+  title,
+  metric,
+  subMetric,
+  description,
+  badge,
+  accent = "blue",
+  onClick,
+}: DeckCardProps) {
+  return (
+    <motion.button
+      data-tv-focusable
+      whileHover={{ scale: 1.02, y: -2 }}
+      whileTap={{ scale: 0.98 }}
+      onClick={onClick}
+      className={cn(
+        "tv-deck-card group relative h-[44vh] min-h-[500px] max-h-[600px] overflow-hidden rounded-[28px] border p-8 text-left transition-all duration-300",
+        accent === "gold" && "tv-deck-card--gold",
+        accent === "blue" && "tv-deck-card--blue",
+        accent === "violet" && "tv-deck-card--violet",
+        accent === "mint" && "tv-deck-card--mint",
+      )}
+    >
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-tr from-white/15 via-transparent to-transparent opacity-60" />
+      <div className="relative z-10 flex h-full flex-col">
+        <div className="mb-4 flex items-center justify-between">
+          <span className="rounded-full border border-white/16 bg-white/6 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-white/66">
+            {badge || "Watch"}
+          </span>
+        </div>
+
+        <div className="flex justify-center pt-2">
+          <div className="rounded-3xl border border-white/20 bg-white/5 p-5">
+            <Icon className="h-16 w-16 text-white/95" />
+          </div>
+        </div>
+
+        <div className="mt-auto flex min-w-0 flex-col items-start gap-2 pb-1">
+          <h3 className="text-[48px] font-semibold tracking-tight text-white leading-none">
+            {title}
+          </h3>
+          {description ? <p className="max-w-[92%] text-[13px] text-white/62">{description}</p> : null}
+          <div className="flex flex-col items-start gap-1">
+            {metric ? <span className="text-[42px] font-semibold text-white/95 leading-none">{metric}</span> : null}
+            {subMetric ? <span className="text-sm text-white/70">{subMetric}</span> : null}
+          </div>
+        </div>
+      </div>
+    </motion.button>
+  );
+}
+
+type OrbActionProps = {
+  icon: any;
+  label: string;
+  onClick?: () => void;
+};
+
+function OrbAction({ icon: Icon, label, onClick }: OrbActionProps) {
+  return (
+    <button
+      data-tv-focusable
+      onClick={onClick}
+      className="tv-orb-action flex h-16 w-16 items-center justify-center rounded-full border border-white/25 bg-black/35 backdrop-blur-md"
+      aria-label={label}
+      title={label}
+    >
+      <Icon className="h-6 w-6 text-white" />
+    </button>
+  );
+}
+
+type UtilityActionProps = {
+  icon: any;
+  label: string;
+  hint?: string;
+  onClick?: () => void;
+};
+
+function UtilityAction({ icon: Icon, label, hint, onClick }: UtilityActionProps) {
+  return (
+    <button
+      data-tv-focusable
+      onClick={onClick}
+      className="home-utility-action tv-utility-pill flex items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm text-white/90"
+      aria-label={label}
+      title={label}
+    >
+      <span className="home-utility-action__icon">
+        <Icon className="h-4 w-4" />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col leading-tight">
+        <span className="truncate text-sm font-semibold text-white/92">{label}</span>
+        {hint ? <span className="truncate text-[11px] text-white/48">{hint}</span> : null}
+      </span>
+      <ChevronRight className="h-4 w-4 shrink-0 text-white/40" />
+    </button>
+  );
+}
 
 export default function Home() {
   const navigate = useNavigate();
   const {
     activePlaylist,
     isConnected,
-    playlists,
     fetchLive,
     refreshAccountInfo,
     isLiveInitialLoading,
     isVodInitialLoading,
     isSeriesInitialLoading,
     sectionLoadProgress,
+    playlistData,
+    activationStatus,
   } = usePlaylist();
   const t = useT();
 
@@ -65,178 +182,299 @@ export default function Home() {
     ? IPTVService.formatExpiryDate(activePlaylist.accountInfo.user.exp_date)
     : t.unlimited;
 
-  // TV D-pad navigation for the home grid
-  // Grid layout (4 cols): row0=[Live, Movies, Series, Radio], row1=[Live(span), Settings, Account, ChangePlaylist], row2=[Reload, OpenUrl]
-  // We flatten to a linear index; the grid has 4 columns
-  const GRID_COLS = 4;
-  const tileRefs = useRef<(HTMLButtonElement | null)[]>([]);
-  const focusIndexRef = useRef(0);
+  const formatActivationExpiry = (value?: string | null) => {
+    if (!value) return t.unlimited;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return t.unlimited;
+    return parsed.toLocaleDateString();
+  };
+
+  const appActivationExpiry = activationStatus.activations.find(
+    (activation) => activation.status === "active" && activation.expiresAt,
+  )?.expiresAt || activationStatus.trial.expiresAt;
+
+  const appActivationExpiryLabel = formatActivationExpiry(appActivationExpiry);
+  const [showOpenStreamModal, setShowOpenStreamModal] = useState(false);
+  const [streamInput, setStreamInput] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // TV D-pad navigation for the home tiles (spatial, non-indexed).
+  const homeFocusRootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
-      const total = tileRefs.current.filter(Boolean).length;
-      if (!total) return;
-
-      let idx = focusIndexRef.current;
-      if (key === "right") idx = Math.min(idx + 1, total - 1);
-      else if (key === "left") idx = Math.max(idx - 1, 0);
-      else if (key === "down") idx = Math.min(idx + GRID_COLS, total - 1);
-      else if (key === "up") idx = Math.max(idx - GRID_COLS, 0);
-      else if (key === "enter") {
-        tileRefs.current[idx]?.click();
+      if (key === "back" && showOpenStreamModal) {
+        setShowOpenStreamModal(false);
         return;
-      } else return;
-
-      focusIndexRef.current = idx;
-      tileRefs.current[idx]?.focus();
+      }
+      if (key === "enter" || key === "select") {
+        (document.activeElement as HTMLElement | null)?.click();
+        return;
+      }
+      if (key === "left" || key === "right" || key === "up" || key === "down") {
+        focusNext(key, { root: homeFocusRootRef.current });
+      }
     };
     window.addEventListener("tv-remote-key", handler);
+    // Auto-focus the first tile so d-pad navigation is immediately responsive
+    requestAnimationFrame(() => {
+      const first = homeFocusRootRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+      first?.focus();
+    });
     return () => window.removeEventListener("tv-remote-key", handler);
-  }, []);
+  }, [showOpenStreamModal]);
+
+  const openExternalStream = (raw: string) => {
+    const url = raw.trim();
+    if (!url) {
+      toast.error(t.enterStreamUrl);
+      return;
+    }
+    const isHttp = /^https?:\/\//i.test(url);
+    const isBlob = /^blob:/i.test(url);
+    if (!isHttp && !isBlob) {
+      toast.error("Please enter a valid stream URL");
+      return;
+    }
+    navigate("/player", {
+      state: {
+        title: t.externalStream,
+        url,
+        isLive: /\.m3u8(\?|$)/i.test(url),
+      },
+    });
+    setShowOpenStreamModal(false);
+    setStreamInput("");
+  };
+
+  const handleStreamFilePick = async (file?: File | null) => {
+    if (!file) return;
+    const lowerName = file.name.toLowerCase();
+    try {
+      // For M3U/text files, extract the first HTTP/HTTPS URL.
+      if (lowerName.endsWith(".m3u") || lowerName.endsWith(".m3u8") || lowerName.endsWith(".txt")) {
+        const text = await file.text();
+        const match = text.match(/https?:\/\/[^\s"'<>]+/i);
+        if (!match) {
+          toast.error("No stream URL found in file");
+          return;
+        }
+        openExternalStream(match[0]);
+        return;
+      }
+
+      // For media files, play through a blob URL directly.
+      const blobUrl = URL.createObjectURL(file);
+      openExternalStream(blobUrl);
+    } catch {
+      toast.error("Failed to read file");
+    }
+  };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen p-8 gap-12 relative">
-      {/* Top Left Info */}
-      <div className="absolute top-8 left-8">
-        <WeatherWidget />
-      </div>
+    <div className="home-tv-shell min-h-screen p-6 md:p-8">
+      <div className="home-tv-bg-orb home-tv-bg-orb--a" />
+      <div className="home-tv-bg-orb home-tv-bg-orb--b" />
 
-      {/* Top Right Info */}
-      <div className="absolute top-8 right-8">
-        <DigitalClock />
-      </div>
-
-      {/* Header / Logo */}
-      <motion.div
-        initial={{ opacity: 0, y: -20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="flex flex-col items-center gap-2"
+      <div
+        ref={homeFocusRootRef}
+        className="relative z-10 mx-auto flex h-[calc(100vh-3rem)] w-full max-w-[1760px] flex-col"
       >
-        <Logo size="lg" />
-      </motion.div>
+        <motion.header
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="home-tv-topbar mb-6 flex items-start justify-between"
+        >
+          <div className="flex min-w-[300px] max-w-[460px] flex-col gap-1 px-1 py-1">
+            <div className="flex items-center gap-2">
+              <span
+                className={cn(
+                  "h-2.5 w-2.5 rounded-full",
+                  isConnected ? "bg-emerald-300 shadow-[0_0_18px_rgba(110,231,183,0.6)]" : "bg-white/35",
+                )}
+              />
+              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/46">
+                {t.active} Playlist
+              </span>
+            </div>
+            <span className="block truncate text-[18px] font-semibold text-white/92">
+              {activePlaylist?.name || t.noPlaylistConnected}
+            </span>
+          </div>
 
-      {/* Main Grid */}
-      <div className="grid grid-cols-4 gap-6 w-full max-w-6xl">
-        {/* Large Live Tile */}
-        <div className="col-span-1 row-span-2">
-          <Tile
-            ref={(el) => { tileRefs.current[0] = el; }}
-            icon={Tv}
-            label={t.live}
-            isLoading={isLiveInitialLoading}
-            loadProgress={sectionLoadProgress.live}
-            large
-            onClick={() => navigate("/live")}
-            className="h-full"
-          />
-        </div>
+          <div className="flex flex-1 items-center justify-center">
+            <Logo size="lg" />
+          </div>
 
-        {/* Medium Tiles */}
-        <Tile
-          ref={(el) => { tileRefs.current[1] = el; }}
-          icon={Film}
-          label={t.movies}
-          isLoading={isVodInitialLoading}
-          loadProgress={sectionLoadProgress.vod}
-          onClick={() => navigate("/movies")}
-        />
-        <Tile
-          ref={(el) => { tileRefs.current[2] = el; }}
-          icon={Clapperboard}
-          label={t.series}
-          isLoading={isSeriesInitialLoading}
-          loadProgress={sectionLoadProgress.series}
-          onClick={() => navigate("/series")}
-        />
-        <Tile ref={(el) => { tileRefs.current[3] = el; }} icon={Radio} label={t.radio} onClick={() => navigate("/radio")} />
+          <div className="flex items-center gap-3">
+            <OrbAction icon={RefreshCw} label={t.reload} onClick={handleReload} />
+            <OrbAction icon={Settings} label={t.settings} onClick={() => navigate("/settings")} />
+            <OrbAction icon={User} label={t.account} onClick={() => navigate("/account")} />
+          </div>
+        </motion.header>
 
-        {/* Small Action Tiles */}
-        <Tile
-          ref={(el) => { tileRefs.current[4] = el; }}
-          icon={Settings}
-          label={t.settings}
-          onClick={() => navigate("/settings")}
-          className="bg-white/5 hover:bg-white/10"
-        />
+        <main className="flex flex-1 flex-col gap-6">
+          <div className="flex flex-1 items-center">
+            <div className="home-deck-grid mx-auto grid w-full max-w-[1580px] grid-cols-4 gap-7">
+            <DeckCard
+              icon={Tv}
+              title={t.live}
+              metric={`+${playlistData.liveStreams?.length || 0}`}
+              subMetric={isLiveInitialLoading ? `Loading ${sectionLoadProgress.live}%` : "Channels"}
+              description="Live channels with fast zap and instant playback"
+              badge="Live"
+              accent="gold"
+              onClick={() => navigate("/live")}
+            />
+            <DeckCard
+              icon={Film}
+              title={t.movies}
+              metric={`+${playlistData.vodStreams?.length || 0}`}
+              subMetric={isVodInitialLoading ? `Loading ${sectionLoadProgress.vod}%` : "Movies"}
+              description="On-demand movies in one curated catalog"
+              badge="VOD"
+              accent="blue"
+              onClick={() => navigate("/movies")}
+            />
+            <DeckCard
+              icon={Clapperboard}
+              title={t.series}
+              metric={`+${playlistData.seriesStreams?.length || 0}`}
+              subMetric={isSeriesInitialLoading ? `Loading ${sectionLoadProgress.series}%` : "Series"}
+              description="Episode browsing with season-aware navigation"
+              badge="Series"
+              accent="violet"
+              onClick={() => navigate("/series")}
+            />
+            <DeckCard
+              icon={Radio}
+              title={t.radio}
+              metric="Live"
+              subMetric="Stations"
+              description="Background-friendly live radio stations"
+              badge="Radio"
+              accent="mint"
+              onClick={() => navigate("/radio")}
+            />
+            </div>
+          </div>
 
-        <Tile
-          ref={(el) => { tileRefs.current[5] = el; }}
-          icon={User}
-          label={t.account}
-          onClick={() => navigate("/account")}
-          className="bg-white/5 hover:bg-white/10"
-          subLabel={
-            expiryDate !== t.unlimited
-              ? `${t.expiry} ${expiryDate}`
-              : t.lifetime
-          }
-        />
-        <Tile
-          ref={(el) => { tileRefs.current[6] = el; }}
-          icon={ListRestart}
-          label={t.changePlaylist}
-          onClick={() =>
-            navigate("/settings", { state: { openModal: "playlists" } })
-          }
-          className="bg-white/5 hover:bg-white/10"
-        />
-        <Tile
-          ref={(el) => { tileRefs.current[7] = el; }}
-          icon={RefreshCw}
-          label={t.reload}
-          onClick={handleReload}
-          className="bg-white/5 hover:bg-white/10"
-        />
+          <div className="mt-auto grid grid-cols-1 items-end gap-6 md:grid-cols-[1fr_auto_1fr]">
+            <div className="flex w-full flex-col gap-3 md:justify-self-start">
+              <div className="flex flex-wrap items-center gap-3">
+                <UtilityAction
+                  icon={ListRestart}
+                  label={t.changePlaylist}
+                  hint="Switch or manage playlists"
+                  onClick={() => navigate("/settings", { state: { openModal: "playlists" } })}
+                />
+                <UtilityAction
+                  icon={FolderOpen}
+                  label={t.openUrlFile}
+                  hint="Open external stream URL or file"
+                  onClick={() => setShowOpenStreamModal(true)}
+                />
+              </div>
+            </div>
 
-        <Tile
-          ref={(el) => { tileRefs.current[8] = el; }}
-          icon={FolderOpen}
-          label={t.openUrlFile}
-          onClick={() => {
-            const url = window.prompt(t.enterStreamUrl);
-            if (url) {
-              navigate("/player", {
-                state: {
-                  title: t.externalStream,
-                  url: url,
-                  isLive: url.includes(".m3u8"),
-                },
-              });
-            }
-          }}
-          className="bg-white/5 hover:bg-white/10"
-        />
-      </div>
+            <div className="home-meta-ribbon flex items-center justify-center gap-3 px-4 py-3">
+              <div className="home-meta-ribbon__item">
+                <span className="home-meta-ribbon__label">IPTV {t.expires}</span>
+                <span className="home-meta-ribbon__value">{expiryDate}</span>
+              </div>
+              <div className="home-meta-ribbon__divider" />
+              <div className="home-meta-ribbon__item">
+                <span className="home-meta-ribbon__label">App {t.expires}</span>
+                <span className="home-meta-ribbon__value">{appActivationExpiryLabel}</span>
+              </div>
+              <div className="home-meta-ribbon__divider" />
+              <div className="home-meta-ribbon__item">
+                <span className="home-meta-ribbon__label">Version</span>
+                <span className="home-meta-ribbon__value">1.0.0</span>
+              </div>
+            </div>
 
-      {/* Footer Info */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 text-white/40 text-xs">
-        <span>Version : 1.7.2.0</span>
-      </div>
+            <div className="flex flex-col items-end gap-2 md:justify-self-end md:pr-2">
+              <div className="home-status-strip flex items-center gap-1 px-2.5 py-2">
+                <DigitalClock variant="compact" />
+                <div className="home-status-separator h-7 w-px bg-white/14" />
+                <WeatherWidget variant="compact" />
+              </div>
+            </div>
+          </div>
+        </main>
 
-      {/* Playlist Info Bottom Right */}
-      <div className="absolute bottom-8 right-8 flex flex-col items-end gap-1">
-        {isConnected ? (
-          <span className="text-primary font-bold text-sm">
-            {t.active} {activePlaylist?.name}
-          </span>
-        ) : (
-          <span className="text-white/40 italic text-xs">
-            {t.noPlaylistConnected}
-          </span>
+        {showOpenStreamModal && (
+          <div className="fixed inset-0 z-[140] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-[720px] rounded-3xl border border-white/15 bg-[#0c111b] p-6 shadow-2xl">
+              <div className="mb-5 flex items-center justify-between">
+                <div>
+                  <h3 className="text-2xl font-semibold text-white">{t.openUrlFile}</h3>
+                  <p className="mt-1 text-sm text-white/50">Paste a stream URL or choose a local file.</p>
+                </div>
+                <button
+                  data-tv-focusable
+                  onClick={() => setShowOpenStreamModal(false)}
+                  className="flex h-11 w-11 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/80"
+                  aria-label="Close"
+                  title="Close"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              <div className="mb-5 rounded-2xl border border-white/10 bg-black/25 p-4">
+                <label className="mb-2 block text-xs uppercase tracking-[0.14em] text-white/45">Stream URL</label>
+                <input
+                  data-tv-focusable
+                  autoFocus
+                  value={streamInput}
+                  onChange={(e) => setStreamInput(e.target.value)}
+                  placeholder="https://...m3u8"
+                  className="w-full rounded-xl border border-white/15 bg-white/5 px-4 py-3 text-sm text-white outline-none focus:border-sky-300/50"
+                />
+              </div>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden"
+                onChange={(e) => {
+                  void handleStreamFilePick(e.target.files?.[0] || null);
+                  e.currentTarget.value = "";
+                }}
+              />
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  data-tv-focusable
+                  onClick={() => openExternalStream(streamInput)}
+                  className="inline-flex items-center gap-2 rounded-full border border-sky-300/30 bg-sky-500/20 px-5 py-2.5 text-sm font-semibold text-sky-100"
+                >
+                  <Link className="h-4 w-4" />
+                  Open URL
+                </button>
+                <button
+                  data-tv-focusable
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/8 px-5 py-2.5 text-sm font-semibold text-white/90"
+                >
+                  <Upload className="h-4 w-4" />
+                  Choose File
+                </button>
+                <button
+                  data-tv-focusable
+                  onClick={() => setShowOpenStreamModal(false)}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-transparent px-5 py-2.5 text-sm font-semibold text-white/75"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
         )}
-        {isConnected && (
-          <span
-            className={cn(
-              "px-3 py-1 rounded-full text-[10px] font-bold",
-              expiryDate === t.unlimited
-                ? "bg-green-500/20 text-green-400"
-                : "bg-primary/20 text-primary",
-            )}
-          >
-            {t.expires} {expiryDate}
-          </span>
-        )}
+
       </div>
     </div>
   );

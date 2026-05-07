@@ -259,6 +259,8 @@ async function idbGetBatch(
 // Pre-open the IDB connection at module load so the first real read is instant.
 openIDB().catch(() => {});
 
+import { getMediaApiBaseUrl } from "../lib/activationApi";
+
 export class IPTVService {
   // ── In-memory L1 cache ──────────────────────────────────────────────
   private static memCache = new Map<string, { data: any; ts: number }>();
@@ -326,9 +328,70 @@ export class IPTVService {
   }
 
   // ── Low-level fetch (no cache) ─────────────────────────────────────
-  // Single retry-capable method that returns response body as text.
+  private static buildProxyUrl(url: string): string {
+    const mediaBase = getMediaApiBaseUrl() || "";
+    if (mediaBase) {
+      return `${mediaBase.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(url)}`;
+    }
+    // Last-resort relative path for non-packaged browser mode.
+    return `/api/proxy?url=${encodeURIComponent(url)}`;
+  }
+
+  private static async fetchTextDirect(url: string, retries = 1): Promise<string> {
+    // Build the list of URLs to try: original first, then HTTP downgrade if original is HTTPS.
+    const urlsToTry = [url];
+    if (url.startsWith("https://")) {
+      urlsToTry.push(url.replace(/^https:\/\//, "http://"));
+    }
+
+    let lastErr: unknown;
+    for (const tryUrl of urlsToTry) {
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30_000);
+        try {
+          const response = await fetch(tryUrl, { signal: controller.signal });
+          if (!response.ok) {
+            if (response.status >= 500 && attempt < retries) {
+              await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+              continue;
+            }
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return await response.text();
+        } catch (err: any) {
+          lastErr = err;
+          const isNetwork =
+            err?.name === "TypeError" ||
+            /fetch|network|timeout|abort/i.test(String(err?.message || ""));
+          if (attempt < retries && isNetwork) {
+            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            continue;
+          }
+          // Non-network error or out of retries — break inner loop, try next URL.
+          break;
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      }
+    }
+    throw lastErr || new Error("Direct fetch failed");
+  }
+
+  // Retry-capable fetch that prefers direct provider access and falls back to backend proxy.
   private static async fetchTextWithProxy(url: string, retries = 2): Promise<string> {
-    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+    const forceProxy = String((import.meta as any)?.env?.VITE_FORCE_PROXY || "").toLowerCase() === "true";
+    let directError: unknown = null;
+
+    if (!forceProxy) {
+      try {
+        return await this.fetchTextDirect(url, 1);
+      } catch (err) {
+        directError = err;
+      }
+    }
+
+    const proxyUrl = this.buildProxyUrl(url);
     for (let attempt = 0; attempt <= retries; attempt++) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60_000);
@@ -355,7 +418,13 @@ export class IPTVService {
         clearTimeout(timeoutId);
       }
     }
-    throw new Error("Max retries reached");
+    const directMsg =
+      directError instanceof Error
+        ? directError.message
+        : directError
+          ? String(directError)
+          : "direct fetch skipped";
+    throw new Error(`Max retries reached (direct: ${directMsg})`);
   }
 
   // JSON convenience wrapper around fetchTextWithProxy.
@@ -803,6 +872,64 @@ export class IPTVService {
       support.xmltv = false;
       return { epg_listings: [] };
     }
+  }
+
+  // Return cached catalog data (memory + IndexedDB) without forcing network.
+  // Used to paint Live/Movies/Series instantly on startup and then refresh in background.
+  static async getCachedBootstrap(
+    host: string,
+    user: string,
+    pass: string,
+  ): Promise<{
+    liveCategories: Category[];
+    liveStreams: LiveStream[];
+    vodCategories: Category[];
+    vodStreams: MovieStream[];
+    seriesCategories: Category[];
+    seriesStreams: SeriesStream[];
+  }> {
+    const urls = {
+      liveCategories: `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_categories`,
+      liveStreams: `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams`,
+      vodCategories: `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_categories`,
+      vodStreams: `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_streams`,
+      seriesCategories: `${host}/player_api.php?username=${user}&password=${pass}&action=get_series_categories`,
+      seriesStreams: `${host}/player_api.php?username=${user}&password=${pass}&action=get_series`,
+    };
+
+    const merged = new Map<string, { data: any; ts: number }>();
+
+    for (const key of Object.values(urls)) {
+      const mem = this.memCache.get(key);
+      if (mem) {
+        merged.set(key, mem);
+      }
+    }
+
+    const missing = Object.values(urls).filter((key) => !merged.has(key));
+    if (missing.length > 0) {
+      const idbEntries = await idbGetBatch(missing);
+      for (const [key, entry] of idbEntries) {
+        merged.set(key, entry);
+        if (!this.memCache.has(key)) {
+          this.memCache.set(key, entry);
+        }
+      }
+    }
+
+    const toList = (url: string) => {
+      const value = merged.get(url)?.data;
+      return this.normalizeListResponse(value);
+    };
+
+    return {
+      liveCategories: toList(urls.liveCategories) as Category[],
+      liveStreams: toList(urls.liveStreams) as LiveStream[],
+      vodCategories: toList(urls.vodCategories) as Category[],
+      vodStreams: toList(urls.vodStreams) as MovieStream[],
+      seriesCategories: toList(urls.seriesCategories) as Category[],
+      seriesStreams: toList(urls.seriesStreams) as SeriesStream[],
+    };
   }
 
   // ── Prefetch ALL data on app start ─────────────────────────────────

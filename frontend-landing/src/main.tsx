@@ -4,8 +4,10 @@ import App from "./App.tsx";
 import { I18nProvider } from "./contexts/I18nContext";
 import { enforceHttpsInProduction } from "./lib/security";
 import "./index.css";
+import { initTVRemote } from "./lib/remote";
 
 enforceHttpsInProduction();
+initTVRemote();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

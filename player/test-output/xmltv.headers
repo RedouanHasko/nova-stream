@@ -1,9 +1,0 @@
-HTTP/1.1 200 OK
-X-Powered-By: Express
-Content-Type: application/xml; charset=utf-8
-Access-Control-Allow-Origin: *
-Date: Thu, 16 Apr 2026 10:17:22 GMT
-Connection: keep-alive
-Keep-Alive: timeout=5
-Content-Length: 9
-

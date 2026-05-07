@@ -31,14 +31,15 @@ const Tile = forwardRef<HTMLButtonElement, TileProps>(function Tile({
   return (
     <motion.button
       ref={ref as any}
+      data-tv-focusable
       whileHover={{ scale: 1.05 }}
       whileTap={{ scale: 0.95 }}
       onClick={onClick}
       tabIndex={0}
       className={cn(
-        "relative overflow-hidden flex flex-col items-center justify-center gap-2 rounded-xl transition-all duration-200",
+        "tv-focus-zoom-only relative overflow-hidden flex flex-col items-center justify-center gap-2 rounded-xl transition-all duration-200",
         "border border-white/10 shadow-lg shadow-black/40 backdrop-blur-md",
-        large ? "aspect-square w-full" : "aspect-video w-full",
+        large ? "h-full w-full" : "h-full w-full",
         className,
       )}
       style={{ backgroundColor: "rgba(255,255,255,0.04)" }}

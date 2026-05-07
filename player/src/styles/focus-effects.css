@@ -1,0 +1,122 @@
+@layer components {
+  /* Enhanced Focus State - Modern Selection Effect */
+  
+  /* Primary focus effect with gradient glow */
+  @apply
+    focus:outline-none
+    focus:ring-0
+    focus:bg-gradient-to-br
+    focus:from-primary/20
+    focus:to-primary/5
+    focus:shadow-[0_0_20px_rgba(var(--primary-rgb),0.3),0_0_40px_rgba(var(--primary-rgb),0.1)]
+    focus:before:absolute
+    focus:before:-inset-1
+    focus:before:rounded-[inherit]
+    focus:before:bg-gradient-to-r
+    focus:before:from-primary/40
+    focus:before:to-primary/10
+    focus:before:opacity-0
+    focus:before:pointer-events-none
+    focus:before:transition-opacity
+    focus:before:duration-300
+    focus:hover:before:opacity-100;
+
+  /* Selection highlight with smooth transition */
+  @apply
+    transition-all
+    duration-200
+    ease-out;
+
+  /* TV Remote Focus - prominent visual feedback */
+  .tv-focus:focus-visible {
+    @apply
+      outline-none
+      ring-0
+      relative;
+
+    background: linear-gradient(135deg, rgb(var(--primary-rgb), 0.25) 0%, rgb(var(--primary-rgb), 0.08) 100%);
+    box-shadow: 
+      0 0 0 2px rgba(var(--primary-rgb), 0.2),
+      0 0 20px rgba(var(--primary-rgb), 0.4),
+      0 0 40px rgba(var(--primary-rgb), 0.2),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  /* Hover state enhancement */
+  .tv-hover:hover {
+    @apply
+      bg-gradient-to-br
+      from-white/10
+      to-white/5
+      shadow-lg
+      transition-all
+      duration-200;
+  }
+
+  /* Selected state with accent */
+  .tv-selected {
+    @apply
+      ring-0
+      outline-none;
+
+    background: linear-gradient(135deg, rgb(var(--primary-rgb), 0.3) 0%, rgb(var(--primary-rgb), 0.1) 100%);
+    box-shadow: 
+      0 0 0 1px rgba(var(--primary-rgb), 0.4),
+      0 0 15px rgba(var(--primary-rgb), 0.3),
+      inset 0 1px 2px rgba(255, 255, 255, 0.15);
+  }
+
+  /* Button focus enhancement */
+  button:focus-visible {
+    @apply
+      outline-none
+      ring-0;
+
+    background: linear-gradient(135deg, rgb(var(--primary-rgb), 0.2) 0%, rgb(var(--primary-rgb), 0.05) 100%);
+    box-shadow: 
+      0 0 0 2px rgba(var(--primary-rgb), 0.15),
+      0 0 24px rgba(var(--primary-rgb), 0.35),
+      inset 0 1px 1px rgba(255, 255, 255, 0.1);
+    transform: translateY(-2px);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Input focus enhancement */
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    @apply
+      outline-none
+      ring-0;
+
+    border-color: rgba(var(--primary-rgb), 0.5);
+    background: linear-gradient(135deg, rgb(var(--primary-rgb), 0.05) 0%, transparent 100%);
+    box-shadow: 
+      0 0 0 2px rgba(var(--primary-rgb), 0.1),
+      0 0 20px rgba(var(--primary-rgb), 0.25),
+      inset 0 1px 2px rgba(255, 255, 255, 0.05);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+/* Selection effect variables for dark backgrounds */
+:root {
+  --primary-rgb: 66 133 244;
+}
+
+/* Smooth fade animation for selections */
+@keyframes selection-glow {
+  0% {
+    box-shadow: 0 0 0 0 rgba(var(--primary-rgb), 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(var(--primary-rgb), 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(var(--primary-rgb), 0);
+  }
+}
+
+.selection-pulse {
+  animation: selection-glow 2s infinite;
+}

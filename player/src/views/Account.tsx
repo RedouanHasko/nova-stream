@@ -13,6 +13,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Logo from "../components/Logo";
 import { motion } from "motion/react";
+import { focusNext } from "../lib/remote";
 import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService } from "../services/iptvService";
 import { toast } from "sonner";
@@ -31,6 +32,23 @@ export default function Account() {
   const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity | null>(
     null,
   );
+
+  // TV remote navigation
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (!key) return;
+      if (key === "back") { navigate("/"); return; }
+      if (key === "up" || key === "left") focusNext("up");
+      else if (key === "down" || key === "right") focusNext("down");
+      else if (key === "enter") (document.activeElement as HTMLElement | null)?.click();
+    };
+    window.addEventListener("tv-remote-key", handler);
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>("button")?.focus();
+    });
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, [navigate]);
 
   useEffect(() => {
     let active = true;

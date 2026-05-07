@@ -1,6 +1,125 @@
+// Generate a deterministic device identity (MAC-like) and activation key.
+// Strategy (best-effort):
+// 1. Try platform-specific IDs (webOS Luna/system APIs, Tizen webapis) where available.
+// 2. If not available, look for a previously stored stable ID in localStorage.
+// 3. If none, create a new random UUID and persist it in localStorage.
+// 4. From the chosen raw identifier derive a MAC-like string and a base64 key using SHA-256.
+// Note: On many TV platforms app storage is cleared on uninstall — surviving a full
+// reinstall is not guaranteed. For truly reinstall-resistant identity, the server
+// must bind server-side to platform-provided hardware identifiers (if allowed).
+
+const STORAGE_KEY = 'player.device.identity.v1';
+const APP_SALT = 'nova-stream-app-salt-v1'; // include app-specific salt (can be changed server-side)
+
+const toHex = (buf: ArrayBuffer) => {
+  const b = new Uint8Array(buf);
+  return Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+};
+
+const toBase64 = (buf: ArrayBuffer) => {
+  let binary = '';
+  const bytes = new Uint8Array(buf);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+};
+
+const sha256 = async (input: string): Promise<ArrayBuffer> => {
+  if ((window as any).crypto && (window as any).crypto.subtle && typeof (window as any).crypto.subtle.digest === 'function') {
+    const enc = new TextEncoder();
+    return await (window as any).crypto.subtle.digest('SHA-256', enc.encode(input));
+  }
+  // Fallback simple hash (not cryptographic) — very unlikely to be used on modern TV webviews
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  const buf = new ArrayBuffer(32);
+  const dv = new DataView(buf);
+  dv.setUint32(0, h);
+  return buf;
+};
+
+const formatMacLike = (hex: string) => {
+  // Take first 12 hex chars and format as MAC (uppercase)
+  const v = (hex || '').replace(/[^a-f0-9]/gi, '').slice(0, 12).padEnd(12, '0').toUpperCase();
+  return v.match(/.{1,2}/g)?.join(':') ?? v;
+};
+
+const genRandomUuid = (): string => {
+  try {
+    const buf = new Uint8Array(16);
+    (window as any).crypto.getRandomValues(buf);
+    // set version bits for v4
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    const hex = Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
+  } catch {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+};
+
+const tryGetPlatformId = async (): Promise<{ id: string | null; source: string | null }> => {
+  try {
+    const w = window as any;
+    // webOS: try multiple Luna endpoints that sometimes expose device identifiers
+    if (w?.webOS && w.webOS.service) {
+      const endpoints = [
+        { ep: 'luna://com.webos.service.systemservice', method: 'getSystemInfo' },
+        { ep: 'luna://com.webos.service.systemservice', method: 'getDeviceInfo' },
+        { ep: 'luna://com.webos.service.sm', method: 'getDeviceInfo' },
+        { ep: 'luna://com.webos.service.connectionmanager', method: 'getStatus' },
+      ];
+      for (const { ep, method } of endpoints) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const res = await new Promise((resolve) => {
+            try {
+              w.webOS.service.request(ep, {
+                method,
+                parameters: {},
+                onSuccess: (r: any) => resolve(r),
+                onFailure: () => resolve(null),
+              });
+            } catch (e) { resolve(null); }
+          });
+          if (res) {
+            // Try common fields
+            const candidates = [res.macAddress, res.mac, res.serialNumber, res.deviceId, res.id, res.uuid, res.hardwareId, res.modelName, JSON.stringify(res)];
+            for (const c of candidates) {
+              if (c && typeof c === 'string' && c.trim().length > 6) return { id: c.trim(), source: `${ep}#${method}` };
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // Tizen: try webapis or systeminfo
+    const ua = navigator.userAgent || '';
+    if (/Tizen/i.test(ua)) {
+      try {
+        const w = window as any;
+        if (w?.webapis?.productinfo) {
+          try {
+            const info = w.webapis.productinfo.getDeviceCapability();
+            const maybe = info?.serial || info?.model || JSON.stringify(info);
+            if (maybe) return { id: String(maybe), source: 'tizen.webapis.productinfo' };
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+  return { id: null, source: null };
+};
+
+/* The lightweight identity helper above was replaced by a more complete
+   identity implementation further down in this file. Keep this space
+   reserved for legacy compatibility if needed. */
 import { detectPlatform, isTV } from "./tv";
 
-const APP_VERSION = "1.7.2.0";
+const APP_VERSION = "1.0.0";
 const IDENTITY_NAMESPACE = "nova-player-device-identity-v1";
 const DEVICE_IDENTITY_CACHE_KEY = "nova:device-identity:v1";
 
