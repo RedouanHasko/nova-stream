@@ -8,7 +8,7 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="msapplication-tap-highlight" content="no" />
-    <link rel="icon" type="image/png" href="/images/favicon.png" />
+    <link rel="icon" type="image/png" href="images/favicon.png" />
     <title>Nova Stream</title>
     <style>
       /* Prevent FOUC: black background until app mounts */
@@ -17,10 +17,75 @@
       * { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
       input, textarea { -webkit-user-select: text; user-select: text; }
     </style>
+    <script>
+      // Some older TV webviews fail to apply generated CSS links in packaged file:// mode.
+      // Add a stable fallback stylesheet path for production bundles.
+      (function () {
+        try {
+          if (window.location.protocol !== 'file:') return;
+          var existing = document.querySelector('link[data-nova-css-fallback="1"]');
+          if (existing) return;
+          var link = document.createElement('link');
+          link.rel = 'stylesheet';
+          link.href = './assets/index.css';
+          link.setAttribute('data-nova-css-fallback', '1');
+          document.head.appendChild(link);
+        } catch (e) {}
+      })();
+    </script>
+    <script>
+      // Load platform-specific SDK libraries.
+      (function () {
+        try {
+          var ua = navigator.userAgent || '';
+
+          // --- webOS TV: load webOSTV.js only when platform globals exist and
+          // the service API is not already injected by the runtime/simulator.
+          // Some simulator/runtime builds already expose window.webOS.service;
+          // forcing an extra loader can trigger noisy system-font URL errors.
+          var hasWebosPlatform = typeof window.PalmSystem !== 'undefined' || typeof window.webOS !== 'undefined';
+          var hasInjectedWebosApi = !!(window.webOS && window.webOS.service);
+          if (hasWebosPlatform && !hasInjectedWebosApi) {
+            var webosLibPaths = [
+              '$WEBOS_LIBS/webOSTV.js',
+              'file:///usr/share/webOSTV.js/webOSTV.js',
+              'file:///media/cryptofs/apps/usr/palm/services/com.webos.service.capture/node_modules/webOSTV.js/webOSTV.js',
+            ];
+            var loadWebos = function(index) {
+              if (index >= webosLibPaths.length) return;
+              try {
+                var s = document.createElement('script');
+                s.type = 'text/javascript';
+                s.src = webosLibPaths[index];
+                s.onerror = function() { loadWebos(index + 1); };
+                document.head.appendChild(s);
+              } catch(e) { loadWebos(index + 1); }
+            };
+            loadWebos(0);
+          }
+
+          // --- Tizen: load webapis.js ---
+          if (/Tizen/i.test(ua) || /SMART-TV/i.test(ua)) {
+            var s = document.createElement('script');
+            s.type = 'text/javascript';
+            s.src = '$WEBAPIS/webapis/webapis.js';
+            s.onerror = function () {
+              try {
+                var s2 = document.createElement('script');
+                s2.type = 'text/javascript';
+                s2.src = '/webapis/webapis.js';
+                document.head.appendChild(s2);
+              } catch (e) {}
+            };
+            document.head.appendChild(s);
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module" src="src/main.tsx"></script>
   </body>
 </html>
 

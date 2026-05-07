@@ -22,7 +22,7 @@ import {
   Clock,
   ExternalLink,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
 import MovieCard from "../components/MovieCard";
 import Logo from "../components/Logo";
@@ -36,9 +36,18 @@ import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService, SeriesStream } from "../services/iptvService";
 import { getFlagForCategory } from "../lib/flags";
 import { reportPlaybackDebug } from "../lib/playbackDebug";
+import { focusNext, useTVRemote, handleHeaderZoneKey, focusHeader } from "../lib/remote";
 
 export default function Series() {
   const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    try {
+      const s = (location.state || {}) as any;
+      if (s?.returnCategory) setActiveCategory(String(s.returnCategory));
+    } catch {}
+  }, [location]);
   const t = useT();
   const {
     activePlaylist,
@@ -56,7 +65,9 @@ export default function Series() {
 
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [visibleCount, setVisibleCount] = useState(50);
+  const INITIAL_VISIBLE = 36;
+  const LOAD_STEP = 36;
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const [localSeriesStreams, setLocalSeriesStreams] = useState<
     SeriesStream[] | null
@@ -80,7 +91,21 @@ export default function Series() {
   // Virtual grid sizing
   const gridContainerRef = useRef<HTMLDivElement>(null);
   const [gridWidth, setGridWidth] = useState(800);
+  const pinModalRef = useRef<HTMLDivElement | null>(null);
+  const seriesModalRef = useRef<HTMLDivElement | null>(null);
+  const sortMenuRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const colorActionTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastNonFavoriteCategoryRef = useRef("all");
+  const [colorAction, setColorAction] = useState<string | null>(null);
+  const seriesCategoryCacheRef = useRef<Map<string, SeriesStream[]>>(new Map());
+  const fetchedAllSeriesRef = useRef(false);
   const CARD_GAP = 16;
+
+  useEffect(() => {
+    seriesCategoryCacheRef.current.clear();
+    fetchedAllSeriesRef.current = false;
+  }, [activePlaylist?.id]);
 
   // ------- Watch progress -------
   const getProgressStore = (): Record<string, any> => {
@@ -128,6 +153,12 @@ export default function Series() {
 
     const fetchCategory = async (catId: string) => {
       try {
+        const cached = seriesCategoryCacheRef.current.get(catId);
+        if (cached) {
+          setLocalSeriesStreams(cached);
+          setIsFetchingCategory(false);
+          return;
+        }
         setIsFetchingCategory(true);
         const streams = await IPTVService.getSeries(
           activePlaylist.host!,
@@ -135,7 +166,11 @@ export default function Series() {
           activePlaylist.password!,
           catId,
         );
-        if (!cancelled) setLocalSeriesStreams(streams || []);
+        if (!cancelled) {
+          const safeStreams = streams || [];
+          seriesCategoryCacheRef.current.set(catId, safeStreams);
+          setLocalSeriesStreams(safeStreams);
+        }
       } catch (err) {
         console.error("fetchSeries category failed:", err);
         if (!cancelled) setLocalSeriesStreams([]);
@@ -159,8 +194,10 @@ export default function Series() {
     // If 'all' is selected, fetch all series streams via context helper
     const cats = playlistData.seriesCategories || [];
     if (activeCategory === "all") {
-      if (!isFetchingSeries) {
+      if (!isFetchingSeries && !fetchedAllSeriesRef.current) {
+        fetchedAllSeriesRef.current = true;
         fetchSeries().catch((err: any) => {
+          fetchedAllSeriesRef.current = false;
           console.error("fetchSeries failed:", err);
           toast.error("Failed to load series");
         });
@@ -189,10 +226,6 @@ export default function Series() {
 
   const deferredSearch = useDeferredValue(searchQuery);
   const deferredCategory = useDeferredValue(activeCategory);
-
-  useEffect(() => {
-    startTransition(() => {});
-  }, [searchQuery, activeCategory]);
 
   const categories = useMemo(() => {
     const cats = playlistData.seriesCategories || [];
@@ -223,18 +256,25 @@ export default function Series() {
     isParentalUnlocked,
   ]);
 
+  const normalizedSearch = deferredSearch.trim().toLowerCase();
+  const favoriteSeriesSet = useMemo(
+    () => new Set(favorites.series),
+    [favorites.series],
+  );
+
   const filteredSeries = useMemo(() => {
     if (!Array.isArray(series)) return [];
+    const hasSearch = normalizedSearch.length > 0;
     let filtered = series.filter(
       (s) =>
-        s.name.toLowerCase().includes(deferredSearch.toLowerCase()) &&
+        (!hasSearch || s.name.toLowerCase().includes(normalizedSearch)) &&
         (deferredCategory === "all" ||
           deferredCategory === "fav" ||
           s.category_id === deferredCategory),
     );
 
     if (deferredCategory === "fav") {
-      filtered = filtered.filter((s) => favorites.series.includes(s.series_id));
+      filtered = filtered.filter((s) => favoriteSeriesSet.has(s.series_id));
     }
 
     switch (sortBy) {
@@ -252,12 +292,12 @@ export default function Series() {
     }
 
     return filtered;
-  }, [series, deferredSearch, deferredCategory, favorites.series, sortBy]);
+  }, [series, normalizedSearch, deferredCategory, favoriteSeriesSet, sortBy]);
 
   // Reset visible count when filters/search change
   useEffect(() => {
-    setVisibleCount(50);
-  }, [deferredSearch, deferredCategory, sortBy, playlistData.seriesStreams?.length, localSeriesStreams?.length]);
+    setVisibleCount(INITIAL_VISIBLE);
+  }, [deferredSearch, deferredCategory, sortBy, playlistData.seriesStreams?.length, localSeriesStreams?.length, INITIAL_VISIBLE]);
 
   // Scroll handler to load more series when near bottom
   useEffect(() => {
@@ -270,14 +310,14 @@ export default function Series() {
       requestAnimationFrame(() => {
         const threshold = 800;
         if (el.scrollHeight - (el.scrollTop + el.clientHeight) < threshold) {
-          setVisibleCount((v) => Math.min((filteredSeries?.length || 0), v + 50));
+          setVisibleCount((v) => Math.min((filteredSeries?.length || 0), v + LOAD_STEP));
         }
         ticking = false;
       });
     };
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
-  }, [filteredSeries.length]);
+  }, [filteredSeries.length, LOAD_STEP]);
 
   // Remove old IntersectionObserver / loadMore from here
 
@@ -310,6 +350,10 @@ export default function Series() {
     settings.parentalLockedCategories?.series,
     isParentalUnlocked,
   ]);
+
+  const activeCategoryLabel = useMemo(() => {
+    return sidebarItems.find((item) => item.id === activeCategory)?.name || t.allSeries;
+  }, [sidebarItems, activeCategory, t.allSeries]);
 
   const handleSeriesClick = useCallback(async (s: SeriesStream) => {
     setSelectedSeries(s);
@@ -412,6 +456,8 @@ export default function Series() {
           fullTitle: `${selectedSeries?.name} - S${ep.season}E${ep.episode_num}: ${ep.title}`,
         })),
         currentIndex: index,
+        from: `${location.pathname}${location.search}`,
+        returnCategory: activeCategory,
       },
     });
   };
@@ -422,7 +468,7 @@ export default function Series() {
       toast.success("Parental content unlocked");
       setShowPinModal(false);
       if (pendingLockedCategoryId) {
-        setActiveCategory(pendingLockedCategoryId);
+        startTransition(() => setActiveCategory(pendingLockedCategoryId!));
         setPendingLockedCategoryId(null);
       }
       setPinInput("");
@@ -438,43 +484,239 @@ export default function Series() {
       setPendingLockedCategoryId(catId);
       setShowPinModal(true);
     } else {
-      setActiveCategory(catId);
+      startTransition(() => setActiveCategory(catId));
     }
   };
 
-  // TV remote navigation
-  const focusedSeriesIndexRef = useRef(-1);
+  const showColorAction = useCallback((label: string) => {
+    setColorAction(label);
+    if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    colorActionTimerRef.current = setTimeout(() => setColorAction(null), 1200);
+  }, []);
+
+  const focusSearch = useCallback(() => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    showColorAction("Search focused");
+  }, [showColorAction]);
+
+  const cycleSort = useCallback(() => {
+    const order: Array<typeof sortBy> = ["default", "name", "rating", "newest"];
+    const currentIndex = order.indexOf(sortBy);
+    const next = order[(currentIndex + 1) % order.length];
+    setSortBy(next);
+    const labels: Record<typeof sortBy, string> = {
+      default: "Sort: Default",
+      name: "Sort: A-Z",
+      rating: "Sort: Top rated",
+      newest: "Sort: Newest",
+    };
+    showColorAction(labels[next]);
+  }, [sortBy, showColorAction]);
+
+  const toggleFavoriteFilter = useCallback(() => {
+    if (activeCategory === "fav") {
+      const fallbackCategory =
+        lastNonFavoriteCategoryRef.current &&
+        (lastNonFavoriteCategoryRef.current === "all" ||
+          categories.some(
+            (category) => category.category_id === lastNonFavoriteCategoryRef.current,
+          ))
+          ? lastNonFavoriteCategoryRef.current
+          : categories[0]?.category_id || "all";
+      setActiveCategory(fallbackCategory);
+      showColorAction("Favorites filter off");
+      return;
+    }
+
+    if (activeCategory !== "all") {
+      lastNonFavoriteCategoryRef.current = activeCategory;
+    }
+    setActiveCategory("fav");
+    showColorAction("Favorites filter on");
+  }, [activeCategory, categories, showColorAction]);
+
+  // Which panel currently owns D-pad focus: sidebar categories or series grid
+  const [sidebarTVFocus, setSidebarTVFocus] = useState(false);
+
+  // TV remote navigation — pure spatial: focusNext() finds the element
+  // visually above/below/left/right of whatever currently has DOM focus.
   useEffect(() => {
+    if (document.documentElement.dataset.tv !== "true") return;
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
-      const total = filteredSeries.length;
-      if (total === 0) return;
-      if (key === "enter") {
-        if (focusedSeriesIndexRef.current >= 0 && focusedSeriesIndexRef.current < total) {
-          handleSeriesClick(filteredSeries[focusedSeriesIndexRef.current]);
+      if (showPinModal || !!selectedSeries || showSortMenu) return;
+
+      // While sidebar owns TV focus, only allow back to release it.
+      if (sidebarTVFocus) {
+        if (key === "back") setSidebarTVFocus(false);
+        return;
+      }
+
+      // Header zone handles its own left/right/enter/back.
+      if (handleHeaderZoneKey(key, { onBack: () => navigate("/") })) return;
+
+      if (key === "green") {
+        focusSearch();
+        return;
+      }
+      if (key === "yellow") {
+        toggleFavoriteFilter();
+        return;
+      }
+      if (key === "blue") {
+        cycleSort();
+        return;
+      }
+
+      if (key === "back") { navigate("/"); return; }
+      if (key === "enter" || key === "select") {
+        (document.activeElement as HTMLElement | null)?.click();
+        return;
+      }
+
+      const grid = gridContainerRef.current;
+      const active = document.activeElement as HTMLElement | null;
+      const inGrid = !!(grid && active && grid.contains(active));
+
+      if (key === "left") {
+        if (inGrid) {
+          const before = document.activeElement;
+          focusNext("left", { root: grid });
+          if (document.activeElement === before) setSidebarTVFocus(true);
+        } else {
+          setSidebarTVFocus(true);
         }
         return;
       }
-      if (key === "back" || key === "backspace") {
-        setSelectedSeries(null);
+
+      if (key === "up") {
+        if (inGrid) {
+          const before = document.activeElement;
+          focusNext("up", { root: grid });
+          if (document.activeElement === before) focusHeader();
+        }
         return;
       }
-      let next = focusedSeriesIndexRef.current;
-      if (key === "right") next = Math.min(next + 1, total - 1);
-      else if (key === "left") next = Math.max(next - 1, 0);
-      else if (key === "down") next = Math.min(next + columnCount, total - 1);
-      else if (key === "up") next = Math.max(next - columnCount, 0);
-      else return;
-      if (next < 0) next = 0;
-      focusedSeriesIndexRef.current = next;
+
+      if (key === "right") {
+        focusNext("right", { root: grid });
+        return;
+      }
+
+      if (key === "down") {
+        if (inGrid) {
+          focusNext("down", { root: grid });
+        } else {
+          const first = grid?.querySelector<HTMLElement>("[data-tv-focusable]");
+          first?.focus();
+        }
+        return;
+      }
     };
     window.addEventListener("tv-remote-key", handler);
     return () => window.removeEventListener("tv-remote-key", handler);
-  }, [filteredSeries, columnCount, handleSeriesClick]);
+  }, [
+    cycleSort,
+    filteredSeries,
+    focusSearch,
+    handleSeriesClick,
+    navigate,
+    selectedSeries,
+    showPinModal,
+    showSortMenu,
+    sidebarTVFocus,
+    toggleFavoriteFilter,
+  ]);
+
+  // Auto-focus first card when the series list loads/changes (TV only).
+  useEffect(() => {
+    if (document.documentElement.dataset.tv !== "true") return;
+    if (filteredSeries.length === 0) return;
+    requestAnimationFrame(() => {
+      const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+      first?.focus();
+    });
+  }, [filteredSeries]);
+
+  useEffect(() => {
+    if (activeCategory !== "fav") {
+      lastNonFavoriteCategoryRef.current = activeCategory;
+    }
+  }, [activeCategory]);
+
+  useEffect(() => {
+    return () => {
+      if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const focusFirst = (container: HTMLElement | null) => {
+      if (!container) return;
+      const first = container.querySelector<HTMLElement>(
+        "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+      );
+      first?.focus();
+    };
+
+    const root = showPinModal
+      ? pinModalRef.current
+      : selectedSeries
+        ? seriesModalRef.current
+        : showSortMenu
+          ? sortMenuRef.current
+          : null;
+    if (!root) return;
+    setTimeout(() => focusFirst(root), 20);
+  }, [showPinModal, selectedSeries, showSortMenu]);
+
+  useTVRemote((key, event) => {
+    const modalRoot = showPinModal
+      ? pinModalRef.current
+      : selectedSeries
+        ? seriesModalRef.current
+        : showSortMenu
+          ? sortMenuRef.current
+          : null;
+    if (!modalRoot) return;
+    event?.stopImmediatePropagation();
+
+    if (key === "back") {
+      if (showPinModal) setShowPinModal(false);
+      else if (selectedSeries) setSelectedSeries(null);
+      else if (showSortMenu) setShowSortMenu(false);
+      return;
+    }
+
+    if (key === "left" || key === "right" || key === "up" || key === "down") {
+      focusNext(key, { root: modalRoot });
+      return;
+    }
+
+    if (key === "enter" || key === "select") {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && modalRoot.contains(active)) {
+        active.click();
+      }
+    }
+  });
 
   return (
-    <div className="flex flex-col h-screen">
+    <div className="tv-browser-shell flex flex-col h-screen">
+      <div className="fixed bottom-4 right-4 z-[100] flex flex-col items-end gap-2 pointer-events-none select-none">
+        <div className="tv-key-hints flex flex-wrap justify-end gap-2 rounded-2xl px-3 py-2 backdrop-blur-sm">
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-green-600" /><span className="text-xs text-white/80 font-bold">Search</span></div>
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-yellow-400" /><span className="text-xs text-white/80 font-bold">Favorites</span></div>
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-blue-600" /><span className="text-xs text-white/80 font-bold">Sort</span></div>
+        </div>
+        {colorAction && (
+          <div className="mt-2 px-3 py-1 rounded bg-black/80 text-white/90 text-xs font-bold shadow-lg animate-pulse">
+            {colorAction}
+          </div>
+        )}
+      </div>
       {/* PIN Modal */}
       <AnimatePresence>
         {showPinModal && (
@@ -489,6 +731,7 @@ export default function Series() {
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
+              ref={pinModalRef}
               className="bg-zinc-900 border border-white/10 p-8 rounded-3xl max-w-sm w-full shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             >
@@ -514,7 +757,7 @@ export default function Series() {
                     onChange={(e) =>
                       setPinInput(e.target.value.replace(/\D/g, ""))
                     }
-                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:border-primary"
+                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:bg-gradient-to-br focus:from-primary/10 focus:to-transparent focus:border-primary/40 focus:shadow-[0_0_20px_rgba(66,133,244,0.25)] transition-all"
                     placeholder="••••"
                   />
                   <div className="flex gap-3">
@@ -539,41 +782,43 @@ export default function Series() {
         )}
       </AnimatePresence>
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-black/40 border-b border-white/5">
+      <header data-tv-zone="header" className="tv-browser-header flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
             <button
               onClick={() => navigate("/")}
-              className="p-1 hover:bg-white/10 rounded-full"
+              className="tv-header-back-btn rounded-full p-2"
+              title="Back to Home"
+              aria-label="Back to Home"
             >
               <ArrowLeft className="w-6 h-6" />
             </button>
             <WeatherWidget />
-            <nav className="flex items-center gap-6">
+            <nav className="tv-nav-tabs flex items-center gap-1">
               <button
                 onClick={() => navigate("/")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.home}
               </button>
               <button
                 onClick={() => navigate("/live")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.live}
               </button>
               <button
                 onClick={() => navigate("/movies")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.movies}
               </button>
-              <button className="text-primary font-bold border-b-2 border-primary">
+              <button className="tv-nav-tab tv-nav-tab--active">
                 {t.series}
               </button>
               <button
                 onClick={() => navigate("/radio")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.radio}
               </button>
@@ -588,7 +833,7 @@ export default function Series() {
                 isParentalUnlocked ? lockParental() : setShowPinModal(true)
               }
               className={cn(
-                "p-2 rounded-full transition-all",
+                "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked
                   ? "bg-primary text-white"
                   : "bg-white/5 text-white/40 hover:bg-white/10",
@@ -606,14 +851,15 @@ export default function Series() {
               )}
             </button>
           )}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
+          <div className="tv-search-shell w-[320px] md:w-[360px]">
+            <Search className="tv-search-icon" />
             <input
+              ref={searchInputRef}
               type="text"
               placeholder={t.search}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="bg-white/5 border border-white/10 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-primary w-64"
+              className="tv-search-input"
             />
           </div>
           <DigitalClock />
@@ -628,11 +874,20 @@ export default function Series() {
           items={sidebarItems}
           activeId={activeCategory}
           onSelect={handleCategorySelect}
-          className="w-72"
+          hasTVFocus={sidebarTVFocus}
+          onTVFocusRelease={() => {
+            setSidebarTVFocus(false);
+            const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+            first?.focus();
+          }}
+          onTVFocusEscapeUp={() => {
+            setSidebarTVFocus(false);
+            focusHeader();
+          }}
         />
 
         {/* Series Grid */}
-        <div ref={gridContainerRef} className="flex-1 flex flex-col overflow-hidden bg-black/10">
+        <div ref={gridContainerRef} className="tv-browser-content flex-1 flex flex-col overflow-hidden">
           {!isConnected ? (
             <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
               <div className="p-6 bg-white/5 rounded-full">
@@ -653,14 +908,26 @@ export default function Series() {
             </div>
           ) : (
             <>
-              <div className="px-8 pt-8 pb-4">
+              <div className="px-8 pt-7 pb-4">
+                <div className="tv-nav-strip mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold uppercase tracking-[0.14em] text-white/40">Category</span>
+                    <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/90">{activeCategoryLabel}</span>
+                  </div>
+                  <span className={cn(
+                    "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide",
+                    sidebarTVFocus ? "bg-emerald-500/20 text-emerald-200" : "bg-cyan-500/20 text-cyan-100",
+                  )}>
+                    {sidebarTVFocus ? "Categories Focus" : "Grid Focus"}
+                  </span>
+                </div>
                 {activePlaylist && activePlaylist.type !== "xtream" && (
                   <div className="mb-4 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
                     <strong>Note:</strong> Series require an Xtream-type playlist. Current:{" "}
                     <span className="font-bold">{activePlaylist.type}</span>.
                   </div>
                 )}
-                <div className="flex items-center justify-between mb-6">
+                <div className="tv-browser-toolbar flex items-center justify-between mb-5 px-4 py-3">
                   <div className="relative">
                     <button
                       onClick={() => setShowSortMenu(!showSortMenu)}
@@ -686,6 +953,7 @@ export default function Series() {
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: 10 }}
+                          ref={sortMenuRef}
                           className="absolute top-full left-0 mt-2 bg-zinc-900 border border-white/10 rounded-xl p-2 min-w-[180px] z-50 shadow-2xl"
                         >
                           {[
@@ -718,7 +986,7 @@ export default function Series() {
                     {isFetchingSeries && (
                       <Loader2 className="w-4 h-4 animate-spin text-primary" />
                     )}
-                    <span className="text-white/40 font-medium">
+                    <span className="tv-browser-stat px-3 py-1 text-white/70 text-sm font-semibold">
                       {filteredSeries.length} series
                     </span>
                   </div>
@@ -749,7 +1017,7 @@ export default function Series() {
                         ? `S${prog.season}E${prog.episodeNum}`
                         : undefined;
                       return (
-                        <div key={item.series_id} data-series-index={idx}>
+                        <div key={item.series_id}>
                           <MovieCard
                             title={item.name}
                             poster={item.cover}
@@ -782,6 +1050,7 @@ export default function Series() {
               initial={{ scale: 0.9, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              ref={seriesModalRef}
               className="bg-zinc-900 w-full max-w-6xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative"
               onClick={(e) => e.stopPropagation()}
             >

@@ -19,12 +19,10 @@ import { toast } from "sonner";
 import { getLang } from "../lib/i18n";
 import {
   ACTIVATION_PORTAL_URL,
-  getDeviceFeed,
   startDeviceTrial,
   verifyDeviceActivation,
-  type BackendAssignedPlaylist,
   type DeviceActivationResponse,
-} from "../lib/backendApi";
+} from "../lib/activationApi";
 import {
   getDeviceIdentity,
   syncDeviceIdentityKeyFromServer,
@@ -47,6 +45,7 @@ import {
   MovieStream,
   SeriesStream,
 } from "../services/iptvService";
+import { requestDedup } from "../lib/requestDedup";
 
 interface PlaylistData {
   liveCategories: Category[];
@@ -106,6 +105,8 @@ interface Settings {
   subtitleSize: "small" | "medium" | "large";
   subtitlePosition: "top" | "bottom";
   subtitleColor: string;
+  subtitleBgOpacity: number;
+  subtitleEdge: "none" | "shadow" | "stroke";
   pipEnabled: boolean;
   accentColor: string;
   backgroundImage: string | null;
@@ -228,6 +229,8 @@ const INITIAL_SETTINGS: Settings = {
   subtitleSize: "medium",
   subtitlePosition: "bottom",
   subtitleColor: "#ffffff",
+  subtitleBgOpacity: 0.6,
+  subtitleEdge: "shadow",
   pipEnabled: true,
   accentColor: "#8b0000",
   backgroundImage: null,
@@ -254,8 +257,44 @@ const INITIAL_ACTIVATION_STATUS: ActivationStatus = {
 };
 
 const LOCAL_PLAYLISTS_STORAGE_KEY = "nova_playlists";
-const MANAGED_PLAYLISTS_STORAGE_KEY = "nova_managed_playlists";
 const ACTIVE_PLAYLIST_STORAGE_KEY = "nova_active_id";
+
+const DEFAULT_BACKGROUND_FILE = "images/img1.png";
+
+function resolveDefaultBackgroundUrl(): string {
+  if (typeof document === "undefined") return `./${DEFAULT_BACKGROUND_FILE}`;
+  return new URL(DEFAULT_BACKGROUND_FILE, document.baseURI).toString();
+}
+
+function normalizeBackgroundImagePath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const raw = value.trim();
+  if (!raw) return null;
+
+  // Migrate legacy absolute/root paths that break in file:// packaged builds.
+  if (
+    raw === "/images/img1.png" ||
+    raw === "images/img1.png" ||
+    raw === "./images/img1.png" ||
+    raw.endsWith("/images/img1.png")
+  ) {
+    return resolveDefaultBackgroundUrl();
+  }
+
+  return raw;
+}
+
+function normalizeSettings(raw: unknown): Settings {
+  const parsed =
+    raw && typeof raw === "object"
+      ? ({ ...INITIAL_SETTINGS, ...(raw as Partial<Settings>) } as Settings)
+      : { ...INITIAL_SETTINGS };
+
+  return {
+    ...parsed,
+    backgroundImage: normalizeBackgroundImagePath(parsed.backgroundImage),
+  };
+}
 
 const PlaylistContext = createContext<PlaylistContextType | undefined>(
   undefined,
@@ -273,47 +312,64 @@ function sanitizeSavedPlaylists(value: unknown): PlaylistInfo[] {
       typeof item === "object" &&
       typeof item.id === "string" &&
       typeof item.name === "string" &&
-      (item.type === "m3u" || item.type === "xtream"),
+      (item.type === "m3u" || item.type === "xtream") &&
+      item.managedByBackend !== true,
   );
 }
 
-function mapBackendPlaylistToLocal(playlist: BackendAssignedPlaylist): PlaylistInfo | null {
-  const credentials = playlist.credentials;
-  if (credentials?.host && credentials?.username && credentials?.password) {
-    return {
-      id: `managed:${playlist.assignmentId || playlist.id || playlist.name || credentials.host}`,
-      name: playlist.name || "Assigned Playlist",
-      type: "xtream",
-      host: credentials.host,
-      username: credentials.username,
-      password: credentials.password,
-      addedAt: playlist.addedAt || playlist.updatedAt || new Date().toISOString(),
-      managedByBackend: true,
-      backendAssignmentId: playlist.assignmentId,
-      backendPlaylistId: playlist.id,
-      backendUpdatedAt: playlist.updatedAt,
-      targetApplicationId: playlist.targetApplicationId ?? null,
-      targetAppName: playlist.targetAppName ?? null,
-    };
-  }
+function persistLocalPlaylists(playlists: PlaylistInfo[]) {
+  const localOnly = playlists.filter((playlist) => !playlist.managedByBackend);
+  localStorage.setItem(LOCAL_PLAYLISTS_STORAGE_KEY, JSON.stringify(localOnly));
+}
 
-  if (playlist.url) {
-    return {
-      id: `managed:${playlist.assignmentId || playlist.id || playlist.name || playlist.url}`,
-      name: playlist.name || "Assigned Playlist",
-      type: "m3u",
-      url: playlist.url,
-      addedAt: playlist.addedAt || playlist.updatedAt || new Date().toISOString(),
-      managedByBackend: true,
-      backendAssignmentId: playlist.assignmentId,
-      backendPlaylistId: playlist.id,
-      backendUpdatedAt: playlist.updatedAt,
-      targetApplicationId: playlist.targetApplicationId ?? null,
-      targetAppName: playlist.targetAppName ?? null,
-    };
-  }
+function mapBackendPlaylists(playlists: DeviceActivationResponse["playlists"]): PlaylistInfo[] {
+  if (!Array.isArray(playlists)) return [];
 
-  return null;
+  return playlists
+    .map((playlist, index) => {
+      const rawType = (playlist?.type || "m3u").toString().toLowerCase();
+      const type = rawType === "xtream" ? "xtream" : "m3u";
+      const credentials = playlist?.credentials || null;
+
+      const id = `backend:${
+        playlist?.assignmentId ?? playlist?.id ?? `${index}:${playlist?.name || "playlist"}`
+      }`;
+
+      return {
+        id,
+        name: (playlist?.name || "Managed Playlist").toString(),
+        type,
+        url: playlist?.url || undefined,
+        host: credentials?.host || undefined,
+        username: credentials?.username || undefined,
+        password: credentials?.password || undefined,
+        addedAt: playlist?.addedAt || playlist?.updatedAt || new Date().toISOString(),
+        managedByBackend: true,
+        backendAssignmentId:
+          typeof playlist?.assignmentId === "number" ? playlist.assignmentId : undefined,
+        backendPlaylistId: typeof playlist?.id === "number" ? playlist.id : undefined,
+        backendUpdatedAt: playlist?.updatedAt || undefined,
+        targetApplicationId:
+          typeof playlist?.targetApplicationId === "number"
+            ? playlist.targetApplicationId
+            : null,
+        targetAppName: playlist?.targetAppName || null,
+      } satisfies PlaylistInfo;
+    })
+    .filter((playlist) =>
+      playlist.type === "xtream"
+        ? Boolean(playlist.host && playlist.username && playlist.password)
+        : Boolean(playlist.url),
+    );
+}
+
+function mergePlaylistsWithBackend(
+  localPlaylists: PlaylistInfo[],
+  backendPlaylists: DeviceActivationResponse["playlists"],
+): PlaylistInfo[] {
+  const editableLocal = localPlaylists.filter((playlist) => !playlist.managedByBackend);
+  const managed = mapBackendPlaylists(backendPlaylists);
+  return [...managed, ...editableLocal];
 }
 
 function readStoredPlaylists(storageKey: string): PlaylistInfo[] {
@@ -386,7 +442,6 @@ function getTrialFailureMessage(response: DeviceActivationResponse): string {
 
 export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const [localPlaylists, setLocalPlaylists] = useState<PlaylistInfo[]>([]);
-  const [managedPlaylists, setManagedPlaylists] = useState<PlaylistInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [playlistData, setPlaylistData] = useState<PlaylistData>(INITIAL_DATA);
   const [favorites, setFavorites] = useState<Favorites>(INITIAL_FAVORITES);
@@ -416,7 +471,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const activationRefreshInFlightRef = useRef(false);
   const activationRetryAfterTsRef = useRef(0);
 
-  const playlists = [...managedPlaylists, ...localPlaylists];
+  const playlists = [...localPlaylists];
 
   const isLiveInitialLoading =
     isFetchingLive &&
@@ -447,11 +502,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     root.style.setProperty("--primary-hover", `rgba(${rgb}, 0.9)`);
     root.style.setProperty("--subtitle-color", settings.subtitleColor);
     root.lang = getLang(settings.language || "english");
-    if (settings.backgroundImage) {
-      document.body.style.backgroundImage = `linear-gradient(rgba(0,0,0,0.6),rgba(0,0,0,0.6)),url('${settings.backgroundImage}')`;
-    } else {
-      document.body.style.backgroundImage = `linear-gradient(rgba(0,0,0,0.6),rgba(0,0,0,0.6)),url('/images/img1.png')`;
-    }
+    const bg = settings.backgroundImage || resolveDefaultBackgroundUrl();
+    document.body.style.backgroundImage = `linear-gradient(rgba(0,0,0,0.6),rgba(0,0,0,0.6)),url('${bg}')`;
   }, [
     settings.accentColor,
     settings.backgroundImage,
@@ -503,7 +555,6 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
 
     const cachedActivation = readActivationCache(deviceIdentity);
     const shouldBlockOnNetwork = !cachedActivation;
-    const hasSavedPlaylists = playlistsRef.current.length > 0;
 
     if (cachedActivation) {
       setActivationStatus(
@@ -514,7 +565,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       );
     }
 
-    if (!forceNetwork && !shouldBlockOnNetwork && !cachedActivation?.shouldRefresh && hasSavedPlaylists) {
+    if (!forceNetwork && !shouldBlockOnNetwork && !cachedActivation?.shouldRefresh) {
       setIsActivationLoading(false);
       return;
     }
@@ -547,47 +598,48 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (!verification.activated) {
-        setManagedPlaylists([]);
-        playlistsRef.current = localPlaylists;
-        localStorage.removeItem(MANAGED_PLAYLISTS_STORAGE_KEY);
-        if (activeIdRef.current && activeIdRef.current.startsWith("managed:")) {
-          const fallbackId = localPlaylists[0]?.id || null;
-          setActiveId(fallbackId);
-          if (fallbackId) {
-            localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, fallbackId);
+        const editableLocal = localPlaylists.filter(
+          (playlist) => !playlist.managedByBackend,
+        );
+        setLocalPlaylists(editableLocal);
+        playlistsRef.current = editableLocal;
+        persistLocalPlaylists(editableLocal);
+
+        const currentActiveId = activeIdRef.current;
+        const currentExists = currentActiveId
+          ? editableLocal.some((playlist) => playlist.id === currentActiveId)
+          : false;
+
+        if (!currentExists) {
+          const nextActiveId = editableLocal[0]?.id || null;
+          setActiveId(nextActiveId);
+          if (nextActiveId) {
+            localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, nextActiveId);
           } else {
             localStorage.removeItem(ACTIVE_PLAYLIST_STORAGE_KEY);
           }
         }
-        return;
-      }
+      } else {
+        const mergedPlaylists = mergePlaylistsWithBackend(
+          localPlaylists,
+          verification.playlists,
+        );
+        setLocalPlaylists(mergedPlaylists);
+        playlistsRef.current = mergedPlaylists;
+        persistLocalPlaylists(mergedPlaylists);
 
-      const feed = await getDeviceFeed(resolvedIdentity);
-      const nextManagedPlaylists = (feed.playlists || [])
-        .map(mapBackendPlaylistToLocal)
-        .filter(Boolean) as PlaylistInfo[];
-
-      setManagedPlaylists(nextManagedPlaylists);
-      localStorage.setItem(
-        MANAGED_PLAYLISTS_STORAGE_KEY,
-        JSON.stringify(nextManagedPlaylists),
-      );
-
-      const nextCombined = [...nextManagedPlaylists, ...localPlaylists];
-      playlistsRef.current = nextCombined;
-
-      const currentActiveId = activeIdRef.current;
-      const currentExists = currentActiveId
-        ? nextCombined.some((playlist) => playlist.id === currentActiveId)
-        : false;
-
-      if (!currentExists) {
-        const nextActiveId = nextCombined[0]?.id || null;
-        setActiveId(nextActiveId);
-        if (nextActiveId) {
-          localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, nextActiveId);
-        } else {
-          localStorage.removeItem(ACTIVE_PLAYLIST_STORAGE_KEY);
+        const currentActiveId = activeIdRef.current;
+        const activeStillExists = currentActiveId
+          ? mergedPlaylists.some((playlist) => playlist.id === currentActiveId)
+          : false;
+        if (!activeStillExists) {
+          const nextActiveId = mergedPlaylists[0]?.id || null;
+          setActiveId(nextActiveId);
+          if (nextActiveId) {
+            localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, nextActiveId);
+          } else {
+            localStorage.removeItem(ACTIVE_PLAYLIST_STORAGE_KEY);
+          }
         }
       }
     } catch (error) {
@@ -623,13 +675,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         setActivationStatus((prev) => ({
           ...prev,
           ready: true,
-          activated: prev.activated || hasSavedPlaylists,
-          reason:
-            prev.activated || hasSavedPlaylists
-              ? "offline_grace"
-              : prev.reason === "loading"
-                ? "unreachable"
-                : prev.reason,
+          activated: false,
+          reason: prev.reason === "loading" ? "unreachable" : prev.reason,
           device:
             prev.device ||
             (deviceIdentity
@@ -703,7 +750,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       const savedSettings = localStorage.getItem(`nova_settings_${activeId}`);
       if (savedSettings) {
         try {
-          setSettings({ ...INITIAL_SETTINGS, ...JSON.parse(savedSettings) });
+          const parsed = JSON.parse(savedSettings);
+          setSettings(normalizeSettings(parsed));
         } catch (e) {
           setSettings(INITIAL_SETTINGS);
         }
@@ -731,9 +779,9 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     }
   }, [activeId]);
 
-  // ── Prefetch ALL data on connect ─────────────────────────────────
-  // Fetches categories + streams for live, vod, and series in parallel.
-  // Cached data is served instantly from IDB; fresh data is fetched in background.
+  // ── Progressive prefetch on connect ───────────────────────────────
+  // 1) Hydrate instantly from cache (memory/IndexedDB).
+  // 2) Refresh live/vod/series in parallel and commit each section as soon as ready.
   // ------------------------------------------------------------------
   useEffect(() => {
     const pl = activePlaylist;
@@ -743,56 +791,34 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     const pass = pl.password!;
     const id = pl.id;
 
-    const settledBySection = {
-      live: 0,
-      vod: 0,
-      series: 0,
-    };
-    const readyBySection = {
+    const readyBySection: Record<"live" | "vod" | "series", boolean> = {
       live: false,
       vod: false,
       series: false,
     };
-    let readyCount = 0;
-    const markSectionReady = (section: "live" | "vod" | "series") => {
+    let completedSections = 0;
+    const markSectionReady = (
+      section: "live" | "vod" | "series",
+      label?: string,
+    ) => {
       if (readyBySection[section]) return;
       readyBySection[section] = true;
-      readyCount += 1;
+      completedSections += 1;
       setSectionLoadProgress((prev) => ({ ...prev, [section]: 100 }));
       setPrefetchProgress({
-        completed: readyCount,
+        completed: completedSections,
         total: 3,
         label:
-          section === "live"
+          label ||
+          (section === "live"
             ? "Live ready"
             : section === "vod"
               ? "Movies ready"
-              : "Series ready",
+              : "Series ready"),
       });
-      if (readyCount >= 3) {
-        setIsPrefetching(false);
-      }
       if (section === "live") setIsFetchingLive(false);
       if (section === "vod") setIsFetchingVod(false);
       if (section === "series") setIsFetchingSeries(false);
-    };
-    const markSectionSettled = (section: "live" | "vod" | "series") => {
-      settledBySection[section] += 1;
-      const nextProgress = readyBySection[section]
-        ? 100
-        : settledBySection[section] >= 2
-          ? 100
-          : 0;
-      setSectionLoadProgress((prev) => ({ ...prev, [section]: nextProgress }));
-      if (section === "live" && settledBySection.live >= 2) {
-        setIsFetchingLive(false);
-      }
-      if (section === "vod" && settledBySection.vod >= 2) {
-        setIsFetchingVod(false);
-      }
-      if (section === "series" && settledBySection.series >= 2) {
-        setIsFetchingSeries(false);
-      }
     };
 
     setIsPrefetching(true);
@@ -823,72 +849,171 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
           ? 100
           : 0,
     });
-    readyCount = 0;
     setPrefetchProgress({ completed: 0, total: 3, label: "Starting..." });
+    completedSections = 0;
 
-    // Track loaded categories for localStorage cache
-    const loadedCategories: {
-      live?: Category[];
-      vod?: Category[];
-      series?: Category[];
-    } = {};
-
-    IPTVService.prefetchAll(host, user, pass, (completed, total, label) => {
-      if (activeIdRef.current !== id) return;
-      setPrefetchProgress({ completed, total, label });
-    })
-      .then(async (data) => {
+    // Fast bootstrap from cache so channels/movies/series appear immediately.
+    IPTVService.getCachedBootstrap(host, user, pass)
+      .then((cached) => {
         if (activeIdRef.current !== id) return;
-        const nextData = {
-          liveCategories: data.liveCategories || [],
-          liveStreams: data.liveStreams || [],
-          vodCategories: data.vodCategories || [],
-          vodStreams: data.vodStreams || [],
-          seriesCategories: data.seriesCategories || [],
-          seriesStreams: data.seriesStreams || [],
-        };
 
-        setPlaylistData(nextData);
-
-        // Cache categories to localStorage for instant load on next visit
-        try {
-          const cats = {
-            live: data.liveCategories || [],
-            vod: data.vodCategories || [],
-            series: data.seriesCategories || [],
-          };
-          localStorage.setItem(`nova_cats_${id}`, JSON.stringify(cats));
-        } catch {
-          // ignore quota errors
+        if (
+          cached.liveCategories.length ||
+          cached.liveStreams.length ||
+          cached.vodCategories.length ||
+          cached.vodStreams.length ||
+          cached.seriesCategories.length ||
+          cached.seriesStreams.length
+        ) {
+          setPlaylistData((prev) => ({
+            ...prev,
+            liveCategories:
+              cached.liveCategories.length > 0
+                ? cached.liveCategories
+                : prev.liveCategories,
+            liveStreams:
+              cached.liveStreams.length > 0
+                ? cached.liveStreams
+                : prev.liveStreams,
+            vodCategories:
+              cached.vodCategories.length > 0
+                ? cached.vodCategories
+                : prev.vodCategories,
+            vodStreams:
+              cached.vodStreams.length > 0 ? cached.vodStreams : prev.vodStreams,
+            seriesCategories:
+              cached.seriesCategories.length > 0
+                ? cached.seriesCategories
+                : prev.seriesCategories,
+            seriesStreams:
+              cached.seriesStreams.length > 0
+                ? cached.seriesStreams
+                : prev.seriesStreams,
+          }));
         }
 
-        // Mark sections ready based on returned data
-        if ((nextData.liveStreams?.length || 0) > 0) {
-          markSectionReady("live");
+        if (cached.liveStreams.length > 0 || cached.liveCategories.length > 0) {
+          markSectionReady("live", "Live loaded from cache");
         }
-        if ((nextData.vodStreams?.length || 0) > 0) {
-          markSectionReady("vod");
+        if (cached.vodStreams.length > 0 || cached.vodCategories.length > 0) {
+          markSectionReady("vod", "Movies loaded from cache");
         }
-        if ((nextData.seriesStreams?.length || 0) > 0) {
-          markSectionReady("series");
+        if (
+          cached.seriesStreams.length > 0 ||
+          cached.seriesCategories.length > 0
+        ) {
+          markSectionReady("series", "Series loaded from cache");
         }
-
-        setSectionLoadProgress({
-          live: (nextData.liveCategories?.length || nextData.liveStreams?.length) ? 100 : 0,
-          vod: (nextData.vodCategories?.length || nextData.vodStreams?.length) ? 100 : 0,
-          series: (nextData.seriesCategories?.length || nextData.seriesStreams?.length) ? 100 : 0,
-        });
       })
-      .catch((err) => {
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        console.error("Failed to prefetch data:", err);
-        toast.error("Failed to load playlist data. Check connection or credentials.");
-      })
+      .catch(() => {});
+
+    const loadSection = async (section: "live" | "vod" | "series") => {
+      try {
+        if (section === "live") {
+          const [liveCategories, liveStreams] = await Promise.all([
+            IPTVService.getLiveCategories(host, user, pass),
+            IPTVService.getLiveStreams(host, user, pass),
+          ]);
+          if (activeIdRef.current !== id) return;
+
+          setPlaylistData((prev) => ({
+            ...prev,
+            liveCategories,
+            liveStreams,
+          }));
+
+          try {
+            const existing = localStorage.getItem(`nova_cats_${id}`);
+            const parsed = existing ? JSON.parse(existing) : {};
+            localStorage.setItem(
+              `nova_cats_${id}`,
+              JSON.stringify({
+                ...parsed,
+                live: liveCategories,
+              }),
+            );
+          } catch {
+            // ignore cache write failures
+          }
+        }
+
+        if (section === "vod") {
+          const [vodCategories, vodStreams] = await Promise.all([
+            IPTVService.getVodCategories(host, user, pass),
+            IPTVService.getVodStreams(host, user, pass),
+          ]);
+          if (activeIdRef.current !== id) return;
+
+          setPlaylistData((prev) => ({
+            ...prev,
+            vodCategories,
+            vodStreams,
+          }));
+
+          try {
+            const existing = localStorage.getItem(`nova_cats_${id}`);
+            const parsed = existing ? JSON.parse(existing) : {};
+            localStorage.setItem(
+              `nova_cats_${id}`,
+              JSON.stringify({
+                ...parsed,
+                vod: vodCategories,
+              }),
+            );
+          } catch {
+            // ignore cache write failures
+          }
+        }
+
+        if (section === "series") {
+          const [seriesCategories, seriesStreams] = await Promise.all([
+            IPTVService.getSeriesCategories(host, user, pass),
+            IPTVService.getSeries(host, user, pass),
+          ]);
+          if (activeIdRef.current !== id) return;
+
+          setPlaylistData((prev) => ({
+            ...prev,
+            seriesCategories,
+            seriesStreams,
+          }));
+
+          try {
+            const existing = localStorage.getItem(`nova_cats_${id}`);
+            const parsed = existing ? JSON.parse(existing) : {};
+            localStorage.setItem(
+              `nova_cats_${id}`,
+              JSON.stringify({
+                ...parsed,
+                series: seriesCategories,
+              }),
+            );
+          } catch {
+            // ignore cache write failures
+          }
+        }
+
+        if (activeIdRef.current === id) {
+          markSectionReady(section);
+        }
+      } catch (err) {
+        if (activeIdRef.current !== id) return;
+        if (section === "live") setIsFetchingLive(false);
+        if (section === "vod") setIsFetchingVod(false);
+        if (section === "series") setIsFetchingSeries(false);
+        console.error(`Failed to prefetch ${section}:`, err);
+      }
+    };
+
+    Promise.all([
+      loadSection("live"),
+      loadSection("vod"),
+      loadSection("series"),
+    ])
+      .catch(() => {})
       .finally(() => {
+        if (activeIdRef.current !== id) return;
         setIsPrefetching(false);
-        setIsFetchingLive(false);
-        setIsFetchingVod(false);
-        setIsFetchingSeries(false);
       });
 
     // Background refresh every 30 min to pick up updates without blocking UI
@@ -924,7 +1049,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const updateSettings = (newSettings: Partial<Settings>) => {
     if (!activeId) return;
     setSettings((prev) => {
-      const updated = { ...prev, ...newSettings };
+      const updated = normalizeSettings({ ...prev, ...newSettings });
       localStorage.setItem(
         `nova_settings_${activeId}`,
         JSON.stringify(updated),
@@ -969,12 +1094,10 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const savedLocalPlaylists = readStoredPlaylists(LOCAL_PLAYLISTS_STORAGE_KEY);
-    const savedManagedPlaylists = readStoredPlaylists(MANAGED_PLAYLISTS_STORAGE_KEY);
     const savedActiveId = localStorage.getItem(ACTIVE_PLAYLIST_STORAGE_KEY);
-    const combined = [...savedManagedPlaylists, ...savedLocalPlaylists];
+    const combined = [...savedLocalPlaylists];
 
     setLocalPlaylists(savedLocalPlaylists);
-    setManagedPlaylists(savedManagedPlaylists);
 
     if (savedActiveId) {
       setActiveId(savedActiveId);
@@ -1009,7 +1132,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       if (document.visibilityState === "visible") {
         runForcedCheck();
       }
-    }, 45_000);
+    }, 15_000);
 
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -1053,11 +1176,10 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       addedAt: new Date().toISOString(),
     };
     const updated = [...localPlaylists, newPlaylist];
-    const combined = [...managedPlaylists, ...updated];
     setLocalPlaylists(updated);
-    playlistsRef.current = combined;
+    playlistsRef.current = updated;
     setActiveId(newPlaylist.id);
-    localStorage.setItem(LOCAL_PLAYLISTS_STORAGE_KEY, JSON.stringify(updated));
+    persistLocalPlaylists(updated);
     localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, newPlaylist.id);
 
     // Auto-refresh info if it's xtream
@@ -1072,19 +1194,14 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   };
 
   const removePlaylist = (id: string) => {
-    if (id.startsWith("managed:")) {
-      return;
-    }
-
     const nextLocal = localPlaylists.filter((playlist) => playlist.id !== id);
-    const nextCombined = [...managedPlaylists, ...nextLocal];
 
     setLocalPlaylists(nextLocal);
-    playlistsRef.current = nextCombined;
-    localStorage.setItem(LOCAL_PLAYLISTS_STORAGE_KEY, JSON.stringify(nextLocal));
+    playlistsRef.current = nextLocal;
+    persistLocalPlaylists(nextLocal);
 
     if (activeIdRef.current === id) {
-      const nextActiveId = nextCombined[0]?.id || null;
+      const nextActiveId = nextLocal[0]?.id || null;
       setActiveId(nextActiveId);
       if (nextActiveId) {
         localStorage.setItem(ACTIVE_PLAYLIST_STORAGE_KEY, nextActiveId);
@@ -1096,14 +1213,12 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
 
   const logout = () => {
     setLocalPlaylists([]);
-    setManagedPlaylists([]);
     playlistsRef.current = [];
     setActiveId(null);
     setPlaylistData(INITIAL_DATA);
     setFavorites(INITIAL_FAVORITES);
     setSettings(INITIAL_SETTINGS);
     localStorage.removeItem(LOCAL_PLAYLISTS_STORAGE_KEY);
-    localStorage.removeItem(MANAGED_PLAYLISTS_STORAGE_KEY);
     localStorage.removeItem(ACTIVE_PLAYLIST_STORAGE_KEY);
     clearActivationCache();
     void IPTVService.clearAllCaches();
@@ -1143,17 +1258,11 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
           : item,
       );
 
-      const nextLocal = combined.filter((item) => !item.id.startsWith("managed:"));
-      const nextManaged = combined.filter((item) => item.id.startsWith("managed:"));
+      const nextLocal = combined;
 
       setLocalPlaylists(nextLocal);
-      setManagedPlaylists(nextManaged);
       playlistsRef.current = combined;
-      localStorage.setItem(LOCAL_PLAYLISTS_STORAGE_KEY, JSON.stringify(nextLocal));
-      localStorage.setItem(
-        MANAGED_PLAYLISTS_STORAGE_KEY,
-        JSON.stringify(nextManaged),
-      );
+      persistLocalPlaylists(nextLocal);
     } catch (error) {
       console.error("Failed to refresh account info:", error);
       throw error;
@@ -1173,20 +1282,23 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     const host = pl.host!;
     const user = pl.username!;
     const pass = pl.password!;
+    const dedupKey = `live-${pl.id}`;
 
     setIsFetchingLive(true);
     try {
-      const [cats, streams] = await Promise.all([
-        IPTVService.getLiveCategories(host, user, pass),
-        IPTVService.getLiveStreams(host, user, pass),
-      ]);
-      if (activeIdRef.current === pl.id) {
-        setPlaylistData((p) => ({
-          ...p,
-          liveCategories: cats,
-          liveStreams: streams,
-        }));
-      }
+      await requestDedup.deduplicate(dedupKey, async () => {
+        const [cats, streams] = await Promise.all([
+          IPTVService.getLiveCategories(host, user, pass),
+          IPTVService.getLiveStreams(host, user, pass),
+        ]);
+        if (activeIdRef.current === pl.id) {
+          setPlaylistData((p) => ({
+            ...p,
+            liveCategories: cats,
+            liveStreams: streams,
+          }));
+        }
+      });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       console.error("Failed to fetch live data:", error);
@@ -1205,55 +1317,58 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     const host = pl.host!;
     const user = pl.username!;
     const pass = pl.password!;
+    const dedupKey = `vod-${pl.id}`;
 
     setIsFetchingVod(true);
     try {
-      const [catsResult, streamsResult] = await Promise.allSettled([
-        IPTVService.getVodCategories(host, user, pass),
-        IPTVService.getVodStreams(host, user, pass),
-      ]);
+      await requestDedup.deduplicate(dedupKey, async () => {
+        const [catsResult, streamsResult] = await Promise.allSettled([
+          IPTVService.getVodCategories(host, user, pass),
+          IPTVService.getVodStreams(host, user, pass),
+        ]);
 
-      let nextCats =
-        catsResult.status === "fulfilled" ? catsResult.value : playlistData.vodCategories;
-      let nextStreams =
-        streamsResult.status === "fulfilled" ? streamsResult.value : playlistData.vodStreams;
+        let nextCats =
+          catsResult.status === "fulfilled" ? catsResult.value : playlistData.vodCategories;
+        let nextStreams =
+          streamsResult.status === "fulfilled" ? streamsResult.value : playlistData.vodStreams;
 
-      // Provider fallback: if global VOD returns empty but categories exist,
-      // fetch per-category and merge by stream_id.
-      if (nextStreams.length === 0 && nextCats.length > 0) {
-        const categorySettled = await Promise.allSettled(
-          nextCats.map((cat) =>
-            IPTVService.getVodStreams(host, user, pass, cat.category_id),
-          ),
-        );
-        const merged = categorySettled
-          .filter(
-            (r): r is PromiseFulfilledResult<MovieStream[]> =>
-              r.status === "fulfilled",
-          )
-          .flatMap((r) => r.value || []);
-        if (merged.length > 0) {
-          const seen = new Set<number>();
-          nextStreams = merged.filter((item) => {
-            if (!Number.isFinite(item.stream_id)) return false;
-            if (seen.has(item.stream_id)) return false;
-            seen.add(item.stream_id);
-            return true;
-          });
+        // Provider fallback: if global VOD returns empty but categories exist,
+        // fetch per-category and merge by stream_id.
+        if (nextStreams.length === 0 && nextCats.length > 0) {
+          const categorySettled = await Promise.allSettled(
+            nextCats.map((cat) =>
+              IPTVService.getVodStreams(host, user, pass, cat.category_id),
+            ),
+          );
+          const merged = categorySettled
+            .filter(
+              (r): r is PromiseFulfilledResult<MovieStream[]> =>
+                r.status === "fulfilled",
+            )
+            .flatMap((r) => r.value || []);
+          if (merged.length > 0) {
+            const seen = new Set<number>();
+            nextStreams = merged.filter((item) => {
+              if (!Number.isFinite(item.stream_id)) return false;
+              if (seen.has(item.stream_id)) return false;
+              seen.add(item.stream_id);
+              return true;
+            });
+          }
         }
-      }
 
-      if (activeIdRef.current === pl.id) {
-        setPlaylistData((p) => ({
-          ...p,
-          vodCategories: nextCats,
-          vodStreams: nextStreams,
-        }));
-      }
+        if (activeIdRef.current === pl.id) {
+          setPlaylistData((p) => ({
+            ...p,
+            vodCategories: nextCats,
+            vodStreams: nextStreams,
+          }));
+        }
 
-      if (streamsResult.status === "rejected") {
-        throw streamsResult.reason;
-      }
+        if (streamsResult.status === "rejected") {
+          throw streamsResult.reason;
+        }
+      });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       console.error("Failed to fetch VOD data:", error);
@@ -1272,59 +1387,62 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     const host = pl.host!;
     const user = pl.username!;
     const pass = pl.password!;
+    const dedupKey = `series-${pl.id}`;
 
     setIsFetchingSeries(true);
     try {
-      const [catsResult, streamsResult] = await Promise.allSettled([
-        IPTVService.getSeriesCategories(host, user, pass),
-        IPTVService.getSeries(host, user, pass),
-      ]);
+      await requestDedup.deduplicate(dedupKey, async () => {
+        const [catsResult, streamsResult] = await Promise.allSettled([
+          IPTVService.getSeriesCategories(host, user, pass),
+          IPTVService.getSeries(host, user, pass),
+        ]);
 
-      let nextCats =
-        catsResult.status === "fulfilled"
-          ? catsResult.value
-          : playlistData.seriesCategories;
-      let nextStreams =
-        streamsResult.status === "fulfilled"
-          ? streamsResult.value
-          : playlistData.seriesStreams;
+        let nextCats =
+          catsResult.status === "fulfilled"
+            ? catsResult.value
+            : playlistData.seriesCategories;
+        let nextStreams =
+          streamsResult.status === "fulfilled"
+            ? streamsResult.value
+            : playlistData.seriesStreams;
 
-      // Provider fallback: if global series returns empty but categories exist,
-      // fetch per-category and merge by series_id.
-      if (nextStreams.length === 0 && nextCats.length > 0) {
-        const categorySettled = await Promise.allSettled(
-          nextCats.map((cat) =>
-            IPTVService.getSeries(host, user, pass, cat.category_id),
-          ),
-        );
-        const merged = categorySettled
-          .filter(
-            (r): r is PromiseFulfilledResult<SeriesStream[]> =>
-              r.status === "fulfilled",
-          )
-          .flatMap((r) => r.value || []);
-        if (merged.length > 0) {
-          const seen = new Set<number>();
-          nextStreams = merged.filter((item) => {
-            if (!Number.isFinite(item.series_id)) return false;
-            if (seen.has(item.series_id)) return false;
-            seen.add(item.series_id);
-            return true;
-          });
+        // Provider fallback: if global series returns empty but categories exist,
+        // fetch per-category and merge by series_id.
+        if (nextStreams.length === 0 && nextCats.length > 0) {
+          const categorySettled = await Promise.allSettled(
+            nextCats.map((cat) =>
+              IPTVService.getSeries(host, user, pass, cat.category_id),
+            ),
+          );
+          const merged = categorySettled
+            .filter(
+              (r): r is PromiseFulfilledResult<SeriesStream[]> =>
+                r.status === "fulfilled",
+            )
+            .flatMap((r) => r.value || []);
+          if (merged.length > 0) {
+            const seen = new Set<number>();
+            nextStreams = merged.filter((item) => {
+              if (!Number.isFinite(item.series_id)) return false;
+              if (seen.has(item.series_id)) return false;
+              seen.add(item.series_id);
+              return true;
+            });
+          }
         }
-      }
 
-      if (activeIdRef.current === pl.id) {
-        setPlaylistData((p) => ({
-          ...p,
-          seriesCategories: nextCats,
-          seriesStreams: nextStreams,
-        }));
-      }
+        if (activeIdRef.current === pl.id) {
+          setPlaylistData((p) => ({
+            ...p,
+            seriesCategories: nextCats,
+            seriesStreams: nextStreams,
+          }));
+        }
 
-      if (streamsResult.status === "rejected") {
-        throw streamsResult.reason;
-      }
+        if (streamsResult.status === "rejected") {
+          throw streamsResult.reason;
+        }
+      });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       console.error("Failed to fetch series data:", error);

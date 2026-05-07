@@ -1,4 +1,4 @@
-import {
+﻿import {
   useState,
   useEffect,
   useMemo,
@@ -49,6 +49,9 @@ import {
 } from "../services/iptvService";
 import Hls from "hls.js";
 import mpegts from "mpegts.js";
+import { trySwitchPlatformAudioTrack, trySwitchPlatformSubtitleTrack, getPlatformName, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack, webosGetTracks, normalizePlatformTracks, webosReadNativeTracks } from "../lib/platformPlayer";
+import { getMediaApiBaseUrl } from "../lib/activationApi";
+import { focusNext, useTVRemote, handleHeaderZoneKey, focusHeader } from "../lib/remote";
 
 const EpgItem = ({
   program,
@@ -167,14 +170,14 @@ const EpgItem = ({
 };
 
 const MiniPlayer = ({
-  url,
+  urls,
   poster,
   title,
   onNext,
   onPrev,
   videoRef: externalVideoRef,
 }: {
-  url: string;
+  urls: string[];
   poster: string;
   title: string;
   onNext?: () => void;
@@ -184,6 +187,7 @@ const MiniPlayer = ({
   const { settings } = usePlaylist();
   const internalVideoRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalVideoRef || internalVideoRef;
+  const platformPlayerRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const mpegtsRef = useRef<any>(null);
@@ -200,9 +204,8 @@ const MiniPlayer = ({
   );
   const [isPipAvailable, setIsPipAvailable] = useState(false);
 
-  const fallbackCountRef = useRef(0);
-  const lastBaseUrlRef = useRef("");
   const lastVolumeRef = useRef(0.8);
+  const startupTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // HLS State
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
@@ -219,8 +222,20 @@ const MiniPlayer = ({
   const [stabilityMode, setStabilityMode] = useState<"stable" | "ultra">(
     "stable",
   );
+  const [streamAttemptIndex, setStreamAttemptIndex] = useState(0);
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const streamCandidates = useMemo(() => {
+    const sanitized = (Array.isArray(urls) ? urls : [])
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+    return Array.from(new Set(sanitized));
+  }, [urls]);
+
+  useEffect(() => {
+    setStreamAttemptIndex(0);
+  }, [streamCandidates.join("|")]);
 
   const resetControlsTimeout = useCallback(() => {
     if (isLocked) return;
@@ -244,412 +259,254 @@ const MiniPlayer = ({
     };
   }, [resetControlsTimeout]);
 
+  // TV remote control â€” only active when the player is fullscreen so keys
+  // don't conflict with the channel-list navigation in the parent view.
   useEffect(() => {
-    if (!videoRef.current || !url) return;
+    if (!isFullscreen) return;
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (!key) return;
+      // Consume the event so the parent onTVKey doesn't also react.
+      e.stopImmediatePropagation();
+      resetControlsTimeout();
+      if (key === "back") {
+        document.exitFullscreen();
+        return;
+      }
+      if (key === "enter" || key === "playpause") {
+        if (!isLocked) {
+          if (videoRef.current) {
+            if (isPlaying) { videoRef.current.pause(); setIsPlaying(false); setShowControls(true); }
+            else { videoRef.current.play().catch(() => {}); setIsPlaying(true); }
+          }
+        }
+        return;
+      }
+      if ((key === "left" || key === "rewind") && !isLocked) { onPrev?.(); return; }
+      if ((key === "right" || key === "fastforward") && !isLocked) { onNext?.(); return; }
+      if (key === "up" && !isLocked) { setVolume((v) => Math.min(100, v + 5)); return; }
+      if (key === "down" && !isLocked) { setVolume((v) => Math.max(0, v - 5)); return; }
+      if (key === "red" && !isLocked) {
+        setIsMuted((m) => !m);
+        return;
+      }
+    };
+    window.addEventListener("tv-remote-key", handler);
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, [isFullscreen, isPlaying, isLocked, onPrev, onNext, resetControlsTimeout, videoRef]);
+
+  useEffect(() => {
+    const activeUrl = streamCandidates[streamAttemptIndex] || "";
+    if (!activeUrl || !videoRef.current) return;
     const video = videoRef.current;
+    const platform = getPlatformName();
+    const base = getMediaApiBaseUrl() || window.location.origin;
+    const proxiedUrl = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(activeUrl)}`;
+    const isPackagedMode = window.location.protocol === "file:";
+    const isDefaultFallbackMediaBase = /192\.168\.56\.1:(4000|5000)/i.test(base);
+    const canUseProxyFallback = !(isPackagedMode && isDefaultFallbackMediaBase);
+    const canTryNextCandidate = streamAttemptIndex < streamCandidates.length - 1;
+    const tryNextCandidate = () => {
+      if (!canTryNextCandidate) return false;
+      setStreamAttemptIndex((previous) => previous + 1);
+      return true;
+    };
+    // â”€â”€â”€ NEW CLEAN PLAYBACK ENGINE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    // Reset state for new channel
     setIsLoading(true);
+    setIsBuffering(false);
     setIsPlaying(true);
     setAudioTracks([]);
     setSubtitleTracks([]);
-    const baseUrl = url.substring(0, url.lastIndexOf("."));
-    if (lastBaseUrlRef.current !== baseUrl) {
-      fallbackCountRef.current = 0;
-      lastBaseUrlRef.current = baseUrl;
-    }
+    setCurrentAudioTrack(-1);
+    setCurrentSubtitleTrack(-1);
 
-    let proxiedUrl = `${window.location.origin}/api/proxy?url=${encodeURIComponent(url)}`;
+    // Tear down previous engine
+    if (startupTimerRef.current) { clearTimeout(startupTimerRef.current); startupTimerRef.current = null; }
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+    if (mpegtsRef.current) { mpegtsRef.current.destroy(); mpegtsRef.current = null; }
 
-    const isM3U8 = url.includes(".m3u8") || !url.includes(".ts");
-    const isTS = !isM3U8 && url.includes(".ts");
+    let cleaned = false;
+    let nativeErrorHandler: (() => void) | null = null;
 
-    const tryMpegts = () => {
-      if (
-        mpegts.getFeatureList().mseLivePlayback ||
-        mpegts.getFeatureList().msePlayback
-      ) {
-        try {
-          if (mpegtsRef.current) {
-            mpegtsRef.current.destroy();
-          }
+    const onCanPlay = () => { setIsLoading(false); setIsBuffering(false); };
+    const onPlaying = () => { setIsLoading(false); setIsBuffering(false); };
+    const onWaiting = () => setIsBuffering(true);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("waiting", onWaiting);
 
-          mpegtsRef.current = mpegts.createPlayer(
-            {
-              type: "mpegts",
-              url: proxiedUrl,
-              isLive: true,
-              cors: true,
-              withCredentials: false,
-            },
-            {
-              enableWorker: true,
-              stashInitialSize:
-                stabilityMode === "ultra" ? 1024 * 1024 : 1024 * 256,
-              enableStashBuffer: true,
-              autoCleanupSourceBuffer: true,
-              liveBufferLatencyChasing: stabilityMode === "stable",
-              liveBufferLatencyChasingOnPaused: true,
-              lazyLoad: false,
-              deferLoadAfterSourceOpen: false,
-            },
-          );
-
-          mpegtsRef.current.attachMediaElement(video);
-          mpegtsRef.current.load();
-
-          const playPromise = mpegtsRef.current.play();
-          if (playPromise instanceof Promise) {
-            playPromise.catch((e) => {
-              if (e.name !== "AbortError")
-                console.log("mpegts.js play failed:", e);
-            });
-          }
-
-          mpegtsRef.current.on(
-            mpegts.Events.ERROR,
-            (type: string, detail: string, info: any) => {
-              console.error("mpegts.js error:", type, detail, info);
-              if (fallbackCountRef.current < 2) {
-                fallbackCountRef.current += 1;
-                console.log(
-                  `mpegts error, retrying... (attempt ${fallbackCountRef.current}/2)`,
-                );
-                try {
-                  if (mpegtsRef.current) {
-                    mpegtsRef.current.unload();
-                    mpegtsRef.current.load();
-                    mpegtsRef.current.play().catch(() => {});
-                  }
-                } catch (e) {
-                  if (mpegtsRef.current) {
-                    mpegtsRef.current.destroy();
-                    mpegtsRef.current = null;
-                  }
-                  video.src = proxiedUrl;
-                  video.play().catch(() => {});
-                }
-              } else {
-                console.log(
-                  "mpegts failed after retries, falling back to native playback...",
-                );
-                if (mpegtsRef.current) {
-                  mpegtsRef.current.destroy();
-                  mpegtsRef.current = null;
-                }
-                video.src = proxiedUrl;
-                video.play().catch(() => {});
-              }
-            },
-          );
-
-          mpegtsRef.current.on(mpegts.Events.METADATA_ARRIVED, () => {
-            setIsLoading(false);
-          });
-        } catch (e) {
-          console.error("Failed to initialize mpegts.js:", e);
-          // Fallback
-          video.src = proxiedUrl;
-          video.play().catch(() => {});
-        }
-      } else {
-        // No MSE support, try native
-        video.src = proxiedUrl;
-        video.play().catch(() => {});
-      }
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (startupTimerRef.current) { clearTimeout(startupTimerRef.current); startupTimerRef.current = null; }
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      if (mpegtsRef.current) { mpegtsRef.current.destroy(); mpegtsRef.current = null; }
+      if (nativeErrorHandler) { video.removeEventListener("error", nativeErrorHandler); nativeErrorHandler = null; }
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("waiting", onWaiting);
     };
 
-    const probePlaylist = async () => {
-      if (!isM3U8) return true;
-      try {
-        const controller = new AbortController();
-        const to = setTimeout(() => controller.abort(), 7000);
-        const resp = await fetch(proxiedUrl, {
-          method: "GET",
-          signal: controller.signal,
-          headers: {
-            Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-          },
-        });
-        clearTimeout(to);
-        if (!resp.ok) {
-          // proceed to try forced/alternate probes below
-        } else {
-          // read only the first chunk to detect playlist signature
-          const reader = resp.body?.getReader();
-          if (reader) {
-            const { value, done } = await reader.read();
-            if (!done && value) {
-              const sig = new TextDecoder().decode(
-                value.slice(0, Math.min(1024, value.length)),
-              );
-              if (
-                sig.startsWith("#EXTM3U") ||
-                /#EXTINF|#EXT-X-STREAM-INF/.test(sig)
-              ) {
-                return true;
-              }
-            }
-            const ct = resp.headers.get("content-type") || "";
-            if (/mpegurl|vnd.apple|application\/x-mpegURL|text\//i.test(ct))
-              return true;
-          } else {
-            const txt = await resp.text();
-            if (
-              txt &&
-              (txt.startsWith("#EXTM3U") ||
-                /#EXTINF|#EXT-X-STREAM-INF/.test(txt))
-            )
-              return true;
-          }
-        }
+    // Browser-parity playback path for all platforms, including webOS.
+    // This keeps stream handling consistent across desktop and TV.
+    const ext = activeUrl.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
+    const isM3U8 = ext === "m3u8" || !["ts", "mp4", "mkv", "avi"].includes(ext);
+    const isTS = ext === "ts";
+    // In packaged TV mode, prefer backend proxy first (same as browser parity
+    // workflow) to avoid provider CORS/playlist issues on device engines.
+    const preferProxyFirst =
+      window.location.protocol === "file:" &&
+      canUseProxyFallback &&
+      platform !== "webos";
+    const primaryUrl = preferProxyFirst ? proxiedUrl : activeUrl;
+    const secondaryUrl = preferProxyFirst ? activeUrl : (canUseProxyFallback ? proxiedUrl : activeUrl);
 
-        // Try forced manifest bypass (server-side ?force=1 to skip type-checks)
-        try {
-          const controller2 = new AbortController();
-          const to2 = setTimeout(() => controller2.abort(), 7000);
-          const forceUrl = `${proxiedUrl}&force=1`;
-          const r2 = await fetch(forceUrl, {
-            method: "GET",
-            signal: controller2.signal,
-            headers: {
-              Accept:
-                "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-            },
-          });
-          clearTimeout(to2);
-          if (r2.ok) {
-            const reader2 = r2.body?.getReader();
-            if (reader2) {
-              const { value: v2, done: d2 } = await reader2.read();
-              if (!d2 && v2) {
-                const sig2 = new TextDecoder().decode(
-                  v2.slice(0, Math.min(1024, v2.length)),
-                );
-                if (
-                  sig2.startsWith("#EXTM3U") ||
-                  /#EXTINF|#EXT-X-STREAM-INF/.test(sig2)
-                ) {
-                  proxiedUrl = forceUrl;
-                  return true;
-                }
-              }
-            }
-            const txt2 = await r2.text();
-            if (
-              txt2 &&
-              (txt2.startsWith("#EXTM3U") ||
-                /#EXTINF|#EXT-X-STREAM-INF/.test(txt2))
-            ) {
-              proxiedUrl = forceUrl;
-              return true;
-            }
-          }
-        } catch (ee) {
-          /* ignore forced probe errors */
-        }
-
-        // Try TS fallback (replace .m3u8 with .ts) and set proxiedUrl so tryMpegts will use it
-        try {
-          const tsUrl = url.replace(/\.m3u8(\?.*)?$/i, ".ts");
-          if (tsUrl && tsUrl !== url) {
-            const proxiedTs = `${window.location.origin}/api/proxy?url=${encodeURIComponent(tsUrl)}&force=1`;
-            const r3 = await fetch(proxiedTs, {
-              method: "GET",
-              headers: { Range: "bytes=0-8191" },
-            });
-            if (r3.ok) {
-              const ct3 = r3.headers.get("content-type") || "";
-              const len3 =
-                parseInt(r3.headers.get("content-length") || "0", 10) || 0;
-              if (/video|mpeg|ts|octet-stream/i.test(ct3) || len3 > 0) {
-                proxiedUrl = proxiedTs;
-                return false; // tell caller to skip HLS and fallback to TS
-              }
-            }
-          }
-        } catch (ee) {
-          /* ignore ts probe errors */
-        }
-
-        // Final: request server-side diagnostic probe to gather headers/snapshot
-        try {
-          fetch(
-            `${window.location.origin}/api/proxy-test?url=${encodeURIComponent(
-              url,
-            )}`,
-          )
-            .then((r) => r.json())
-            .then((d) => {
-              console.log("proxy-test:", d);
-              toast.error(
-                "Stream appears blocked; diagnostics logged to console",
-              );
-            })
-            .catch(() => {});
-        } catch (ee) {
-          /* noop */
-        }
-
-        return false;
-      } catch (e) {
-        console.log("playlist probe error:", e?.message || e);
-        return false;
-      }
-    };
-
-    if (isM3U8) {
-      if (Hls.isSupported()) {
-        if (hlsRef.current) hlsRef.current.destroy();
-
-        const isUltra = stabilityMode === "ultra";
-        const hls = new Hls({
-          // Worker & crypto (native Web Crypto API = hardware AES decrypt)
-          enableWorker: true,
-          enableSoftwareAES: false,
-
-          // Prefer stability over low latency on slow networks.
-          lowLatencyMode: false,
-          backBufferLength: isUltra ? 30 : 20,
-          liveSyncDurationCount: isUltra ? 10 : 6,
-          liveMaxLatencyDurationCount: isUltra ? 20 : 12,
-
-          // Buffer tuning
-          startLevel: -1,
-          maxBufferLength: isUltra ? 30 : 15,
-          maxMaxBufferLength: isUltra ? 60 : 30,
-          maxBufferSize: (isUltra ? 48 : 24) * 1000 * 1000,
-          maxBufferHole: 0.5,
-          highBufferWatchdogPeriod: 3,
-          nudgeMaxRetry: 6,
-
-          // ABR
-          capLevelToPlayerSize: true,
-          abrEwmaDefaultEstimate: 800_000,
-          abrBandWidthFactor: 0.8,
-          abrBandWidthUpFactor: 0.65,
-          testBandwidth: false,
-
-          // Loading
-          autoStartLoad: true,
-          startFragPrefetch: false,
-          progressive: true,
-          fragLoadingMaxRetry: 20,
-          manifestLoadingMaxRetry: 8,
-          levelLoadingMaxRetry: 8,
-          fragLoadingTimeOut: 60_000,
-          manifestLoadingTimeOut: 45_000,
-          levelLoadingTimeOut: 45_000,
-        });
-
-        hlsRef.current = hls;
-        (async () => {
-          const ok = await probePlaylist();
-          if (!ok) {
-            console.warn(
-              "Playlist probe failed, falling back to MPEG-TS/native for:",
-              url,
-            );
-            tryMpegts();
-            return;
-          }
-          hls.loadSource(proxiedUrl);
-          hls.attachMedia(video);
-        })();
-
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          setIsLoading(false);
-          setAudioTracks(hls.audioTracks || []);
-          setCurrentAudioTrack(hls.audioTrack);
-          setSubtitleTracks(hls.subtitleTracks || []);
-          setCurrentSubtitleTrack(hls.subtitleTrack);
-          video.play().catch(() => setIsPlaying(false));
-        });
-
-        hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
-          setCurrentAudioTrack(data.id);
-        });
-
-        hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (event, data) => {
-          setCurrentSubtitleTrack(data.id);
-        });
-
-        hls.on(Hls.Events.ERROR, (event, data) => {
-          if (!data.fatal) return;
-          console.error(
-            "Fatal HLS error in MiniPlayer:",
-            data.type,
-            data.details,
-          );
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              if (fallbackCountRef.current < 3) {
-                fallbackCountRef.current++;
-                console.log(
-                  `HLS network error, retrying (${fallbackCountRef.current}/3)...`,
-                );
-                hls.startLoad();
-              } else {
-                console.log(
-                  "HLS network failed after retries, falling back to mpegts...",
-                );
-                hls.destroy();
-                hlsRef.current = null;
-                tryMpegts();
-              }
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              if (fallbackCountRef.current < 2) {
-                fallbackCountRef.current++;
-                console.log(
-                  `HLS media error, recovering (${fallbackCountRef.current}/2)...`,
-                );
-                hls.recoverMediaError();
-              } else {
-                console.log(
-                  "HLS media error unrecoverable, falling back to native...",
-                );
-                hls.destroy();
-                hlsRef.current = null;
-                video.src = proxiedUrl;
-                video.play().catch(() => {});
-              }
-              break;
-            default:
-              console.log("HLS fatal error, falling back to native...");
-              hls.destroy();
-              hlsRef.current = null;
-              video.src = proxiedUrl;
-              video.play().catch(() => {});
-              break;
-          }
-        });
-      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = proxiedUrl;
-        video.addEventListener("loadedmetadata", () => {
-          setIsLoading(false);
-          video.play().catch(() => setIsPlaying(false));
-        });
-      }
-    } else if (isTS) {
-      tryMpegts();
-    } else {
-      video.src = proxiedUrl;
-      video.addEventListener("loadedmetadata", () => {
+    if (isM3U8 && Hls.isSupported()) {
+      const isUltra = stabilityMode === "ultra";
+      const hls = new Hls({
+        enableWorker: true,
+        enableSoftwareAES: false,
+        lowLatencyMode: false,
+        startLevel: -1,
+        maxBufferLength: isUltra ? 30 : 15,
+        maxMaxBufferLength: isUltra ? 60 : 30,
+        maxBufferSize: (isUltra ? 48 : 24) * 1000 * 1000,
+        fragLoadingMaxRetry: 10,
+        manifestLoadingMaxRetry: 5,
+        levelLoadingMaxRetry: 5,
+        fragLoadingTimeOut: 30_000,
+        manifestLoadingTimeOut: 20_000,
+        levelLoadingTimeOut: 20_000,
+        capLevelToPlayerSize: true,
+        autoStartLoad: true,
+      });
+      hlsRef.current = hls;
+      let switchedToSecondary = false;
+      hls.loadSource(primaryUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
         setIsLoading(false);
+        setAudioTracks(hls.audioTracks || []);
+        setCurrentAudioTrack(hls.audioTrack);
+        setSubtitleTracks(hls.subtitleTracks || []);
+        setCurrentSubtitleTrack(hls.subtitleTrack);
         video.play().catch(() => setIsPlaying(false));
       });
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_e: any, data: any) => setCurrentAudioTrack(data.id));
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (_e: any, data: any) => setCurrentSubtitleTrack(data.id));
+      let hlsRetries = 0;
+      hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
+        if (!data.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !switchedToSecondary && secondaryUrl !== primaryUrl) {
+          switchedToSecondary = true;
+          hlsRetries = 0;
+          hls.loadSource(secondaryUrl);
+          hls.startLoad();
+        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR && hlsRetries < 3) {
+          hlsRetries++;
+          hls.startLoad();
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsRetries < 2) {
+          hlsRetries++;
+          hls.recoverMediaError();
+        } else {
+          if (tryNextCandidate()) return;
+          hls.destroy();
+          hlsRef.current = null;
+          video.src = secondaryUrl;
+          video.load();
+          video.play().catch(() => {});
+        }
+      });
+    } else if (isM3U8 && video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Safari / native HLS
+      let switchedToSecondary = false;
+      const nativeErr = () => {
+        if (switchedToSecondary || cleaned) return;
+        switchedToSecondary = true;
+        if (secondaryUrl === primaryUrl) {
+          // No usable proxy fallback for this environment.
+          if (tryNextCandidate()) return;
+          setIsPlaying(false);
+          return;
+        }
+        video.src = secondaryUrl;
+        video.load();
+        video.play().catch(() => setIsPlaying(false));
+      };
+      video.addEventListener("error", nativeErr, { once: true });
+      video.src = primaryUrl;
+      video.load();
+      video.play().catch(() => setIsPlaying(false));
+    } else if (isTS && (mpegts.getFeatureList().mseLivePlayback || mpegts.getFeatureList().msePlayback)) {
+      let switchedToSecondary = false;
+      const player = mpegts.createPlayer(
+        { type: "mpegts", url: primaryUrl, isLive: true, cors: true, withCredentials: false },
+        {
+          enableWorker: true,
+          enableStashBuffer: true,
+          stashInitialSize: stabilityMode === "ultra" ? 1024 * 1024 : 1024 * 256,
+          autoCleanupSourceBuffer: true,
+          liveBufferLatencyChasing: stabilityMode === "stable",
+        },
+      );
+      mpegtsRef.current = player;
+      player.attachMediaElement(video);
+      player.load();
+      const _pp = player.play();
+      if (_pp instanceof Promise) _pp.catch(() => {});
+      player.on(mpegts.Events.ERROR, () => {
+        if (!switchedToSecondary && secondaryUrl !== primaryUrl) {
+          switchedToSecondary = true;
+          player.destroy();
+          mpegtsRef.current = null;
+          const fallbackPlayer = mpegts.createPlayer(
+            { type: "mpegts", url: secondaryUrl, isLive: true, cors: true, withCredentials: false },
+            {
+              enableWorker: true,
+              enableStashBuffer: true,
+              stashInitialSize: stabilityMode === "ultra" ? 1024 * 1024 : 1024 * 256,
+              autoCleanupSourceBuffer: true,
+              liveBufferLatencyChasing: stabilityMode === "stable",
+            },
+          );
+          mpegtsRef.current = fallbackPlayer;
+          fallbackPlayer.attachMediaElement(video);
+          fallbackPlayer.load();
+          const p = fallbackPlayer.play();
+          if (p instanceof Promise) p.catch(() => {});
+          return;
+        }
+        player.destroy();
+        mpegtsRef.current = null;
+        if (tryNextCandidate()) return;
+        video.src = secondaryUrl;
+        video.play().catch(() => {});
+      });
+    } else {
+      let switchedToSecondary = false;
+      const nativeErr = () => {
+        if (switchedToSecondary || cleaned) return;
+        switchedToSecondary = true;
+        if (secondaryUrl === primaryUrl) {
+          // No usable proxy fallback for this environment.
+          if (tryNextCandidate()) return;
+          setIsPlaying(false);
+          return;
+        }
+        video.src = secondaryUrl;
+        video.load();
+        video.play().catch(() => setIsPlaying(false));
+      };
+      video.addEventListener("error", nativeErr, { once: true });
+      video.src = primaryUrl;
+      video.load();
+      video.play().catch(() => setIsPlaying(false));
     }
 
-    return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
-      if (mpegtsRef.current) {
-        mpegtsRef.current.destroy();
-        mpegtsRef.current = null;
-      }
-    };
-  }, [url, stabilityMode]);
+    return cleanup;
+  }, [stabilityMode, streamAttemptIndex, streamCandidates]);
 
   const togglePlay = (e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -764,8 +621,7 @@ const MiniPlayer = ({
         style={{ transform: "translateZ(0)", willChange: "transform" }}
         poster={poster || undefined}
         playsInline
-        crossOrigin="anonymous"
-        preload="metadata"
+        preload="auto"
         onPlay={() => {
           setIsPlaying(true);
           setIsBuffering(false);
@@ -1092,8 +948,14 @@ const MiniPlayer = ({
                             <button
                               key={idx}
                               onClick={() => {
-                                if (hlsRef.current)
-                                  hlsRef.current.audioTrack = idx;
+                                const v = (document.querySelector('video') as HTMLVideoElement) || null;
+                                // Try platform API first (Tizen AVPlay)
+                                if (trySwitchPlatformAudioTrack(v, idx)) {
+                                  setActiveMenu("none");
+                                  setCurrentAudioTrack(idx);
+                                  return;
+                                }
+                                if (hlsRef.current) hlsRef.current.audioTrack = idx;
                                 setActiveMenu("none");
                               }}
                               className={cn(
@@ -1139,8 +1001,13 @@ const MiniPlayer = ({
                           </div>
                           <button
                             onClick={() => {
-                              if (hlsRef.current)
-                                hlsRef.current.subtitleTrack = -1;
+                              const v = (document.querySelector('video') as HTMLVideoElement) || null;
+                              if (trySwitchPlatformSubtitleTrack(v, -1)) {
+                                setActiveMenu("none");
+                                setCurrentSubtitleTrack(-1);
+                                return;
+                              }
+                              if (hlsRef.current) hlsRef.current.subtitleTrack = -1;
                               setActiveMenu("none");
                             }}
                             className={cn(
@@ -1156,8 +1023,13 @@ const MiniPlayer = ({
                             <button
                               key={idx}
                               onClick={() => {
-                                if (hlsRef.current)
-                                  hlsRef.current.subtitleTrack = idx;
+                                const v = (document.querySelector('video') as HTMLVideoElement) || null;
+                                if (trySwitchPlatformSubtitleTrack(v, idx)) {
+                                  setActiveMenu("none");
+                                  setCurrentSubtitleTrack(idx);
+                                  return;
+                                }
+                                if (hlsRef.current) hlsRef.current.subtitleTrack = idx;
                                 setActiveMenu("none");
                               }}
                               className={cn(
@@ -1197,13 +1069,8 @@ const MiniPlayer = ({
 // Persists across component mounts so failed logos are never retried.
 const failedImageCache = new Set<string>();
 
-const toProxyAssetUrl = (src?: string) => {
-  if (!src || src.trim() === "") return "";
-  if (/^https?:\/\//i.test(src)) {
-    return `${window.location.origin}/api/proxy?url=${encodeURIComponent(src)}`;
-  }
-  return src;
-};
+// Images in <img> tags load cross-origin natively without CORS proxying.
+const toProxyAssetUrl = (src?: string) => (src?.trim() || "");
 
 const CHANNEL_BATCH_SIZE = 50;
 const CATEGORY_DIVIDER_PATTERN = /^#+\s*[^#]+\s*#+$/;
@@ -1221,7 +1088,7 @@ const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
     () => !resolvedSrc || failedImageCache.has(resolvedSrc),
   );
 
-  // Virtual lists reuse component instances with new props — the useState
+  // Virtual lists reuse component instances with new props â€” the useState
   // initializer only runs on mount, so we must sync `error` whenever `src` changes.
   useEffect(() => {
     setError(!resolvedSrc || failedImageCache.has(resolvedSrc));
@@ -1277,36 +1144,45 @@ const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
   );
 };
 
-const ChannelRow = memo(({ channel, isSelected, isFavorite, onSelect, onHover }: {
+const ChannelRow = memo(({ channel, isSelected, isFavorite, isTVFocused, onSelect, onHover }: {
   channel: any;
   isSelected: boolean;
   isFavorite: boolean;
+  isTVFocused?: boolean;
   onSelect: (ch: any) => void;
   onHover: (ch: any) => void;
 }) => {
   return (
     <div>
       <button
+        data-tv-focusable
         onMouseEnter={() => onHover(channel)}
         onFocus={() => onHover(channel)}
         onClick={() => onSelect(channel)}
         className={cn(
-          "flex items-center gap-4 w-full h-[72px] px-6 text-left transition-all",
-          "hover:bg-white/5 border-b border-white/5",
-          isSelected && "bg-primary/20",
+          "tv-channel-row flex items-center gap-3 w-full h-[82px] px-4 text-left transition-all mx-2 my-1",
+          "hover:bg-white/6",
+          isSelected && "tv-channel-row--selected",
+          isTVFocused && !isSelected && "tv-channel-row--focus",
         )}
       >
+        <div className="w-10 text-xs text-white/40 font-semibold tabular-nums">{channel.num ?? "-"}</div>
         <div className="w-12 h-8 bg-white/5 rounded overflow-hidden flex-shrink-0">
           <ChannelIcon src={channel.stream_icon} alt={channel.name} />
         </div>
-        <span
-          className={cn(
-            "text-lg font-medium truncate flex-1",
-            isSelected ? "text-white" : "text-white/80",
-          )}
-        >
-          {channel.name}
-        </span>
+        <div className="flex-1 min-w-0">
+          <span
+            className={cn(
+              "block text-lg font-medium truncate",
+              isSelected ? "text-white" : "text-white/80",
+            )}
+          >
+            {channel.name}
+          </span>
+          <span className="block text-[11px] text-white/35 uppercase tracking-wide">
+            Live Channel
+          </span>
+        </div>
         <div className="flex items-center gap-2">
           {isSelected && (
             <div className="flex items-center gap-1 px-2 py-1 bg-primary/20 rounded text-[10px] text-primary font-bold uppercase">
@@ -1356,6 +1232,7 @@ export default function LiveTV() {
   const [isEpgLoading, setIsEpgLoading] = useState(false);
   const [guideNow, setGuideNow] = useState(() => Date.now());
   const [showPinModal, setShowPinModal] = useState(false);
+  const pinModalRef = useRef<HTMLDivElement | null>(null);
   const [pinInput, setPinInput] = useState("");
   const [pendingLockedCategoryId, setPendingLockedCategoryId] = useState<
     string | null
@@ -1447,7 +1324,7 @@ export default function LiveTV() {
           : [];
         setEpgData(listings);
       } catch {
-        // EPG is best-effort — many channels simply don't have it; swallow silently
+        // EPG is best-effort â€” many channels simply don't have it; swallow silently
         setEpgData([]);
       } finally {
         setIsEpgLoading(false);
@@ -1493,12 +1370,18 @@ export default function LiveTV() {
   const categories = useMemo(() => {
     const cats = playlistData.liveCategories || [];
     if (isParentalUnlocked) return cats;
-    return cats.filter(
-      (cat) =>
-        !settings.hiddenCategories.live.includes(
-          normalizeCategoryId(cat.category_id),
-        ),
+
+    const hidden = new Set(
+      (settings.hiddenCategories.live || []).map((id) =>
+        normalizeCategoryId(id),
+      ),
     );
+    const visible = cats.filter(
+      (cat) => !hidden.has(normalizeCategoryId(cat.category_id)),
+    );
+
+    // If all categories were effectively hidden (or ids mismatched), avoid rendering an empty Live UI.
+    return visible.length > 0 ? visible : cats;
   }, [
     playlistData.liveCategories,
     settings.hiddenCategories.live,
@@ -1508,17 +1391,39 @@ export default function LiveTV() {
   const streams = useMemo(() => {
     const allStreams = playlistData.liveStreams || [];
     if (isParentalUnlocked) return allStreams;
-    return allStreams.filter(
-      (stream) =>
-        !settings.hiddenCategories.live.includes(
-          normalizeCategoryId(stream.category_id),
-        ),
+
+    const hidden = new Set(
+      (settings.hiddenCategories.live || []).map((id) =>
+        normalizeCategoryId(id),
+      ),
     );
+    const visible = allStreams.filter(
+      (stream) => !hidden.has(normalizeCategoryId(stream.category_id)),
+    );
+
+    // Prevent accidental full hide from leaving channels list empty.
+    return visible.length > 0 ? visible : allStreams;
   }, [
     playlistData.liveStreams,
     settings.hiddenCategories.live,
     isParentalUnlocked,
   ]);
+
+  useEffect(() => {
+    const normalizedActive = normalizeCategoryId(activeCategory);
+    if (normalizedActive === "all" || normalizedActive === "fav") return;
+
+    const stillExists = categories.some(
+      (category) =>
+        normalizeCategoryId(category.category_id) === normalizedActive,
+    );
+
+    if (!stillExists) {
+      setActiveCategory("all");
+      setFocusIndex(0);
+      setHoveredChannel(null);
+    }
+  }, [activeCategory, categories]);
 
   const listableChannels = useMemo(
     () => streams.filter(isListableLiveChannel),
@@ -1596,6 +1501,8 @@ export default function LiveTV() {
   const sentinelRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const previewPanelRef = useRef<HTMLDivElement>(null);
+  const shouldFocusListAfterCategorySelectRef = useRef(false);
 
   // Reset display limit when category or search changes
   useEffect(() => {
@@ -1645,8 +1552,41 @@ export default function LiveTV() {
   }, [displayLimit, deferredChannels.length, loadMoreChannels]);
   // TV navigation state
   const [focusIndex, setFocusIndex] = useState(0);
+  // Which panel owns D-pad focus: sidebar categories or channel list
+  const [sidebarTVFocus, setSidebarTVFocus] = useState(false);
   // Color button action feedback
   const [colorAction, setColorAction] = useState<string>("");
+
+  const focusChannelListAt = useCallback(
+    (targetIndex = 0) => {
+      const total = displayedChannels.length;
+      if (total <= 0) return false;
+
+      const nextIndex = Math.max(0, Math.min(targetIndex, total - 1));
+      setSidebarTVFocus(false);
+      setFocusIndex(nextIndex);
+      setHoveredChannel(displayedChannels[nextIndex]);
+
+      requestAnimationFrame(() => {
+        const root = scrollContainerRef.current;
+        if (!root) return;
+        const rows = root.querySelectorAll<HTMLButtonElement>("button[data-tv-focusable]");
+        const row = rows[nextIndex] || rows[0];
+        row?.focus();
+        row?.scrollIntoView({ block: "nearest", behavior: "auto" });
+      });
+
+      return true;
+    },
+    [displayedChannels],
+  );
+
+  useEffect(() => {
+    if (!shouldFocusListAfterCategorySelectRef.current) return;
+    if (!displayedChannels.length) return;
+    shouldFocusListAfterCategorySelectRef.current = false;
+    focusChannelListAt(0);
+  }, [displayedChannels, focusChannelListAt]);
 
   const showColorAction = useCallback((message: string) => {
     setColorAction(message);
@@ -1708,10 +1648,70 @@ export default function LiveTV() {
     showColorAction(searchQuery ? "Search focused" : "Search ready");
   }, [searchQuery, showColorAction]);
 
+  const focusFirstPreviewControl = useCallback(() => {
+    const root = previewPanelRef.current;
+    if (!root) return false;
+    const first = root.querySelector<HTMLElement>(
+      "[data-tv-focusable], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])",
+    );
+    if (!first) return false;
+    first.focus();
+    return true;
+  }, []);
+
   useEffect(() => {
     // TV remote navigation
     const onTVKey = (e: Event) => {
       const key = (e as CustomEvent).detail?.key;
+      const active = document.activeElement as HTMLElement | null;
+      const inPreviewPanel = !!(
+        previewPanelRef.current &&
+        active &&
+        previewPanelRef.current.contains(active)
+      );
+
+      if (showPinModal) {
+        return;
+      }
+
+      // When focus is in the right preview panel, navigate controls spatially.
+      if (inPreviewPanel) {
+        if (key === "enter" || key === "select") {
+          active?.click();
+          return;
+        }
+        if (key === "up" || key === "down" || key === "right") {
+          focusNext(key, { root: previewPanelRef.current });
+          return;
+        }
+        if (key === "left") {
+          const before = document.activeElement as HTMLElement | null;
+          focusNext("left", { root: previewPanelRef.current });
+          // If there is no more control to the left in preview panel,
+          // hand control back to the channel list navigation.
+          if (document.activeElement === before) {
+            before?.blur();
+          }
+          return;
+        }
+        if (key === "back") {
+          active?.blur();
+          return;
+        }
+      }
+
+      // Header zone: left/right navigate within navbar; down escapes to channel list
+      if (handleHeaderZoneKey(key, { onBack: () => navigate('/') })) return;
+
+      // While sidebar owns focus, channel-list navigation must remain frozen.
+      if (sidebarTVFocus) {
+        if (key === "back") {
+          setSidebarTVFocus(false);
+          return;
+        }
+        return;
+      }
+
       if (key === "green") {
         focusSearch();
         return;
@@ -1735,10 +1735,20 @@ export default function LiveTV() {
 
       if (!displayedChannels.length) return;
 
-      if (["down", "up"].includes(key)) {
+      if (key === "up") {
+        if (focusIndex === 0) {
+          // Escape channel list upward to the header navbar
+          focusHeader();
+          return;
+        }
         setFocusIndex((prev) => {
-          let next = key === "down" ? prev + 1 : prev - 1;
-          if (next < 0) next = 0;
+          const next = Math.max(prev - 1, 0);
+          setHoveredChannel(displayedChannels[next]);
+          return next;
+        });
+      } else if (key === "down") {
+        setFocusIndex((prev) => {
+          let next = prev + 1;
           if (next >= displayedChannels.length)
             next = displayedChannels.length - 1;
           // Load more if navigating near the end
@@ -1748,7 +1758,11 @@ export default function LiveTV() {
           setHoveredChannel(displayedChannels[next]);
           return next;
         });
-      } else if (key === "enter") {
+      } else if (key === "left") {
+        setSidebarTVFocus(true);
+      } else if (key === "right") {
+        focusFirstPreviewControl();
+      } else if (key === "enter" || key === "select") {
         setSelectedChannel(displayedChannels[focusIndex]);
       } else if (key === "red") {
         const ch = displayedChannels[focusIndex];
@@ -1774,8 +1788,11 @@ export default function LiveTV() {
     favorites.live,
     focusIndex,
     focusSearch,
+    focusFirstPreviewControl,
     navigate,
     selectedChannel,
+    showPinModal,
+    sidebarTVFocus,
     showColorAction,
     toggleFavoriteFilter,
   ]);
@@ -1786,13 +1803,52 @@ export default function LiveTV() {
     }
   }, [activeCategory]);
 
+    // Scroll focused channel into view when d-pad navigation changes the index
+    useEffect(() => {
+      const container = scrollContainerRef.current;
+      if (!container) return;
+      const row = container.children[focusIndex] as HTMLElement | undefined;
+      row?.scrollIntoView({ block: "nearest", behavior: "auto" });
+    }, [focusIndex]);
+
   useEffect(() => {
     return () => {
       if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
     };
   }, []);
 
-  const buildLiveChannelUrl = useCallback(
+  useEffect(() => {
+    if (!showPinModal) return;
+    setSidebarTVFocus(false);
+    const first = pinModalRef.current?.querySelector<HTMLElement>(
+      "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+    );
+    setTimeout(() => first?.focus(), 20);
+  }, [showPinModal]);
+
+  useTVRemote((key, event) => {
+    if (!showPinModal || !pinModalRef.current) return;
+    event?.stopImmediatePropagation();
+
+    if (key === "back") {
+      setShowPinModal(false);
+      return;
+    }
+
+    if (key === "left" || key === "right" || key === "up" || key === "down") {
+      focusNext(key, { root: pinModalRef.current });
+      return;
+    }
+
+    if (key === "enter" || key === "select") {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && pinModalRef.current.contains(active)) {
+        active.click();
+      }
+    }
+  });
+
+  const buildLiveChannelUrls = useCallback(
     (channel: LiveStream | null) => {
       if (
         !channel ||
@@ -1800,14 +1856,34 @@ export default function LiveTV() {
         !activePlaylist?.username ||
         !activePlaylist?.password
       ) {
-        return "";
+        return [] as string[];
       }
-      return `${activePlaylist.host}/live/${activePlaylist.username}/${activePlaylist.password}/${channel.stream_id}.m3u8`;
+
+      const preferredExt =
+        settings.streamFormat === "ts"
+          ? "ts"
+          : settings.streamFormat === "mp4"
+            ? "mp4"
+            : "m3u8";
+
+      // Based on webOS AV specs, keep live playback in this extension set and
+      // use deterministic fallback order per platform.
+      const platform = getPlatformName();
+      const baseOrder =
+        platform === "webos"
+          ? ["ts", "m3u8", "mp4"]
+          : ["m3u8", "ts", "mp4"];
+      const orderedExts = Array.from(
+        new Set([preferredExt, ...baseOrder].filter(Boolean)),
+      );
+
+      return orderedExts.map(
+        (ext) =>
+          `${activePlaylist.host}/live/${activePlaylist.username}/${activePlaylist.password}/${channel.stream_id}.${ext}`,
+      );
     },
-    [activePlaylist],
+    [activePlaylist, settings.streamFormat],
   );
-
-
 
   const sidebarItems = useMemo(() => {
     if (!Array.isArray(listableChannels))
@@ -1867,15 +1943,17 @@ export default function LiveTV() {
       setPendingLockedCategoryId(normalizedCategoryId);
       setShowPinModal(true);
     } else {
+      shouldFocusListAfterCategorySelectRef.current = true;
+      setSidebarTVFocus(false);
       setActiveCategory(normalizedCategoryId);
     }
   };
 
   return (
-    <div className="flex flex-col h-screen relative">
+    <div className="tv-browser-shell flex flex-col h-screen relative">
       {/* TV Color Buttons Bar */}
       <div className="fixed bottom-4 right-4 z-[100] flex flex-col items-end gap-2 pointer-events-none select-none">
-        <div className="flex flex-wrap justify-end gap-2 rounded-2xl border border-white/10 bg-black/70 px-3 py-2 backdrop-blur-sm">
+        <div className="tv-key-hints flex flex-wrap justify-end gap-2 rounded-2xl px-3 py-2 backdrop-blur-sm">
           <div className="flex items-center gap-1">
             <span className="w-4 h-4 rounded bg-red-600" />
             <span className="text-xs text-white/80 font-bold">
@@ -1915,6 +1993,7 @@ export default function LiveTV() {
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
+              ref={pinModalRef}
               className="bg-zinc-900 border border-white/10 p-8 rounded-3xl max-w-sm w-full shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             >
@@ -1940,8 +2019,8 @@ export default function LiveTV() {
                     onChange={(e) =>
                       setPinInput(e.target.value.replace(/\D/g, ""))
                     }
-                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:border-primary"
-                    placeholder="••••"
+                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:bg-gradient-to-br focus:from-primary/10 focus:to-transparent focus:border-primary/40 focus:shadow-[0_0_20px_rgba(66,133,244,0.25)] transition-all"
+                    placeholder="â€¢â€¢â€¢â€¢"
                   />
                   <div className="flex gap-3">
                     <button
@@ -1965,41 +2044,43 @@ export default function LiveTV() {
         )}
       </AnimatePresence>
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-black/40 border-b border-white/5">
+      <header data-tv-zone="header" className="tv-browser-header flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
             <button
               onClick={() => navigate("/")}
-              className="p-1 hover:bg-white/10 rounded-full"
+              className="tv-header-back-btn rounded-full p-2"
+              title="Back to Home"
+              aria-label="Back to Home"
             >
               <ArrowLeft className="w-6 h-6" />
             </button>
             <WeatherWidget />
-            <nav className="flex items-center gap-6">
+            <nav className="tv-nav-tabs flex items-center gap-1">
               <button
                 onClick={() => navigate("/")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.home}
               </button>
-              <button className="text-primary font-bold border-b-2 border-primary">
+              <button className="tv-nav-tab tv-nav-tab--active">
                 {t.live}
               </button>
               <button
                 onClick={() => navigate("/movies")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.movies}
               </button>
               <button
                 onClick={() => navigate("/series")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.series}
               </button>
               <button
                 onClick={() => navigate("/radio")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.radio}
               </button>
@@ -2014,7 +2095,7 @@ export default function LiveTV() {
                 isParentalUnlocked ? lockParental() : setShowPinModal(true)
               }
               className={cn(
-                "p-2 rounded-full transition-all",
+                "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked
                   ? "bg-primary text-white"
                   : "bg-white/5 text-white/40 hover:bg-white/10",
@@ -2032,15 +2113,15 @@ export default function LiveTV() {
               )}
             </button>
           )}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
+          <div className="tv-search-shell w-[320px] md:w-[360px]">
+            <Search className="tv-search-icon" />
             <input
               ref={searchInputRef}
               type="text"
               placeholder={t.search}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="bg-white/5 border border-white/10 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-primary w-64"
+              className="tv-search-input"
             />
           </div>
           <DigitalClock />
@@ -2055,14 +2136,40 @@ export default function LiveTV() {
           items={sidebarItems}
           activeId={activeCategory}
           onSelect={handleCategorySelect}
-          className="w-72"
+          hasTVFocus={sidebarTVFocus && !showPinModal}
+          onTVFocusRelease={() => {
+            focusChannelListAt(focusIndex);
+          }}
+          onTVFocusEscapeUp={() => {
+            setSidebarTVFocus(false);
+            focusHeader();
+          }}
         />
 
         {/* Channel List */}
         <div
           ref={containerRef}
-          className="flex-1 bg-black/10 flex flex-col overflow-hidden border-r border-white/5"
+          className="tv-browser-content flex-1 flex flex-col overflow-hidden border-r border-white/10"
         >
+          <div className="tv-nav-strip mx-3 mt-3 mb-2 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold uppercase tracking-[0.14em] text-white/40">Category</span>
+              <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/90">
+                {sidebarItems.find((item) => item.id === activeCategory)?.name || t.allChannels}
+              </span>
+              <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/80">
+                {deferredChannels.length} channels
+              </span>
+            </div>
+            <span
+              className={cn(
+                "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide",
+                sidebarTVFocus ? "bg-emerald-500/20 text-emerald-200" : "bg-cyan-500/20 text-cyan-100",
+              )}
+            >
+              {sidebarTVFocus ? "Categories Focus" : "Channel List Focus"}
+            </span>
+          </div>
           {!isConnected ? (
             <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
               <div className="p-6 bg-white/5 rounded-full">
@@ -2083,13 +2190,14 @@ export default function LiveTV() {
             <div
               ref={scrollContainerRef}
               onScroll={handleChannelListScroll}
-              className="flex-1 overflow-y-auto scrollbar-hide min-h-0"
+              className="flex-1 overflow-y-auto scrollbar-hide min-h-0 px-2 pb-3"
             >
               {displayedChannels.map((channel, index) => (
                 <ChannelRow
                   key={channel.stream_id}
                   channel={channel}
                   isSelected={selectedChannel?.stream_id === channel.stream_id}
+                  isTVFocused={index === focusIndex}
                   isFavorite={favorites.live.includes(channel.stream_id)}
                   onSelect={setSelectedChannel}
                   onHover={setHoveredChannel}
@@ -2112,14 +2220,15 @@ export default function LiveTV() {
         </div>
 
         {/* Preview Player */}
-        <div className="w-[40%] flex flex-col bg-black/30">
+        <div ref={previewPanelRef} className="tv-browser-content w-[40%] flex flex-col bg-black/25">
           {isConnected ? (
             <>
               <div className="aspect-video w-full bg-black relative">
                 {selectedChannel ? (
                   <MiniPlayer
+                    key={selectedChannel.stream_id}
                     videoRef={playerRef}
-                    url={`${activePlaylist?.host}/live/${activePlaylist?.username}/${activePlaylist?.password}/${selectedChannel.stream_id}.m3u8`}
+                    urls={buildLiveChannelUrls(selectedChannel)}
                     poster={toProxyAssetUrl(selectedChannel.stream_icon)}
                     title={selectedChannel.name}
                     onNext={() => {
@@ -2244,7 +2353,7 @@ export default function LiveTV() {
                                 minute: "2-digit",
                                 hour12: settings.timeFormat === "12h",
                               })}
-                              {" — "}
+                              {" â€” "}
                               {new Date(currentProgram.end).toLocaleTimeString(
                                 [],
                                 {

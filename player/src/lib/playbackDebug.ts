@@ -1,3 +1,5 @@
+import { getMediaApiBaseUrl } from "./activationApi";
+
 export type PlaybackDebugLevel = "info" | "warn" | "error";
 
 export function reportPlaybackDebug(
@@ -14,7 +16,7 @@ export function reportPlaybackDebug(
     ts: Date.now(),
   });
 
-  const url = `${window.location.origin}/api/playback-debug`;
+  const url = `${(getMediaApiBaseUrl() || window.location.origin).replace(/\/$/, "")}/api/playback-debug`;
 
   try {
     if (navigator.sendBeacon) {

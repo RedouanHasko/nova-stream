@@ -10,7 +10,9 @@ import {
   Tv,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useEffect } from "react";
 import Logo from "../components/Logo";
+import { focusNext } from "../lib/remote";
 import { usePlaylist } from "../context/PlaylistContext";
 
 function formatDate(value?: string | null) {
@@ -27,6 +29,29 @@ export default function Activation() {
     refreshActivationStatus,
     activationPortalUrl,
   } = usePlaylist();
+
+  // TV remote navigation — d-pad moves focus between buttons, back is ignored
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const key = (e as CustomEvent).detail?.key as string;
+      if (!key) return;
+      if (key === "up" || key === "left") {
+        focusNext("up");
+      } else if (key === "down" || key === "right") {
+        focusNext("down");
+      } else if (key === "enter") {
+        const el = document.activeElement as HTMLElement | null;
+        el?.click();
+      }
+    };
+    window.addEventListener("tv-remote-key", handler);
+    // Focus first button so remote works on first keypress
+    requestAnimationFrame(() => {
+      const btn = document.querySelector<HTMLElement>("button:not([disabled])");
+      btn?.focus();
+    });
+    return () => window.removeEventListener("tv-remote-key", handler);
+  }, []);
 
   const openActivationPortal = () => {
     if (!activationPortalUrl) {
@@ -67,7 +92,7 @@ export default function Activation() {
           : activationStatus.reason === "device_key_mismatch"
             ? "The stored device key does not match this device. Contact support to resolve the activation lock."
             : activationStatus.reason === "unreachable"
-              ? "The app could not verify activation right now. Check the backend connection and refresh."
+              ? "The app could not verify activation right now. Check the activation server connection and refresh."
               : "Activate this device or start its one-time free trial before using the player.";
 
   const StatusIcon =
@@ -82,9 +107,9 @@ export default function Activation() {
           : ShieldCheck;
 
   return (
-    <div className="min-h-screen bg-black flex items-center justify-center p-8">
+    <div className="activation-shell min-h-screen bg-black flex items-center justify-center p-8">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(139,0,0,0.28),transparent_45%)]" />
-      <div className="relative w-full max-w-4xl rounded-[36px] border border-white/10 bg-black/70 backdrop-blur-2xl shadow-2xl shadow-black/50 p-8 md:p-12">
+      <div className="activation-card relative w-full max-w-4xl rounded-[36px] border border-white/10 bg-black/70 backdrop-blur-2xl shadow-2xl shadow-black/50 p-8 md:p-12">
         <div className="flex items-center justify-between gap-4 mb-10">
           <div className="flex items-center gap-4">
             <Logo size="sm" />
@@ -101,7 +126,7 @@ export default function Activation() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-[1.2fr_0.8fr] gap-8">
-          <div className="space-y-6">
+          <div className="activation-main space-y-6">
             <div className="rounded-3xl border border-white/10 bg-white/5 p-6">
               <div className="flex items-start gap-4">
                 <div className="w-14 h-14 rounded-2xl bg-primary/15 flex items-center justify-center">
@@ -146,7 +171,7 @@ export default function Activation() {
             </div>
           </div>
 
-          <div className="rounded-3xl border border-white/10 bg-white/5 p-6 flex flex-col gap-4">
+          <div className="activation-side rounded-3xl border border-white/10 bg-white/5 p-6 flex flex-col gap-4">
             <h3 className="text-xl font-bold">What you can do now</h3>
             <p className="text-white/55 leading-7">
               Free trial is locked to this device identity. Uninstalling the app will not reset trial usage.
@@ -159,7 +184,7 @@ export default function Activation() {
                 !activationStatus.trial.available ||
                 activationStatus.reason === "blocked"
               }
-              className="w-full rounded-2xl bg-primary hover:bg-primary-hover disabled:opacity-50 disabled:cursor-not-allowed py-4 px-5 font-bold text-lg transition-colors"
+              className="activation-action-btn w-full rounded-2xl bg-primary hover:bg-primary-hover disabled:opacity-50 disabled:cursor-not-allowed py-4 px-5 font-bold text-lg transition-colors"
             >
               {isActivationLoading
                 ? "Working..."
@@ -168,7 +193,7 @@ export default function Activation() {
 
             <button
               onClick={openActivationPortal}
-              className="w-full rounded-2xl border border-white/15 bg-white/5 hover:bg-white/10 py-4 px-5 font-bold text-lg transition-colors flex items-center justify-center gap-3"
+              className="activation-action-btn w-full rounded-2xl border border-white/15 bg-white/5 hover:bg-white/10 py-4 px-5 font-bold text-lg transition-colors flex items-center justify-center gap-3"
             >
               <ExternalLink className="w-5 h-5" />
               Open Activation Page
@@ -177,13 +202,13 @@ export default function Activation() {
             <button
               onClick={() => refreshActivationStatus()}
               disabled={isActivationLoading}
-              className="w-full rounded-2xl border border-white/10 bg-transparent hover:bg-white/5 disabled:opacity-50 py-4 px-5 font-semibold transition-colors flex items-center justify-center gap-3"
+              className="activation-action-btn w-full rounded-2xl border border-white/10 bg-transparent hover:bg-white/5 disabled:opacity-50 py-4 px-5 font-semibold transition-colors flex items-center justify-center gap-3"
             >
               <RefreshCw className={`w-5 h-5 ${isActivationLoading ? "animate-spin" : ""}`} />
               Refresh Activation Status
             </button>
 
-            <div className="mt-4 rounded-2xl border border-white/10 bg-black/30 p-4 text-sm text-white/55 leading-6">
+            <div className="activation-device-meta mt-4 rounded-2xl border border-white/10 bg-black/30 p-4 text-sm text-white/55 leading-6">
               <p>Device status: {activationStatus.device?.status || "Unknown"}</p>
               <p>Platform: {activationStatus.device?.platform || "Unknown"}</p>
               <p>Device name: {activationStatus.device?.deviceName || "Unknown"}</p>

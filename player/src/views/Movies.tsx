@@ -22,7 +22,7 @@ import {
   Unlock,
   ExternalLink,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
 import MovieCard from "../components/MovieCard";
 import Logo from "../components/Logo";
@@ -36,9 +36,18 @@ import { usePlaylist } from "../context/PlaylistContext";
 import { IPTVService, MovieStream } from "../services/iptvService";
 import { getFlagForCategory } from "../lib/flags";
 import { reportPlaybackDebug } from "../lib/playbackDebug";
+import { focusNext, useTVRemote, handleHeaderZoneKey, focusHeader } from "../lib/remote";
 
 export default function Movies() {
   const navigate = useNavigate();
+  const location = useLocation();
+
+  useEffect(() => {
+    try {
+      const s = (location.state || {}) as any;
+      if (s?.returnCategory) setActiveCategory(String(s.returnCategory));
+    } catch {}
+  }, [location]);
   const t = useT();
   const {
     activePlaylist,
@@ -72,12 +81,28 @@ export default function Movies() {
   const [pendingLockedCategoryId, setPendingLockedCategoryId] = useState<
     string | null
   >(null);
+  const INITIAL_VISIBLE = 48;
+  const LOAD_STEP = 48;
   // Virtual grid sizing
   const gridContainerRef = useRef<HTMLDivElement>(null);
   const [gridWidth, setGridWidth] = useState(800);
-  const [visibleCount, setVisibleCount] = useState(80);
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const pinModalRef = useRef<HTMLDivElement | null>(null);
+  const movieModalRef = useRef<HTMLDivElement | null>(null);
+  const sortMenuRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const colorActionTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastNonFavoriteCategoryRef = useRef("all");
+  const [colorAction, setColorAction] = useState<string | null>(null);
+  const vodCategoryCacheRef = useRef<Map<string, MovieStream[]>>(new Map());
+  const fetchedAllVodRef = useRef(false);
   const CARD_GAP = 16;
+
+  useEffect(() => {
+    vodCategoryCacheRef.current.clear();
+    fetchedAllVodRef.current = false;
+  }, [activePlaylist?.id]);
 
   // If prefetch didn't load VOD streams, fetch per-category on demand.
   useEffect(() => {
@@ -96,6 +121,12 @@ export default function Movies() {
 
     const fetchCategory = async (catId: string) => {
       try {
+        const cached = vodCategoryCacheRef.current.get(catId);
+        if (cached) {
+          setLocalVodStreams(cached);
+          setIsFetchingCategory(false);
+          return;
+        }
         setIsFetchingCategory(true);
         const streams = await IPTVService.getVodStreams(
           activePlaylist.host!,
@@ -103,7 +134,11 @@ export default function Movies() {
           activePlaylist.password!,
           catId,
         );
-        if (!cancelled) setLocalVodStreams(streams || []);
+        if (!cancelled) {
+          const safeStreams = streams || [];
+          vodCategoryCacheRef.current.set(catId, safeStreams);
+          setLocalVodStreams(safeStreams);
+        }
       } catch (err) {
         console.error("fetchVod category failed:", err);
         if (!cancelled) setLocalVodStreams([]);
@@ -128,10 +163,12 @@ export default function Movies() {
     // If 'all' is selected, fetch all VOD streams (populate playlistData.vodStreams)
     const cats = playlistData.vodCategories || [];
     if (activeCategory === "all") {
-      if (!isFetchingVod) {
+      if (!isFetchingVod && !fetchedAllVodRef.current) {
+        fetchedAllVodRef.current = true;
         // Trigger fetchVod from context to populate all streams
         // fetchVod is a no-op if prefetch already filled streams
         fetchVod().catch((err: any) => {
+          fetchedAllVodRef.current = false;
           console.error("fetchVod failed:", err);
           toast.error("Failed to load movies");
         });
@@ -191,18 +228,22 @@ export default function Movies() {
     isParentalUnlocked,
   ]);
 
+  const normalizedSearch = deferredSearch.trim().toLowerCase();
+  const favoriteVodSet = useMemo(() => new Set(favorites.vod), [favorites.vod]);
+
   const filteredMovies = useMemo(() => {
     if (!Array.isArray(movies)) return [];
+    const hasSearch = normalizedSearch.length > 0;
     let filtered = movies.filter(
       (m) =>
-        m.name.toLowerCase().includes(deferredSearch.toLowerCase()) &&
+        (!hasSearch || m.name.toLowerCase().includes(normalizedSearch)) &&
         (deferredCategory === "all" ||
           deferredCategory === "fav" ||
           m.category_id === deferredCategory),
     );
 
     if (deferredCategory === "fav") {
-      filtered = filtered.filter((m) => favorites.vod.includes(m.stream_id));
+      filtered = filtered.filter((m) => favoriteVodSet.has(m.stream_id));
     }
 
     switch (sortBy) {
@@ -220,12 +261,12 @@ export default function Movies() {
     }
 
     return filtered;
-  }, [movies, deferredSearch, deferredCategory, favorites.vod, sortBy]);
+  }, [movies, normalizedSearch, deferredCategory, favoriteVodSet, sortBy]);
 
   // Reset visible count when filters/search change
   useEffect(() => {
-    setVisibleCount(80);
-  }, [deferredSearch, deferredCategory, sortBy, playlistData.vodStreams?.length, localVodStreams?.length]);
+    setVisibleCount(INITIAL_VISIBLE);
+  }, [deferredSearch, deferredCategory, sortBy, playlistData.vodStreams?.length, localVodStreams?.length, INITIAL_VISIBLE]);
 
   // Scroll handler to load more items when near bottom
   useEffect(() => {
@@ -238,14 +279,14 @@ export default function Movies() {
       requestAnimationFrame(() => {
         const threshold = 800; // px from bottom
         if (el.scrollHeight - (el.scrollTop + el.clientHeight) < threshold) {
-          setVisibleCount((v) => Math.min((filteredMovies?.length || 0), v + 80));
+          setVisibleCount((v) => Math.min((filteredMovies?.length || 0), v + LOAD_STEP));
         }
         ticking = false;
       });
     };
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
-  }, [filteredMovies.length]);
+  }, [filteredMovies.length, LOAD_STEP]);
 
   const sidebarItems = useMemo(() => {
     if (!Array.isArray(movies))
@@ -270,6 +311,10 @@ export default function Movies() {
       })),
     ];
   }, [movies, categories, favorites.vod.length]);
+
+  const activeCategoryLabel = useMemo(() => {
+    return sidebarItems.find((item) => item.id === activeCategory)?.name || t.allMovies;
+  }, [sidebarItems, activeCategory, t.allMovies]);
 
   const handleMovieClick = useCallback(async (movie: MovieStream) => {
     setSelectedMovie(movie);
@@ -358,6 +403,8 @@ export default function Movies() {
         streamId: id,
         extension: ext,
         streamInfo: movieInfo?.info ?? null,
+        from: `${location.pathname}${location.search}`,
+        returnCategory: activeCategory,
       },
     });
   };
@@ -368,7 +415,7 @@ export default function Movies() {
       toast.success("Parental content unlocked");
       setShowPinModal(false);
       if (pendingLockedCategoryId) {
-        setActiveCategory(pendingLockedCategoryId);
+        startTransition(() => setActiveCategory(pendingLockedCategoryId!));
         setPendingLockedCategoryId(null);
       }
       setPinInput("");
@@ -384,47 +431,243 @@ export default function Movies() {
       setPendingLockedCategoryId(catId);
       setShowPinModal(true);
     } else {
-      setActiveCategory(catId);
+      startTransition(() => setActiveCategory(catId));
     }
   };
 
-  // TV remote navigation — D-pad moves focus across grid items; Enter opens modal
-  const focusedMovieIndexRef = useRef(-1);
+  const showColorAction = useCallback((label: string) => {
+    setColorAction(label);
+    if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    colorActionTimerRef.current = setTimeout(() => setColorAction(null), 1200);
+  }, []);
+
+  const focusSearch = useCallback(() => {
+    searchInputRef.current?.focus();
+    searchInputRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    showColorAction("Search focused");
+  }, [showColorAction]);
+
+  const cycleSort = useCallback(() => {
+    const order: Array<typeof sortBy> = ["default", "name", "rating", "newest"];
+    const currentIndex = order.indexOf(sortBy);
+    const next = order[(currentIndex + 1) % order.length];
+    setSortBy(next);
+    const labels: Record<typeof sortBy, string> = {
+      default: "Sort: Default",
+      name: "Sort: A-Z",
+      rating: "Sort: Top rated",
+      newest: "Sort: Newest",
+    };
+    showColorAction(labels[next]);
+  }, [sortBy, showColorAction]);
+
+  const toggleFavoriteFilter = useCallback(() => {
+    if (activeCategory === "fav") {
+      const fallbackCategory =
+        lastNonFavoriteCategoryRef.current &&
+        (lastNonFavoriteCategoryRef.current === "all" ||
+          categories.some(
+            (category) => category.category_id === lastNonFavoriteCategoryRef.current,
+          ))
+          ? lastNonFavoriteCategoryRef.current
+          : categories[0]?.category_id || "all";
+      setActiveCategory(fallbackCategory);
+      showColorAction("Favorites filter off");
+      return;
+    }
+
+    if (activeCategory !== "all") {
+      lastNonFavoriteCategoryRef.current = activeCategory;
+    }
+    setActiveCategory("fav");
+    showColorAction("Favorites filter on");
+  }, [activeCategory, categories, showColorAction]);
+
+  // Which panel currently owns D-pad focus: sidebar categories or movie grid
+  const [sidebarTVFocus, setSidebarTVFocus] = useState(false);
+
+  // TV remote navigation — pure spatial: focusNext() finds the element
+  // visually above/below/left/right of whatever currently has DOM focus.
+  // No index tracking needed; the browser focus ring highlights the target.
   useEffect(() => {
+    if (document.documentElement.dataset.tv !== "true") return;
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
-      const total = filteredMovies.length;
-      if (total === 0) return;
+      if (showPinModal || !!selectedMovie || showSortMenu) return;
 
-      if (key === "enter") {
-        if (focusedMovieIndexRef.current >= 0 && focusedMovieIndexRef.current < total) {
-          handleMovieClick(filteredMovies[focusedMovieIndexRef.current]);
+      // While sidebar owns TV focus, only allow back to release it.
+      if (sidebarTVFocus) {
+        if (key === "back") setSidebarTVFocus(false);
+        return;
+      }
+
+      // Header zone handles its own left/right/enter/back.
+      if (handleHeaderZoneKey(key, { onBack: () => navigate("/") })) return;
+
+      if (key === "green") {
+        focusSearch();
+        return;
+      }
+      if (key === "yellow") {
+        toggleFavoriteFilter();
+        return;
+      }
+      if (key === "blue") {
+        cycleSort();
+        return;
+      }
+
+      if (key === "back") { navigate("/"); return; }
+      if (key === "enter" || key === "select") {
+        (document.activeElement as HTMLElement | null)?.click();
+        return;
+      }
+
+      const grid = gridContainerRef.current;
+      const active = document.activeElement as HTMLElement | null;
+      const inGrid = !!(grid && active && grid.contains(active));
+
+      if (key === "left") {
+        if (inGrid) {
+          const before = document.activeElement;
+          focusNext("left", { root: grid });
+          // If nothing was to the left, hand off to sidebar.
+          if (document.activeElement === before) setSidebarTVFocus(true);
+        } else {
+          setSidebarTVFocus(true);
         }
         return;
       }
-      if (key === "back" || key === "backspace") {
-        setSelectedMovie(null);
+
+      if (key === "up") {
+        if (inGrid) {
+          const before = document.activeElement;
+          focusNext("up", { root: grid });
+          // If nothing was above, escape to header navbar.
+          if (document.activeElement === before) focusHeader();
+        }
         return;
       }
-      let next = focusedMovieIndexRef.current;
-      if (key === "right") next = Math.min(next + 1, total - 1);
-      else if (key === "left") next = Math.max(next - 1, 0);
-      else if (key === "down") next = Math.min(next + columnCount, total - 1);
-      else if (key === "up") next = Math.max(next - columnCount, 0);
-      else return;
-      if (next < 0) next = 0;
-      focusedMovieIndexRef.current = next;
-      // Scroll focused card into view via the virtual list container
-      const el = gridContainerRef.current?.querySelector(`[data-movie-index="${next}"]`) as HTMLElement | null;
-      el?.scrollIntoView({ block: "nearest" });
+
+      if (key === "right") {
+        focusNext("right", { root: grid });
+        return;
+      }
+
+      if (key === "down") {
+        if (inGrid) {
+          focusNext("down", { root: grid });
+        } else {
+          // Focus first card to start navigation.
+          const first = grid?.querySelector<HTMLElement>("[data-tv-focusable]");
+          first?.focus();
+        }
+        return;
+      }
     };
     window.addEventListener("tv-remote-key", handler);
     return () => window.removeEventListener("tv-remote-key", handler);
-  }, [filteredMovies, columnCount, handleMovieClick]);
+  }, [
+    cycleSort,
+    filteredMovies,
+    focusSearch,
+    handleMovieClick,
+    navigate,
+    selectedMovie,
+    showPinModal,
+    showSortMenu,
+    sidebarTVFocus,
+    toggleFavoriteFilter,
+  ]);
+
+  // Auto-focus first card when the movie list loads/changes (TV only).
+  useEffect(() => {
+    if (document.documentElement.dataset.tv !== "true") return;
+    if (filteredMovies.length === 0) return;
+    requestAnimationFrame(() => {
+      const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+      first?.focus();
+    });
+  }, [filteredMovies]);
+
+  useEffect(() => {
+    if (activeCategory !== "fav") {
+      lastNonFavoriteCategoryRef.current = activeCategory;
+    }
+  }, [activeCategory]);
+
+  useEffect(() => {
+    return () => {
+      if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const focusFirst = (container: HTMLElement | null) => {
+      if (!container) return;
+      const first = container.querySelector<HTMLElement>(
+        "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+      );
+      first?.focus();
+    };
+
+    const root = showPinModal
+      ? pinModalRef.current
+      : selectedMovie
+        ? movieModalRef.current
+        : showSortMenu
+          ? sortMenuRef.current
+          : null;
+    if (!root) return;
+    setTimeout(() => focusFirst(root), 20);
+  }, [showPinModal, selectedMovie, showSortMenu]);
+
+  useTVRemote((key, event) => {
+    const modalRoot = showPinModal
+      ? pinModalRef.current
+      : selectedMovie
+        ? movieModalRef.current
+        : showSortMenu
+          ? sortMenuRef.current
+          : null;
+    if (!modalRoot) return;
+    event?.stopImmediatePropagation();
+
+    if (key === "back") {
+      if (showPinModal) setShowPinModal(false);
+      else if (selectedMovie) setSelectedMovie(null);
+      else if (showSortMenu) setShowSortMenu(false);
+      return;
+    }
+
+    if (key === "left" || key === "right" || key === "up" || key === "down") {
+      focusNext(key, { root: modalRoot });
+      return;
+    }
+
+    if (key === "enter" || key === "select") {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && modalRoot.contains(active)) {
+        active.click();
+      }
+    }
+  });
 
   return (
-    <div className="flex flex-col h-screen">
+    <div className="tv-browser-shell flex flex-col h-screen">
+      <div className="fixed bottom-4 right-4 z-[100] flex flex-col items-end gap-2 pointer-events-none select-none">
+        <div className="tv-key-hints flex flex-wrap justify-end gap-2 rounded-2xl px-3 py-2 backdrop-blur-sm">
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-green-600" /><span className="text-xs text-white/80 font-bold">Search</span></div>
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-yellow-400" /><span className="text-xs text-white/80 font-bold">Favorites</span></div>
+          <div className="flex items-center gap-1"><span className="w-4 h-4 rounded bg-blue-600" /><span className="text-xs text-white/80 font-bold">Sort</span></div>
+        </div>
+        {colorAction && (
+          <div className="mt-2 px-3 py-1 rounded bg-black/80 text-white/90 text-xs font-bold shadow-lg animate-pulse">
+            {colorAction}
+          </div>
+        )}
+      </div>
       {/* PIN Modal */}
       <AnimatePresence>
         {showPinModal && (
@@ -439,6 +682,7 @@ export default function Movies() {
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
+              ref={pinModalRef}
               className="bg-zinc-900 border border-white/10 p-8 rounded-3xl max-w-sm w-full shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             >
@@ -464,7 +708,7 @@ export default function Movies() {
                     onChange={(e) =>
                       setPinInput(e.target.value.replace(/\D/g, ""))
                     }
-                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:border-primary"
+                    className="bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-3xl tracking-[1em] text-center w-full focus:outline-none focus:bg-gradient-to-br focus:from-primary/10 focus:to-transparent focus:border-primary/40 focus:shadow-[0_0_20px_rgba(66,133,244,0.25)] transition-all"
                     placeholder="••••"
                   />
                   <div className="flex gap-3">
@@ -489,41 +733,43 @@ export default function Movies() {
         )}
       </AnimatePresence>
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-black/40 border-b border-white/5">
+      <header data-tv-zone="header" className="tv-browser-header flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
             <button
               onClick={() => navigate("/")}
-              className="p-1 hover:bg-white/10 rounded-full"
+              className="tv-header-back-btn rounded-full p-2"
+              title="Back to Home"
+              aria-label="Back to Home"
             >
               <ArrowLeft className="w-6 h-6" />
             </button>
             <WeatherWidget />
-            <nav className="flex items-center gap-6">
+            <nav className="tv-nav-tabs flex items-center gap-1">
               <button
                 onClick={() => navigate("/")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.home}
               </button>
               <button
                 onClick={() => navigate("/live")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.live}
               </button>
-              <button className="text-primary font-bold border-b-2 border-primary">
+              <button className="tv-nav-tab tv-nav-tab--active">
                 {t.movies}
               </button>
               <button
                 onClick={() => navigate("/series")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.series}
               </button>
               <button
                 onClick={() => navigate("/radio")}
-                className="text-white/60 hover:text-white font-medium"
+                className="tv-nav-tab"
               >
                 {t.radio}
               </button>
@@ -538,7 +784,7 @@ export default function Movies() {
                 isParentalUnlocked ? lockParental() : setShowPinModal(true)
               }
               className={cn(
-                "p-2 rounded-full transition-all",
+                "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked
                   ? "bg-primary text-white"
                   : "bg-white/5 text-white/40 hover:bg-white/10",
@@ -556,14 +802,15 @@ export default function Movies() {
               )}
             </button>
           )}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
+          <div className="tv-search-shell w-[320px] md:w-[360px]">
+            <Search className="tv-search-icon" />
             <input
+              ref={searchInputRef}
               type="text"
               placeholder={t.search}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="bg-white/5 border border-white/10 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-primary w-64"
+              className="tv-search-input"
             />
           </div>
           <DigitalClock />
@@ -578,11 +825,20 @@ export default function Movies() {
           items={sidebarItems}
           activeId={activeCategory}
           onSelect={handleCategorySelect}
-          className="w-72"
+          hasTVFocus={sidebarTVFocus}
+          onTVFocusRelease={() => {
+            setSidebarTVFocus(false);
+            const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+            first?.focus();
+          }}
+          onTVFocusEscapeUp={() => {
+            setSidebarTVFocus(false);
+            focusHeader();
+          }}
         />
 
         {/* Movie Grid */}
-        <div ref={gridContainerRef} className="flex-1 flex flex-col overflow-hidden bg-black/10">
+        <div ref={gridContainerRef} className="tv-browser-content flex-1 flex flex-col overflow-hidden">
           {!isConnected ? (
             <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
               <div className="p-6 bg-white/5 rounded-full">
@@ -603,8 +859,20 @@ export default function Movies() {
             </div>
           ) : (
             <>
-              <div className="px-8 pt-8 pb-4">
-                <div className="flex items-center justify-between mb-6">
+              <div className="px-8 pt-7 pb-4">
+                <div className="tv-nav-strip mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold uppercase tracking-[0.14em] text-white/40">Category</span>
+                    <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/90">{activeCategoryLabel}</span>
+                  </div>
+                  <span className={cn(
+                    "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide",
+                    sidebarTVFocus ? "bg-emerald-500/20 text-emerald-200" : "bg-cyan-500/20 text-cyan-100",
+                  )}>
+                    {sidebarTVFocus ? "Categories Focus" : "Grid Focus"}
+                  </span>
+                </div>
+                <div className="tv-browser-toolbar flex items-center justify-between mb-5 px-4 py-3">
                   <div className="relative">
                   <button
                     onClick={() => setShowSortMenu(!showSortMenu)}
@@ -630,6 +898,7 @@ export default function Movies() {
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: 10 }}
+                        ref={sortMenuRef}
                         className="absolute top-full left-0 mt-2 bg-zinc-900 border border-white/10 rounded-xl p-2 min-w-[180px] z-50 shadow-2xl"
                       >
                         {[
@@ -662,7 +931,7 @@ export default function Movies() {
                   {(isFetchingVod || isFetchingCategory) && (
                     <Loader2 className="w-4 h-4 animate-spin text-primary" />
                   )}
-                  <span className="text-white/40 font-medium">
+                  <span className="tv-browser-stat px-3 py-1 text-white/70 text-sm font-semibold">
                     {filteredMovies.length} movies
                   </span>
                 </div>
@@ -691,7 +960,7 @@ export default function Movies() {
                     }}
                   >
                     {filteredMovies.slice(0, visibleCount).map((movie, idx) => (
-                      <div key={movie.stream_id} data-movie-index={idx}>
+                      <div key={movie.stream_id}>
                         <MovieCard
                           title={movie.name}
                           poster={movie.stream_icon}
@@ -721,6 +990,7 @@ export default function Movies() {
               initial={{ scale: 0.9, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              ref={movieModalRef}
               className="bg-zinc-900 w-full max-w-5xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative"
               onClick={(e) => e.stopPropagation()}
             >

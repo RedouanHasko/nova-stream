@@ -625,6 +625,8 @@ export default function DeviceActivation() {
                           setSelectedApplicationId(event.target.value)
                         }
                         className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-red-500"
+                        data-tv-focusable
+                        tabIndex={0}
                       >
                         {applications.length === 0 && (
                           <option value="" className="text-black">
@@ -707,6 +709,12 @@ export default function DeviceActivation() {
                           )}
                           <button
                             type="button"
+                                selectedPlan?.id === plan.id
+                                  ? "bg-red-600/10 border-red-600 shadow-lg shadow-red-600/10"
+                                  : "bg-white/5 border-white/5 hover:border-white/20"
+                              }`}
+                              data-tv-focusable
+                              tabIndex={0}
                             onClick={() => handleManualContact("email")}
                             className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition-colors hover:border-white/20 flex items-center justify-center gap-2"
                           >
@@ -785,6 +793,8 @@ export default function DeviceActivation() {
                           ? "bg-red-600 hover:bg-red-700 text-white shadow-red-600/20"
                           : "bg-white/10 text-gray-500 cursor-not-allowed"
                       }`}
+                      data-tv-focusable
+                      tabIndex={0}
                     >
                       {isSubmittingCheckout
                         ? paymentConfig?.configured
@@ -890,6 +900,8 @@ export default function DeviceActivation() {
                     placeholder="00:1A:2B:3C:4D:5E"
                     className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white placeholder:text-gray-700 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500/50 transition-all font-mono"
                     required
+                    data-tv-focusable
+                    tabIndex={0}
                   />
                 </div>
 
@@ -913,15 +925,26 @@ export default function DeviceActivation() {
                     placeholder="••••••"
                     className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white placeholder:text-gray-700 focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500/50 transition-all font-mono"
                     required
+                    data-tv-focusable
+                    tabIndex={0}
                   />
                 </div>
 
                 {/* High-Fidelity Simulated reCAPTCHA (Works in Preview) */}
-                <div
-                  onClick={() => setIsCaptchaChecked(!isCaptchaChecked)}
-                  className="flex justify-center py-2 select-none"
-                >
-                  <div className="w-[302px] h-[76px] bg-[#222] border border-[#333] rounded-[3px] flex items-center px-3 gap-3 cursor-pointer hover:bg-[#252525] transition-colors">
+                <div className="flex justify-center py-2 select-none">
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    data-tv-focusable
+                    onClick={() => setIsCaptchaChecked(!isCaptchaChecked)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setIsCaptchaChecked(!isCaptchaChecked);
+                      }
+                    }}
+                    className="w-[302px] h-[76px] bg-[#222] border border-[#333] rounded-[3px] flex items-center px-3 gap-3 cursor-pointer hover:bg-[#252525] transition-colors"
+                  >
                     <div
                       className={`w-6 h-6 border-2 rounded-[2px] flex items-center justify-center transition-all ${
                         isCaptchaChecked

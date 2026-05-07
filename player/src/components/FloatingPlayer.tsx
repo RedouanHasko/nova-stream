@@ -3,6 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { X, Maximize2, Play, Pause } from "lucide-react";
 import Hls from "hls.js";
 import { useFloatingPlayer } from "../context/FloatingPlayerContext";
+import { getPlatformName, platformSupportsEngine, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack } from "../lib/platformPlayer";
+import { getMediaApiBaseUrl } from "../lib/activationApi";
+import { useTVRemote, focusNext } from "../lib/remote";
 
 export default function FloatingPlayer() {
   const navigate = useNavigate();
@@ -10,9 +13,11 @@ export default function FloatingPlayer() {
     useFloatingPlayer();
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const currentTimeRef = useRef(0);
+  const platformPlayerRef = useRef<any>(null);
 
   // Start/restart playback whenever the stream changes
   useEffect(() => {
@@ -28,7 +33,8 @@ export default function FloatingPlayer() {
     video.removeAttribute("src");
     video.load();
 
-    const proxied = `${window.location.origin}/api/proxy?url=${encodeURIComponent(floatingStream.url)}`;
+    const base = getMediaApiBaseUrl() || window.location.origin;
+    const proxied = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(floatingStream.url)}`;
     const startTime = miniCurrentTimeRef.current ?? 0;
 
     const onReady = () => {
@@ -46,6 +52,29 @@ export default function FloatingPlayer() {
       floatingStream.url.includes(".m3u8") ||
       floatingStream.url.includes("/live/") ||
       floatingStream.url.includes("/hls/");
+    const isMKV = ext === "mkv" || floatingStream.url.includes(".mkv");
+
+    const platform = getPlatformName();
+
+    // If this is an MKV and the platform has native engines, try platform playback first.
+    if (isMKV && platform === 'tizen') {
+      try {
+        const handle = startPlatformPlayback(floatingStream.url, startTime, (ev) => {
+          // best-effort: expose events via console for now
+          try { console.debug('platform-player-event', ev); } catch {}
+        });
+        if (handle) {
+          platformPlayerRef.current = handle;
+          // platform playback in use — skip attaching to the <video> element
+          return () => {
+            try { handle.stop(); } catch {}
+            platformPlayerRef.current = null;
+          };
+        }
+      } catch (e) {
+        // fall through to HTML5/HLS fallback
+      }
+    }
 
     if (isM3U8 && Hls.isSupported()) {
       let fatalRecoveryAttempts = 0;
@@ -99,6 +128,21 @@ export default function FloatingPlayer() {
       video.addEventListener("loadedmetadata", onReady, { once: true });
     } else {
       // Native video (mp4, mkv, ts, etc.)
+
+      // On webOS we can attempt to register an audio track so the platform
+      // can better manage routing/volume for in-band MKV tracks while still
+      // using HTML5 video for rendering.
+      if (isMKV && platform === 'webos') {
+        (async () => {
+          try {
+            const trackId = await webosRegisterTrack('default');
+            if (trackId) {
+              platformPlayerRef.current = { webosTrackId: trackId, stop: async () => { try { await webosUnregisterTrack(trackId); } catch {} } };
+            }
+          } catch {}
+        })();
+      }
+
       video.src = proxied;
       video.addEventListener("loadedmetadata", onReady, { once: true });
     }
@@ -108,8 +152,21 @@ export default function FloatingPlayer() {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
-      video.pause();
-      video.removeAttribute("src");
+      try { video.pause(); } catch {}
+      try { video.removeAttribute("src"); } catch {}
+
+      // Teardown any platform handles (Tizen AVPlay or webOS registered tracks)
+      if (platformPlayerRef.current) {
+        try {
+          if (typeof platformPlayerRef.current.stop === 'function') platformPlayerRef.current.stop();
+        } catch {}
+        // If it's a webOS registered track wrapper, attempt unregister
+        try {
+          const tId = (platformPlayerRef.current as any).webosTrackId;
+          if (tId) webosUnregisterTrack(tId).catch(() => {});
+        } catch {}
+        platformPlayerRef.current = null;
+      }
     };
   }, [floatingStream?.url]);
 
@@ -176,15 +233,45 @@ export default function FloatingPlayer() {
     }
   };
 
+  // TV / keyboard navigation — only active when the mini player is visible
+  useTVRemote((key) => {
+    if (!floatingStream) return; // not visible – don't intercept keys
+    if (!rootRef.current) return;
+    const ae = document.activeElement as HTMLElement | null;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+
+    if (key === 'left' || key === 'right' || key === 'up' || key === 'down') {
+      focusNext(key, { root: rootRef.current ?? undefined });
+      return;
+    }
+
+    if (key === 'select') {
+      const el = document.activeElement as HTMLElement | null;
+      if (el) el.click();
+      return;
+    }
+
+    if (key === 'back') {
+      handleClose();
+      return;
+    }
+
+    if (key === 'play' || key === 'playpause') {
+      togglePlay();
+      return;
+    }
+  });
+
   if (!floatingStream) return null;
 
   return (
     <div
+      ref={rootRef}
       className="fixed bottom-6 right-6 z-[9999] w-80 rounded-2xl overflow-hidden shadow-2xl border border-white/10 bg-black flex flex-col"
       style={{ boxShadow: "0 8px 40px rgba(0,0,0,0.8)" }}
     >
       {/* Video */}
-      <div className="relative aspect-video bg-black cursor-pointer" onClick={togglePlay}>
+      <div className="relative aspect-video bg-black cursor-pointer" onClick={togglePlay} data-tv-focusable tabIndex={0}>
         <video
           ref={videoRef}
           className="absolute inset-0 w-full h-full object-contain"
@@ -192,7 +279,7 @@ export default function FloatingPlayer() {
           muted={false}
           poster={
             floatingStream.poster
-              ? `${window.location.origin}/api/proxy?url=${encodeURIComponent(floatingStream.poster)}`
+              ? `${(getMediaApiBaseUrl() || window.location.origin).replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(floatingStream.poster)}`
               : undefined
           }
         />
@@ -216,6 +303,8 @@ export default function FloatingPlayer() {
           onClick={handleExpand}
           className="p-1.5 hover:bg-white/10 rounded-lg transition-colors shrink-0"
           title="Expand to full player"
+          data-tv-focusable
+          tabIndex={0}
         >
           <Maximize2 className="w-4 h-4 text-white/70" />
         </button>
@@ -224,6 +313,8 @@ export default function FloatingPlayer() {
           onClick={handleClose}
           className="p-1.5 hover:bg-white/10 rounded-lg transition-colors shrink-0"
           title="Close"
+          data-tv-focusable
+          tabIndex={0}
         >
           <X className="w-4 h-4 text-white/70" />
         </button>

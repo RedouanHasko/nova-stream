@@ -1,4 +1,4 @@
-import type { DeviceActivationResponse } from "./backendApi";
+import type { DeviceActivationResponse } from "./activationApi";
 import type { DeviceIdentity } from "./deviceIdentity";
 
 const ACTIVATION_CACHE_STORAGE_KEY = "nova_activation_cache";

@@ -1219,13 +1219,13 @@ router.post(
           const existing = await prisma.device.findUnique({
             where: { mac: normalizedMac },
           });
-          if (existing && existing.ownerResellerId)
+          if (existing && existing.ownerResellerId) {
             ownerId = existing.ownerResellerId;
-          else
-            return res.status(400).json({
-              error:
-                "ownerResellerId required for superadmin when device unknown",
-            });
+          } else {
+            // Allow superadmin to create devices without assigning a reseller
+            // (devices owned by the admin/system will have null ownerResellerId).
+            ownerId = null;
+          }
         }
         if (payerResellerId) payerId = Number(payerResellerId);
       } else {

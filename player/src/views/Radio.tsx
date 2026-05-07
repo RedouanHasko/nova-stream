@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { ArrowLeft, Loader2, Radio as RadioIcon, Search, Play, Pause, Volume2, Music, SkipBack, SkipForward, VolumeX, Lock, Unlock, Maximize2, Minimize2, Globe, Share2, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
+import { getMediaApiBaseUrl } from '../lib/activationApi';
 import Sidebar from '../components/Sidebar';
 import Logo from '../components/Logo';
 import WeatherWidget from '../components/WeatherWidget';
@@ -10,6 +11,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 import { usePlaylist } from '../context/PlaylistContext';
 import { toast } from 'sonner';
+import { focusNext, useTVRemote, handleHeaderZoneKey } from '../lib/remote';
 
 interface Station {
   name: string;
@@ -40,6 +42,8 @@ export default function Radio() {
     return saved ? JSON.parse(saved) : [];
   });
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const pinModalRef = useRef<HTMLDivElement | null>(null);
+  const radioRootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (stations.length > 0) {
@@ -109,7 +113,8 @@ export default function Radio() {
   const playStation = (station: Station) => {
     if (audioRef.current) {
       setIsBuffering(true);
-      const proxiedUrl = `/api/proxy?url=${encodeURIComponent(station.url)}`;
+      const base = getMediaApiBaseUrl() || window.location.origin;
+      const proxiedUrl = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(station.url)}`;
       audioRef.current.src = proxiedUrl;
       audioRef.current.play().catch(err => {
         console.error('Playback error:', err);
@@ -241,10 +246,28 @@ export default function Radio() {
   };
 
   // TV remote navigation for Radio
+  // Auto-focus first interactive element on load so D-pad works immediately
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      const first = document.querySelector<HTMLElement>('[data-tv-zone="header"] button, main button, main [tabindex]');
+      first?.focus();
+    });
+  }, []);
+
   useEffect(() => {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
+
+      if (showPinModal) {
+        if (key === "back" || key === "backspace") {
+          setShowPinModal(false);
+        }
+        return;
+      }
+
+      // Header zone: left/right navigate within navbar; down escapes to content
+      if (handleHeaderZoneKey(key, { onBack: () => navigate('/') })) return;
 
       if (key === "back" || key === "backspace") {
         if (isFullScreenPlayer) {
@@ -269,13 +292,46 @@ export default function Radio() {
         audioRef.current?.pause();
         return;
       }
+      // Directional navigation: move DOM focus through visible interactive elements
+      if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
+        focusNext(key, { root: radioRootRef.current });
+        return;
+      }
+      if (key === 'enter' || key === 'select') {
+        (document.activeElement as HTMLElement | null)?.click();
+        return;
+      }
     };
     window.addEventListener("tv-remote-key", handler);
     return () => window.removeEventListener("tv-remote-key", handler);
-  }, [isFullScreenPlayer, selectedCountry, selectedContinent, currentStation, isPlaying, navigate]);
+  }, [showPinModal, isFullScreenPlayer, selectedCountry, selectedContinent, currentStation, isPlaying, navigate]);
+  useEffect(() => {
+    if (!showPinModal) return;
+    const first = pinModalRef.current?.querySelector<HTMLElement>(
+      "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+    );
+    setTimeout(() => first?.focus(), 20);
+  }, [showPinModal]);
+
+  useTVRemote((key, event) => {
+    if (!showPinModal || !pinModalRef.current) return;
+    event?.stopImmediatePropagation();
+
+    if (key === "left" || key === "right" || key === "up" || key === "down") {
+      focusNext(key, { root: pinModalRef.current });
+      return;
+    }
+
+    if (key === "enter" || key === "select") {
+      const active = document.activeElement as HTMLElement | null;
+      if (active && pinModalRef.current.contains(active)) {
+        active.click();
+      }
+    }
+  });
 
   return (
-    <div className="flex flex-col h-screen text-white">
+    <div ref={radioRootRef} className="tv-browser-shell flex flex-col h-screen text-white">
       {/* PIN Modal */}
       <AnimatePresence>
         {showPinModal && (
@@ -290,6 +346,7 @@ export default function Radio() {
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
+              ref={pinModalRef}
               className="bg-zinc-900 border border-white/10 p-8 rounded-3xl max-w-sm w-full shadow-2xl"
               onClick={e => e.stopPropagation()}
             >
@@ -344,19 +401,25 @@ export default function Radio() {
       />
       
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 bg-black/40 border-b border-white/5">
+      <header data-tv-zone="header" className="tv-browser-header flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
-            <button onClick={() => navigate('/')} className="p-1 hover:bg-white/10 rounded-full">
+            <button
+              data-tv-focusable
+              onClick={() => navigate('/')}
+              className="tv-header-back-btn rounded-full p-2"
+              title="Back to Home"
+              aria-label="Back to Home"
+            >
               <ArrowLeft className="w-6 h-6" />
             </button>
             <WeatherWidget />
-            <nav className="flex items-center gap-6">
-              <button onClick={() => navigate('/')} className="text-white/60 hover:text-white font-medium">Home</button>
-              <button onClick={() => navigate('/live')} className="text-white/60 hover:text-white font-medium">Live</button>
-              <button onClick={() => navigate('/movies')} className="text-white/60 hover:text-white font-medium">Movies</button>
-              <button onClick={() => navigate('/series')} className="text-white/60 hover:text-white font-medium">Series</button>
-              <button className="text-primary font-bold border-b-2 border-primary">Radio</button>
+            <nav className="tv-nav-tabs flex items-center gap-1">
+              <button data-tv-focusable onClick={() => navigate('/')} className="tv-nav-tab">Home</button>
+              <button data-tv-focusable onClick={() => navigate('/live')} className="tv-nav-tab">Live</button>
+              <button data-tv-focusable onClick={() => navigate('/movies')} className="tv-nav-tab">Movies</button>
+              <button data-tv-focusable onClick={() => navigate('/series')} className="tv-nav-tab">Series</button>
+              <button data-tv-focusable className="tv-nav-tab tv-nav-tab--active">Radio</button>
             </nav>
           </div>
         </div>
@@ -364,9 +427,10 @@ export default function Radio() {
         <div className="flex items-center gap-4">
           {settings.parentalPin && (
             <button 
+              data-tv-focusable
               onClick={() => isParentalUnlocked ? lockParental() : setShowPinModal(true)}
               className={cn(
-                "p-2 rounded-full transition-all",
+                "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked ? "bg-primary text-white" : "bg-white/5 text-white/40 hover:bg-white/10"
               )}
               title={isParentalUnlocked ? "Lock Parental Content" : "Unlock Parental Content"}
@@ -374,15 +438,16 @@ export default function Radio() {
               {isParentalUnlocked ? <Unlock className="w-5 h-5" /> : <Lock className="w-5 h-5" />}
             </button>
           )}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
+          <div className="tv-search-shell w-[280px] md:w-[320px]">
+            <Search className="tv-search-icon" />
             <input 
+              data-tv-focusable
               type="text" 
               placeholder="Search..." 
               value={globalSearch}
               onChange={(e) => setGlobalSearch(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleGlobalSearch()}
-              className="bg-white/5 border border-white/10 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-primary w-64"
+              className="tv-search-input"
             />
           </div>
           <DigitalClock />
@@ -400,7 +465,7 @@ export default function Radio() {
         />
 
         {/* Main Content Area */}
-        <div className="flex-1 flex flex-col relative overflow-hidden bg-black/10">
+        <div className="tv-browser-content flex-1 flex flex-col relative overflow-hidden">
           <AnimatePresence>
             {isLoading && (
               <motion.div 
@@ -423,11 +488,20 @@ export default function Radio() {
               {filteredStations.map((s, index) => (
                 <div 
                   key={`${s.url}-${index}`} 
+                  data-tv-focusable
+                  tabIndex={0}
+                  role="button"
                   className={cn(
-                    "p-4 bg-white/5 border border-white/10 rounded-xl flex items-center gap-4 transition-all duration-200 hover:border-white/20 hover:bg-white/10 group cursor-pointer",
+                    "tv-radio-card p-4 bg-white/5 border border-white/10 rounded-xl flex items-center gap-4 transition-all duration-200 hover:border-white/20 hover:bg-white/10 group cursor-pointer",
                     currentStation?.url === s.url && "ring-2 ring-primary border-transparent bg-primary/10"
                   )}
                   onClick={() => playStation(s)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      playStation(s);
+                    }
+                  }}
                 >
                   <div className="w-12 h-12 rounded-lg bg-white/10 flex items-center justify-center overflow-hidden shrink-0 group-hover:scale-105 transition-transform">
                     {s.favicon ? (

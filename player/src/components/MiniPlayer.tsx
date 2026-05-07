@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import Hls from "hls.js";
+import { getMediaApiBaseUrl } from "../lib/activationApi";
 
 interface MiniPlayerProps {
   url: string;
@@ -14,7 +15,8 @@ export default function MiniPlayer({ url, poster }: MiniPlayerProps) {
     const video = videoRef.current;
     let hls: Hls | null = null;
 
-    const proxiedUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+    const base = getMediaApiBaseUrl() || window.location.origin;
+    const proxiedUrl = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(url)}`;
     const isM3u8 = url.includes(".m3u8");
 
     if (!isM3u8) {

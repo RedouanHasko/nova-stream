@@ -1,37 +1,149 @@
-@import "tailwindcss";
 @import "video.js/dist/video-js.css";
-
-@theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --color-primary: var(--primary-color);
-  --color-primary-hover: var(--primary-hover);
-}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
+  --font-sans: "Inter", "Noto Sans", "Segoe UI", "Helvetica Neue", Arial, Tahoma, ui-sans-serif, system-ui, sans-serif;
+  --font-arabic: "Noto Naskh Arabic", "Noto Sans Arabic", "Geeza Pro", Tahoma, Arial, "Segoe UI", sans-serif;
   --primary-rgb: 139, 0, 0;
   --primary-color: rgb(var(--primary-rgb));
   --primary-hover: rgba(var(--primary-rgb), 0.9);
   --bg-gradient: radial-gradient(circle at 50% 50%, #2d0b3d 0%, #1a0624 50%, #000000 100%);
+  color-scheme: dark;
 }
 
 body {
   margin: 0;
   padding: 0;
-  background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.6)), url('/images/img1.png');
+  background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.6)), url('../images/img1.png');
   background-size: cover;
   background-position: center;
   background-attachment: fixed;
   background-repeat: no-repeat;
   color: white;
   font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
   overflow: hidden;
   height: 100vh;
   width: 100vw;
 }
 
+/* Force script-aware fallbacks on TVs where default sans fonts miss Arabic glyphs. */
+html:lang(ar),
+html:lang(fa),
+html:lang(ur),
+html:lang(ps) {
+  font-family: var(--font-arabic);
+}
+
+html:lang(ar) body,
+html:lang(ar) button,
+html:lang(ar) input,
+html:lang(ar) select,
+html:lang(ar) textarea,
+html:lang(ar) option,
+html:lang(ar) optgroup {
+  font-family: var(--font-arabic);
+}
+
 #root {
   height: 100%;
   width: 100%;
+}
+
+/* Keep native form controls visually consistent across desktop and TV engines. */
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  background-image: none;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+}
+
+input,
+select,
+textarea {
+  background-color: rgba(12, 12, 12, 0.85);
+  border-color: rgba(255, 255, 255, 0.14);
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.92);
+}
+
+option,
+optgroup {
+  background-color: #111 !important;
+  color: #f3f3f3 !important;
+}
+
+/* Remove all browser default focus outlines globally — replaced with custom shadow effects */
+*:focus,
+*:focus-visible {
+  outline: none !important;
+  outline-offset: 0 !important;
+}
+
+input[type="checkbox"],
+input[type="radio"],
+progress,
+meter {
+  accent-color: var(--primary-color);
+}
+
+/* Activation screen fallback styles for older TV web engines. */
+.activation-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  position: relative;
+}
+
+.activation-card {
+  width: 100%;
+  max-width: 1280px;
+  border-radius: 36px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.72);
+  padding: 32px;
+  position: relative;
+}
+
+.activation-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.activation-action-btn {
+  width: 100%;
+  min-height: 58px;
+}
+
+.activation-device-meta {
+  margin-top: 8px;
+}
+
+@media (max-width: 960px) {
+  .activation-shell {
+    padding: 18px;
+  }
+
+  .activation-card {
+    border-radius: 24px;
+    padding: 20px;
+  }
 }
 
 /* Custom scrollbar */
@@ -60,6 +172,21 @@ body {
   letter-spacing: 0.01em;
 }
 
+[data-tv="true"] input,
+[data-tv="true"] select,
+[data-tv="true"] textarea {
+  background-color: rgba(8, 8, 8, 0.92);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.95);
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.95);
+}
+
+[data-tv="true"] option,
+[data-tv="true"] optgroup {
+  background-color: #090909 !important;
+  color: #f5f5f5 !important;
+}
+
 [data-tv="true"] button,
 [data-tv="true"] a {
   min-height: 48px;
@@ -72,20 +199,562 @@ body {
 [data-tv="true"] [tabindex]:focus-visible {
   outline: 3px solid var(--primary-color);
   outline-offset: 2px;
-  border-radius: 8px;
   box-shadow: 0 0 0 6px rgba(var(--primary-rgb), 0.25);
+  z-index: 10;
+  position: relative;
+  transform: scale(1.04);
+}
+
+/* TV-focused item scale (remote-selected item pops) */
+[data-tv="true"] .tv-focused,
+.tv-focused {
+  outline: 3px solid var(--primary-color, #e21d48);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgba(var(--primary-rgb, 226 29 72), 0.3);
+  transform: scale(1.04);
   z-index: 10;
   position: relative;
 }
 
-/* TV-focused item scale (remote-selected item pops) */
-[data-tv="true"] .tv-focused {
-  outline: 3px solid var(--primary-color);
-  outline-offset: 2px;
-  box-shadow: 0 0 0 6px rgba(var(--primary-rgb), 0.3);
-  transform: scale(1.04);
-  z-index: 10;
+/* Home menu tiles: zoom-only focus (no red square border/ring). */
+[data-tv="true"] .tv-focus-zoom-only:focus-visible {
+  outline: none;
+  box-shadow: none;
+  transform: scale(1.03);
+}
+
+/* Home view modern TV visuals */
+.home-tv-shell {
   position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.home-tv-topbar {
+  box-shadow: none;
+}
+
+.home-hero-copy h1 {
+  text-shadow: 0 10px 28px rgba(0, 0, 0, 0.44);
+}
+
+.home-deck-grid {
+  align-items: stretch;
+}
+
+.home-meta-ribbon {
+  background: transparent;
+  box-shadow: none;
+}
+
+.home-meta-ribbon__item {
+  display: flex;
+  min-width: 150px;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.home-meta-ribbon__label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.home-meta-ribbon__value {
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.home-meta-ribbon__divider {
+  width: 1px;
+  height: 28px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.home-remote-hints {
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(7, 12, 20, 0.68);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.52);
+}
+
+.home-expiry-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.home-time-hero {
+  text-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}
+
+.home-weather-hero {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.025));
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.22);
+}
+
+.home-status-strip {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02));
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+}
+
+.home-status-separator {
+  opacity: 0.7;
+}
+
+.home-tv-bg-orb {
+  position: absolute;
+  width: 38vw;
+  height: 38vw;
+  border-radius: 9999px;
+  filter: blur(72px);
+  pointer-events: none;
+  opacity: 0.34;
+}
+
+.home-tv-bg-orb--a {
+  top: -10vw;
+  left: -9vw;
+  background: radial-gradient(circle, rgba(220, 40, 60, 0.58), rgba(220, 40, 60, 0));
+}
+
+.home-tv-bg-orb--b {
+  right: -10vw;
+  bottom: -12vw;
+  background: radial-gradient(circle, rgba(80, 120, 255, 0.36), rgba(80, 120, 255, 0));
+}
+
+[data-tv="true"] .tv-home-focus:focus-visible {
+  outline: none;
+  box-shadow:
+    0 18px 55px rgba(0, 0, 0, 0.48),
+    0 0 0 1px rgba(255, 255, 255, 0.34),
+    0 0 38px rgba(var(--primary-rgb), 0.3);
+  transform: translateY(-4px) scale(1.03);
+  z-index: 12;
+  position: relative;
+}
+
+.tv-deck-card {
+  position: relative;
+  border-color: rgba(255, 255, 255, 0.2);
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.36);
+}
+
+.tv-utility-pill {
+  border: 1px solid rgba(255, 255, 255, 0.17);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.home-utility-action {
+  min-width: 260px;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+}
+
+.home-utility-action__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.tv-deck-card::before {
+  content: "";
+  position: absolute;
+  left: 26px;
+  top: -12px;
+  width: 116px;
+  height: 18px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(255, 217, 74, 0.98), rgba(255, 201, 36, 0.9));
+  box-shadow: 0 8px 24px rgba(255, 210, 64, 0.45);
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.tv-deck-card--gold {
+  background:
+    radial-gradient(circle at 18% 18%, rgba(255, 210, 80, 0.2), transparent 46%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.03));
+}
+
+.tv-deck-card--blue {
+  background:
+    radial-gradient(circle at 20% 22%, rgba(95, 190, 255, 0.2), transparent 46%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+}
+
+.tv-deck-card--violet {
+  background:
+    radial-gradient(circle at 20% 20%, rgba(195, 120, 255, 0.2), transparent 46%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+}
+
+.tv-deck-card--mint {
+  background:
+    radial-gradient(circle at 20% 18%, rgba(110, 255, 205, 0.2), transparent 46%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.03));
+}
+
+[data-tv="true"] .tv-deck-card:focus-visible,
+[data-tv="true"] .tv-utility-pill:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.45),
+    0 0 36px rgba(120, 200, 255, 0.28),
+    0 16px 42px rgba(0, 0, 0, 0.46);
+  transform: translateY(-3px) scale(1.02);
+}
+
+[data-tv="true"] .home-utility-action:focus-visible {
+  border-color: rgba(162, 226, 255, 0.6);
+}
+
+[data-tv="true"] .tv-orb-action:focus-visible {
+  outline: none !important;
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.55),
+    0 0 32px rgba(120, 200, 255, 0.3),
+    0 14px 34px rgba(0, 0, 0, 0.42) !important;
+  transform: translateY(-2px) scale(1.04);
+}
+
+[data-tv="true"] .tv-sidebar-item:focus-visible {
+  outline: none !important;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.5),
+    0 0 24px rgba(155, 230, 255, 0.24),
+    0 12px 30px rgba(0, 0, 0, 0.4) !important;
+  transform: translateY(-1px) scale(1.02);
+}
+
+[data-tv="true"] .home-tv-bg-orb {
+  filter: blur(56px);
+  opacity: 0.24;
+}
+
+[data-tv="true"] .tv-deck-card,
+[data-tv="true"] .home-weather-hero,
+[data-tv="true"] .tv-orb-action {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.tv-browser-shell {
+  background:
+    radial-gradient(circle at 12% 4%, rgba(188, 46, 71, 0.28), transparent 35%),
+    radial-gradient(circle at 84% 8%, rgba(77, 141, 255, 0.22), transparent 35%),
+    linear-gradient(180deg, rgba(4, 7, 15, 0.88), rgba(4, 7, 15, 0.66));
+  overflow: hidden;
+}
+
+.tv-browser-header {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: linear-gradient(180deg, rgba(9, 13, 24, 0.88), rgba(9, 13, 24, 0.5));
+  box-shadow: none;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  position: relative;
+  z-index: 20;
+}
+
+.tv-browser-header::after {
+  content: none;
+}
+
+.tv-browser-content {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.01));
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  contain: layout paint;
+}
+
+.tv-browser-toolbar {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+}
+
+.tv-browser-stat {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 999px;
+}
+
+.tv-key-hints {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(160deg, rgba(12, 14, 24, 0.78), rgba(12, 14, 24, 0.56));
+}
+
+.tv-nav-tabs {
+  padding: 6px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+.tv-nav-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.72);
+  border-radius: 12px;
+  padding: 9px 16px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+.tv-nav-tab:hover {
+  color: rgba(255, 255, 255, 0.96);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.tv-nav-tab--active {
+  color: #fff;
+  border-radius: 12px;
+  border-color: rgba(255, 255, 255, 0.36);
+  background: linear-gradient(145deg, rgba(var(--primary-rgb), 0.62), rgba(var(--primary-rgb), 0.22));
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.3),
+    0 0 28px rgba(var(--primary-rgb), 0.28);
+}
+
+[data-tv="true"] .tv-nav-tab:focus-visible {
+  outline: none !important;
+  color: #fff;
+  border-color: rgba(198, 244, 255, 0.65);
+  box-shadow:
+    0 0 0 1px rgba(216, 247, 255, 0.6),
+    0 0 22px rgba(130, 225, 255, 0.34);
+  transform: translateY(-1px);
+}
+
+.tv-search-shell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 300px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.03));
+  backdrop-filter: blur(6px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    0 12px 22px rgba(0, 0, 0, 0.24);
+  transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+
+.tv-search-shell:focus-within {
+  border-color: rgba(255, 255, 255, 0.4);
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.055));
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.2),
+    0 0 18px rgba(255, 255, 255, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.tv-header-back-btn,
+.tv-header-icon-btn {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.04));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  transition: transform 130ms ease, border-color 130ms ease, background 130ms ease;
+}
+
+.tv-header-back-btn:hover,
+.tv-header-icon-btn:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.17), rgba(255, 255, 255, 0.07));
+}
+
+.tv-search-icon {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+  transition: color 160ms ease;
+}
+
+.tv-search-shell:focus-within .tv-search-icon {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.tv-search-input {
+  width: 100%;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.95);
+  padding: 11px 16px 11px 42px;
+  font-size: 0.92rem;
+  font-weight: 550;
+  letter-spacing: 0;
+}
+
+.tv-search-input::placeholder {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.tv-search-input:focus {
+  outline: none;
+}
+
+.tv-nav-strip {
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+}
+
+.tv-category-rail {
+  background:
+    radial-gradient(circle at 8% 4%, rgba(255, 255, 255, 0.13), transparent 33%),
+    linear-gradient(165deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.02));
+}
+
+.tv-media-card {
+  transition: transform 180ms ease, filter 180ms ease;
+  will-change: transform;
+}
+
+.tv-radio-card {
+  will-change: transform;
+}
+
+[data-tv="true"] .tv-radio-card:focus-visible {
+  outline: none !important;
+  border-color: rgba(182, 240, 255, 0.62);
+  box-shadow:
+    0 0 0 1px rgba(212, 247, 255, 0.6),
+    0 0 30px rgba(120, 221, 255, 0.22),
+    0 14px 30px rgba(0, 0, 0, 0.42);
+  transform: translateY(-2px) scale(1.01);
+}
+
+.tv-media-poster::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 45%, rgba(0, 0, 0, 0.42));
+  pointer-events: none;
+}
+
+[data-tv="true"] .tv-media-card:focus-visible {
+  outline: none !important;
+  transform: translateY(-8px) scale(1.04);
+}
+
+[data-tv="true"] .tv-media-card:focus-visible .tv-media-poster {
+  box-shadow:
+    0 0 0 1px rgba(228, 249, 255, 0.72),
+    0 0 34px rgba(112, 223, 255, 0.4),
+    0 24px 44px rgba(0, 0, 0, 0.5);
+  border-color: rgba(210, 247, 255, 0.7);
+}
+
+[data-tv="true"] .tv-media-card:focus-visible .tv-media-title {
+  color: rgba(255, 255, 255, 1);
+}
+
+.tv-channel-row {
+  border-radius: 16px;
+  border: 1px solid transparent;
+}
+
+.tv-channel-row--selected {
+  background: linear-gradient(90deg, rgba(139, 0, 0, 0.34), rgba(139, 0, 0, 0.14));
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.tv-channel-row--focus {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(196, 246, 255, 0.45);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.33);
+}
+
+[data-tv="true"] .tv-channel-row:focus-visible {
+  outline: none !important;
+  border-color: rgba(203, 246, 255, 0.58);
+  box-shadow:
+    0 0 0 1px rgba(219, 250, 255, 0.58),
+    0 14px 30px rgba(0, 0, 0, 0.36),
+    0 0 24px rgba(116, 223, 255, 0.24);
+  transform: translateX(2px);
+}
+
+[data-tv="true"] .tv-deck-card:focus-visible {
+  border-color: rgba(152, 234, 255, 0.68);
+  background:
+    radial-gradient(circle at 15% 15%, rgba(140, 246, 255, 0.2), transparent 42%),
+    linear-gradient(155deg, rgba(168, 246, 255, 0.22), rgba(255, 255, 255, 0.05));
+  box-shadow:
+    0 0 0 1px rgba(196, 248, 255, 0.55),
+    0 0 58px rgba(120, 235, 255, 0.36),
+    0 24px 54px rgba(0, 0, 0, 0.52);
+  transform: translateY(-10px) scale(1.035) rotate(-1.7deg);
+  animation: tvDeckFocusFloat 2.8s ease-in-out infinite !important;
+}
+
+[data-tv="true"] .tv-deck-card:focus-visible::before {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@keyframes tvDeckFocusFloat {
+  0%,
+  100% {
+    transform: translateY(-10px) scale(1.035) rotate(-1.7deg);
+  }
+  50% {
+    transform: translateY(-14px) scale(1.04) rotate(-1.2deg);
+  }
+}
+
+@media (max-width: 1480px) {
+  .home-deck-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+  }
+
+  .home-meta-ribbon {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+.tv-orb-action {
+  transition: transform 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
 }
 
 /* Disable hover effects on TV (no mouse cursor) */
@@ -99,15 +768,8 @@ body {
   transition-duration: 0.15s !important;
 }
 
-/* Disable expensive GPU effects on TV hardware */
-[data-tv="true"] .backdrop-blur-md,
-[data-tv="true"] .backdrop-blur-sm,
-[data-tv="true"] .backdrop-blur-lg,
-[data-tv="true"] .backdrop-blur-xl {
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-  background-color: rgba(0, 0, 0, 0.85) !important;
-}
+/* Keep Tailwind's native backdrop blur behavior on TV so modal/card glass
+   appearance matches dev mode. */
 
 /* Disable box-shadow on TV to reduce compositor work */
 [data-tv="true"] .shadow-lg,
