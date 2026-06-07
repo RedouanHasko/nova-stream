@@ -37,6 +37,8 @@ import { IPTVService, SeriesStream } from "../services/iptvService";
 import { getFlagForCategory } from "../lib/flags";
 import { reportPlaybackDebug } from "../lib/playbackDebug";
 import { focusNext, useTVRemote, handleHeaderZoneKey, focusHeader } from "../lib/remote";
+import { getHDPosterUrl } from "../lib/imageOptimization";
+import { xtreamSeriesUrl } from "../lib/xtreamUrls";
 
 export default function Series() {
   const navigate = useNavigate();
@@ -61,12 +63,17 @@ export default function Series() {
     isParentalUnlocked,
     unlockParental,
     lockParental,
+    categoryCounts: indexedCategoryCounts,
+    setCategoryCount,
   } = usePlaylist();
 
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const INITIAL_VISIBLE = 36;
-  const LOAD_STEP = 36;
+  // webOS TV is CPU-constrained; render fewer items initially for smooth interaction
+  const isWebOS = document.documentElement.dataset.tv === "true";
+  const panelHost = activePlaylist?.host || "";
+  const INITIAL_VISIBLE = isWebOS ? 18 : 36;
+  const LOAD_STEP = isWebOS ? 18 : 36;
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const [localSeriesStreams, setLocalSeriesStreams] = useState<
@@ -102,10 +109,34 @@ export default function Series() {
   const fetchedAllSeriesRef = useRef(false);
   const CARD_GAP = 16;
 
+  const MAX_SERIES_CATEGORY_CACHE = isWebOS ? 1 : 12;
+  const trimSeriesCategoryCache = (
+    map: Map<string, SeriesStream[]>,
+    max: number,
+    keepId?: string,
+  ) => {
+    for (const k of Array.from(map.keys())) {
+      if (k !== keepId) map.delete(k);
+    }
+    while (map.size > max) {
+      const k = map.keys().next().value;
+      if (k === undefined || k === keepId) break;
+      map.delete(k);
+    }
+  };
+
   useEffect(() => {
     seriesCategoryCacheRef.current.clear();
     fetchedAllSeriesRef.current = false;
   }, [activePlaylist?.id]);
+
+  // webOS: avoid "All" — it forces a full-catalog fetch that OOMs the TV browser.
+  useEffect(() => {
+    if (!isWebOS) return;
+    const cats = playlistData.seriesCategories || [];
+    if (cats.length === 0 || activeCategory !== "all") return;
+    setActiveCategory(String(cats[0].category_id));
+  }, [isWebOS, playlistData.seriesCategories, activeCategory]);
 
   // ------- Watch progress -------
   const getProgressStore = (): Record<string, any> => {
@@ -137,6 +168,19 @@ export default function Series() {
     return `${s}s`;
   };
 
+  useEffect(() => {
+    if (!activePlaylist || activePlaylist.type !== "xtream") return;
+    if (!isWebOS) return;
+    if ((playlistData.seriesCategories || []).length > 0) return;
+    fetchSeries().catch(() => {});
+  }, [
+    activePlaylist?.id,
+    activePlaylist?.type,
+    isWebOS,
+    playlistData.seriesCategories?.length,
+    fetchSeries,
+  ]);
+
   // If prefetch didn't load Series streams, fetch per-category on demand.
   useEffect(() => {
     if (!activePlaylist) return;
@@ -153,6 +197,15 @@ export default function Series() {
 
     const fetchCategory = async (catId: string) => {
       try {
+        if (isWebOS) {
+          trimSeriesCategoryCache(
+            seriesCategoryCacheRef.current,
+            MAX_SERIES_CATEGORY_CACHE,
+            catId,
+          );
+          setLocalSeriesStreams(null);
+          setVisibleCount(INITIAL_VISIBLE);
+        }
         const cached = seriesCategoryCacheRef.current.get(catId);
         if (cached) {
           setLocalSeriesStreams(cached);
@@ -169,7 +222,17 @@ export default function Series() {
         if (!cancelled) {
           const safeStreams = streams || [];
           seriesCategoryCacheRef.current.set(catId, safeStreams);
+          if (isWebOS) {
+            trimSeriesCategoryCache(
+              seriesCategoryCacheRef.current,
+              MAX_SERIES_CATEGORY_CACHE,
+              catId,
+            );
+          } else {
+            trimSeriesCategoryCache(seriesCategoryCacheRef.current, MAX_SERIES_CATEGORY_CACHE);
+          }
           setLocalSeriesStreams(safeStreams);
+          setCategoryCount("series", catId, safeStreams.length);
         }
       } catch (err) {
         console.error("fetchSeries category failed:", err);
@@ -191,10 +254,10 @@ export default function Series() {
       };
     }
 
-    // If 'all' is selected, fetch all series streams via context helper
+    // Desktop: "All" loads the full series catalog. webOS: per-category only (OOM-safe).
     const cats = playlistData.seriesCategories || [];
     if (activeCategory === "all") {
-      if (!isFetchingSeries && !fetchedAllSeriesRef.current) {
+      if (!isWebOS && !isFetchingSeries && !fetchedAllSeriesRef.current) {
         fetchedAllSeriesRef.current = true;
         fetchSeries().catch((err: any) => {
           fetchedAllSeriesRef.current = false;
@@ -304,11 +367,11 @@ export default function Series() {
     const el = listScrollRef.current;
     if (!el) return;
     let ticking = false;
+    const threshold = isWebOS ? 600 : 800; // px from bottom - trigger sooner on webOS
     const onScroll = () => {
       if (ticking) return;
       ticking = true;
       requestAnimationFrame(() => {
-        const threshold = 800;
         if (el.scrollHeight - (el.scrollTop + el.clientHeight) < threshold) {
           setVisibleCount((v) => Math.min((filteredSeries?.length || 0), v + LOAD_STEP));
         }
@@ -317,7 +380,7 @@ export default function Series() {
     };
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
-  }, [filteredSeries.length, LOAD_STEP]);
+  }, [filteredSeries.length, LOAD_STEP, isWebOS]);
 
   // Remove old IntersectionObserver / loadMore from here
 
@@ -325,18 +388,25 @@ export default function Series() {
     if (!Array.isArray(series))
       return [{ id: "all", name: t.allSeries, count: 0 }];
     const counts: Record<string, number> = {};
-    for (let i = 0; i < series.length; i++) {
-      const catId = series[i].category_id;
-      counts[catId] = (counts[catId] || 0) + 1;
+    if (!isWebOS) {
+      for (let i = 0; i < series.length; i++) {
+        const catId = series[i].category_id;
+        counts[catId] = (counts[catId] || 0) + 1;
+      }
     }
 
     return [
-      { id: "all", name: t.allSeries, count: series.length },
+      ...(isWebOS
+        ? []
+        : [{ id: "all", name: t.allSeries, count: series.length }]),
       { id: "fav", name: `⭐ ${t.favorites}`, count: favorites.series.length },
       ...(categories || []).map((cat) => ({
         id: cat.category_id,
         name: `${getFlagForCategory(cat.category_name)} ${cat.category_name}`,
-        count: counts[cat.category_id] || 0,
+        count: isWebOS
+          ? (indexedCategoryCounts.series[cat.category_id] ??
+            (activeCategory === cat.category_id ? series.length : 0))
+          : counts[cat.category_id] || 0,
         locked:
           (settings.parentalLockedCategories?.series || []).includes(
             cat.category_id,
@@ -349,11 +419,41 @@ export default function Series() {
     favorites.series.length,
     settings.parentalLockedCategories?.series,
     isParentalUnlocked,
+    isWebOS,
+    indexedCategoryCounts.series,
+    activeCategory,
   ]);
 
   const activeCategoryLabel = useMemo(() => {
     return sidebarItems.find((item) => item.id === activeCategory)?.name || t.allSeries;
   }, [sidebarItems, activeCategory, t.allSeries]);
+
+  const episodeSeasons = useMemo(() => {
+    const episodes = seriesInfo?.episodes;
+    if (!episodes || typeof episodes !== "object") return [];
+
+    return Object.entries(episodes)
+      .map(([seasonNum, value]) => {
+        const seasonEpisodes = Array.isArray(value)
+          ? value
+          : value && typeof value === "object"
+            ? "id" in value || "episode_num" in value
+              ? [value]
+              : Object.values(value)
+            : [];
+
+        return {
+          seasonNum,
+          episodes: seasonEpisodes.filter(
+            (episode) =>
+              episode &&
+              typeof episode === "object" &&
+              ("id" in episode || "episode_num" in episode),
+          ),
+        };
+      })
+      .filter((season) => season.episodes.length > 0);
+  }, [seriesInfo]);
 
   const handleSeriesClick = useCallback(async (s: SeriesStream) => {
     setSelectedSeries(s);
@@ -410,7 +510,7 @@ export default function Series() {
     const id = episode.id;
     const ext = episode.container_extension || "mp4";
 
-    const url = `${baseUrl}/series/${user}/${pass}/${id}.${ext}`;
+    const url = xtreamSeriesUrl(baseUrl, user!, pass!, id, ext);
 
     reportPlaybackDebug("selection.seriesEpisode", {
       playlistId: activePlaylist.id,
@@ -452,7 +552,7 @@ export default function Series() {
         seriesName: selectedSeries?.name ?? "",
         episodes: episodes.map((ep) => ({
           ...ep,
-          url: `${baseUrl}/series/${user}/${pass}/${ep.id}.${ep.container_extension || "mp4"}`,
+          url: xtreamSeriesUrl(baseUrl, user!, pass!, ep.id, ep.container_extension || "mp4"),
           fullTitle: `${selectedSeries?.name} - S${ep.season}E${ep.episode_num}: ${ep.title}`,
         })),
         currentIndex: index,
@@ -539,23 +639,76 @@ export default function Series() {
   // Which panel currently owns D-pad focus: sidebar categories or series grid
   const [sidebarTVFocus, setSidebarTVFocus] = useState(false);
 
+  // Auto-focus first card on load if nothing focused
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!document.activeElement || document.activeElement === document.body) {
+        const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+        first?.focus();
+      }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Auto-focus modal when it opens
+  useEffect(() => {
+    if (selectedSeries) {
+      setTimeout(() => {
+        // Try to focus the first season/episode button or the close button
+        const firstBtn = seriesModalRef.current?.querySelector<HTMLElement>('button[data-tv-focusable]:not([aria-label="Close"])');
+        if (firstBtn) firstBtn.focus();
+        else {
+           const closeBtn = document.querySelector<HTMLElement>('button[aria-label="Close"]');
+           closeBtn?.focus();
+        }
+      }, 300);
+    }
+  }, [selectedSeries]);
+
   // TV remote navigation — pure spatial: focusNext() finds the element
   // visually above/below/left/right of whatever currently has DOM focus.
   useEffect(() => {
-    if (document.documentElement.dataset.tv !== "true") return;
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
-      if (showPinModal || !!selectedSeries || showSortMenu) return;
+
+      // Handle Modal Focus if open
+      if (showPinModal || !!selectedSeries || showSortMenu) {
+        if (key === "back" || key === "red") {
+          if (showSortMenu) setShowSortMenu(false);
+          else if (showPinModal) setShowPinModal(false);
+          else if (selectedSeries) setSelectedSeries(null);
+          return;
+        }
+        if (key === "enter" || key === "select") {
+          (document.activeElement as HTMLElement | null)?.click();
+          return;
+        }
+        if (["left", "right", "up", "down"].includes(key)) {
+          const modalRoot = seriesModalRef.current || pinModalRef.current || sortMenuRef.current;
+          if (modalRoot) {
+            focusNext(key as any, { root: modalRoot });
+          }
+        }
+        return;
+      }
 
       // While sidebar owns TV focus, only allow back to release it.
       if (sidebarTVFocus) {
-        if (key === "back") setSidebarTVFocus(false);
+        if (key === "back" || key === "red") setSidebarTVFocus(false);
         return;
       }
 
       // Header zone handles its own left/right/enter/back.
-      if (handleHeaderZoneKey(key, { onBack: () => navigate("/") })) return;
+      if (handleHeaderZoneKey(key, { 
+        onBack: () => navigate("/"),
+        onEscapeDown: () => {
+          const first = document.querySelector<HTMLElement>(
+            ".tv-live-column [data-tv-focusable], aside [data-tv-focusable]",
+          );
+          first?.focus();
+        }
+      })) return;
 
       if (key === "green") {
         focusSearch();
@@ -570,7 +723,7 @@ export default function Series() {
         return;
       }
 
-      if (key === "back") { navigate("/"); return; }
+      if (key === "back" || key === "red") { navigate("/"); return; }
       if (key === "enter" || key === "select") {
         (document.activeElement as HTMLElement | null)?.click();
         return;
@@ -629,16 +782,35 @@ export default function Series() {
     sidebarTVFocus,
     toggleFavoriteFilter,
   ]);
-
   // Auto-focus first card when the series list loads/changes (TV only).
   useEffect(() => {
-    if (document.documentElement.dataset.tv !== "true") return;
-    if (filteredSeries.length === 0) return;
-    requestAnimationFrame(() => {
-      const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+    if (selectedSeries || showPinModal || showSortMenu) return;
+    if (filteredSeries.length > 0 && !sidebarTVFocus) {
+      const first = gridContainerRef.current?.querySelector<HTMLElement>(
+        "[data-tv-focusable]",
+      );
       first?.focus();
-    });
-  }, [filteredSeries]);
+    }
+  }, [filteredSeries.length, sidebarTVFocus, selectedSeries, showPinModal, showSortMenu]);
+
+  // Auto-focus first button when modal opens
+  useEffect(() => {
+    if (selectedSeries) {
+      setTimeout(() => {
+        const first = seriesModalRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+        first?.focus();
+      }, 100);
+    }
+  }, [selectedSeries]);
+
+  useEffect(() => {
+    if (showPinModal) {
+      setTimeout(() => {
+        const first = pinModalRef.current?.querySelector<HTMLElement>("input, button[data-tv-focusable]");
+        first?.focus();
+      }, 100);
+    }
+  }, [showPinModal]);
 
   useEffect(() => {
     if (activeCategory !== "fav") {
@@ -651,57 +823,6 @@ export default function Series() {
       if (colorActionTimerRef.current) clearTimeout(colorActionTimerRef.current);
     };
   }, []);
-
-  useEffect(() => {
-    const focusFirst = (container: HTMLElement | null) => {
-      if (!container) return;
-      const first = container.querySelector<HTMLElement>(
-        "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
-      );
-      first?.focus();
-    };
-
-    const root = showPinModal
-      ? pinModalRef.current
-      : selectedSeries
-        ? seriesModalRef.current
-        : showSortMenu
-          ? sortMenuRef.current
-          : null;
-    if (!root) return;
-    setTimeout(() => focusFirst(root), 20);
-  }, [showPinModal, selectedSeries, showSortMenu]);
-
-  useTVRemote((key, event) => {
-    const modalRoot = showPinModal
-      ? pinModalRef.current
-      : selectedSeries
-        ? seriesModalRef.current
-        : showSortMenu
-          ? sortMenuRef.current
-          : null;
-    if (!modalRoot) return;
-    event?.stopImmediatePropagation();
-
-    if (key === "back") {
-      if (showPinModal) setShowPinModal(false);
-      else if (selectedSeries) setSelectedSeries(null);
-      else if (showSortMenu) setShowSortMenu(false);
-      return;
-    }
-
-    if (key === "left" || key === "right" || key === "up" || key === "down") {
-      focusNext(key, { root: modalRoot });
-      return;
-    }
-
-    if (key === "enter" || key === "select") {
-      const active = document.activeElement as HTMLElement | null;
-      if (active && modalRoot.contains(active)) {
-        active.click();
-      }
-    }
-  });
 
   return (
     <div className="tv-browser-shell flex flex-col h-screen">
@@ -762,15 +883,17 @@ export default function Series() {
                   />
                   <div className="flex gap-3">
                     <button
+                      data-tv-focusable
                       type="button"
                       onClick={() => setShowPinModal(false)}
-                      className="flex-1 px-6 py-4 bg-white/5 hover:bg-white/10 rounded-2xl font-bold transition-colors"
+                      className="tv-channel-row flex-1 px-6 py-4 font-bold mx-0"
                     >
                       Cancel
                     </button>
                     <button
+                      data-tv-focusable
                       type="submit"
-                      className="flex-1 px-6 py-4 bg-primary hover:bg-primary/90 rounded-2xl font-bold transition-colors"
+                      className="tv-channel-row tv-channel-row--selected flex-1 px-6 py-4 font-bold mx-0"
                     >
                       Unlock
                     </button>
@@ -786,6 +909,7 @@ export default function Series() {
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
             <button
+              data-tv-focusable
               onClick={() => navigate("/")}
               className="tv-header-back-btn rounded-full p-2"
               title="Back to Home"
@@ -795,31 +919,19 @@ export default function Series() {
             </button>
             <WeatherWidget />
             <nav className="tv-nav-tabs flex items-center gap-1">
-              <button
-                onClick={() => navigate("/")}
-                className="tv-nav-tab"
-              >
+              <button data-tv-focusable onClick={() => navigate("/")} className="tv-nav-tab">
                 {t.home}
               </button>
-              <button
-                onClick={() => navigate("/live")}
-                className="tv-nav-tab"
-              >
+              <button data-tv-focusable onClick={() => navigate("/live")} className="tv-nav-tab">
                 {t.live}
               </button>
-              <button
-                onClick={() => navigate("/movies")}
-                className="tv-nav-tab"
-              >
+              <button data-tv-focusable onClick={() => navigate("/movies")} className="tv-nav-tab">
                 {t.movies}
               </button>
-              <button className="tv-nav-tab tv-nav-tab--active">
+              <button data-tv-focusable className="tv-nav-tab tv-nav-tab--active">
                 {t.series}
               </button>
-              <button
-                onClick={() => navigate("/radio")}
-                className="tv-nav-tab"
-              >
+              <button data-tv-focusable onClick={() => navigate("/radio")} className="tv-nav-tab">
                 {t.radio}
               </button>
             </nav>
@@ -829,13 +941,14 @@ export default function Series() {
         <div className="flex items-center gap-4">
           {settings.parentalPin && (
             <button
+              data-tv-focusable
               onClick={() =>
                 isParentalUnlocked ? lockParental() : setShowPinModal(true)
               }
               className={cn(
                 "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked
-                  ? "bg-primary text-white"
+                  ? "tv-header-icon-btn--on text-white"
                   : "bg-white/5 text-white/40 hover:bg-white/10",
               )}
               title={
@@ -868,13 +981,14 @@ export default function Series() {
       </header>
 
       {/* Main Content */}
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className="flex flex-1 overflow-hidden relative bg-zinc-950">
         {/* Sidebar */}
         <Sidebar
           items={sidebarItems}
           activeId={activeCategory}
           onSelect={handleCategorySelect}
           hasTVFocus={sidebarTVFocus}
+          onTVFocusAcquire={() => setSidebarTVFocus(true)}
           onTVFocusRelease={() => {
             setSidebarTVFocus(false);
             const first = gridContainerRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
@@ -887,111 +1001,119 @@ export default function Series() {
         />
 
         {/* Series Grid */}
-        <div ref={gridContainerRef} className="tv-browser-content flex-1 flex flex-col overflow-hidden">
+        <div ref={gridContainerRef} className="tv-live-column flex-1 flex flex-col overflow-hidden border-r border-white/5 bg-black/20">
           {!isConnected ? (
             <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
               <div className="p-6 bg-white/5 rounded-full">
                 <Tv className="w-12 h-12 text-white/20" />
               </div>
               <div className="flex flex-col gap-2">
-                <h3 className="text-xl font-bold">No Playlist Connected</h3>
+                <h3 className="text-xl font-bold">{t.noPlaylistConnected}</h3>
                 <p className="text-white/40 max-w-xs">
                   Please add a playlist in settings to view series.
                 </p>
               </div>
               <button
+                data-tv-focusable
                 onClick={() => navigate("/playlist-setup")}
-                className="bg-primary px-8 py-3 rounded-xl font-bold hover:bg-primary-hover transition-colors"
+                className="tv-channel-row tv-channel-row--selected px-8 py-3 mx-0 font-bold uppercase tracking-widest text-sm"
               >
-                Add Playlist
+                {t.addPlaylistBtn}
               </button>
             </div>
           ) : (
             <>
-              <div className="px-8 pt-7 pb-4">
-                <div className="tv-nav-strip mb-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold uppercase tracking-[0.14em] text-white/40">Category</span>
-                    <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/90">{activeCategoryLabel}</span>
-                  </div>
-                  <span className={cn(
-                    "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide",
-                    sidebarTVFocus ? "bg-emerald-500/20 text-emerald-200" : "bg-cyan-500/20 text-cyan-100",
-                  )}>
-                    {sidebarTVFocus ? "Categories Focus" : "Grid Focus"}
-                  </span>
-                </div>
-                {activePlaylist && activePlaylist.type !== "xtream" && (
-                  <div className="mb-4 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200">
-                    <strong>Note:</strong> Series require an Xtream-type playlist. Current:{" "}
-                    <span className="font-bold">{activePlaylist.type}</span>.
-                  </div>
-                )}
-                <div className="tv-browser-toolbar flex items-center justify-between mb-5 px-4 py-3">
-                  <div className="relative">
-                    <button
-                      onClick={() => setShowSortMenu(!showSortMenu)}
-                      className="flex items-center gap-2 bg-white/5 hover:bg-white/10 px-4 py-2 rounded-lg transition-colors"
-                    >
-                      <span className="font-medium">
-                        {sortBy === "default" && "Default Order"}
-                        {sortBy === "name" && "Name (A-Z)"}
-                        {sortBy === "rating" && "Top Rated"}
-                        {sortBy === "newest" && "Newest Added"}
-                      </span>
-                      <ChevronDown
-                        className={cn(
-                          "w-4 h-4 transition-transform",
-                          showSortMenu && "rotate-180",
-                        )}
-                      />
-                    </button>
-
-                    <AnimatePresence>
-                      {showSortMenu && (
-                        <motion.div
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: 10 }}
-                          ref={sortMenuRef}
-                          className="absolute top-full left-0 mt-2 bg-zinc-900 border border-white/10 rounded-xl p-2 min-w-[180px] z-50 shadow-2xl"
-                        >
-                          {[
-                            { id: "default", label: "Default Order" },
-                            { id: "name", label: "Name (A-Z)" },
-                            { id: "rating", label: "Top Rated" },
-                            { id: "newest", label: "Newest Added" },
-                          ].map((option) => (
-                            <button
-                              key={option.id}
-                              onClick={() => {
-                                setSortBy(option.id as any);
-                                setShowSortMenu(false);
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
-                                sortBy === option.id
-                                  ? "bg-primary text-white"
-                                  : "hover:bg-white/10 text-white/80",
-                              )}
-                            >
-                              {option.label}
-                            </button>
-                          ))}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                  <div className="flex items-center gap-3">
+              <div className="flex items-center justify-between px-8 py-6 bg-linear-to-b from-white/[0.02] to-transparent border-b border-white/5">
+                <div className="flex flex-col gap-1 min-w-0">
+                  <h2 className="text-3xl font-black text-white tracking-tight uppercase truncate">
+                    {activeCategoryLabel}
+                  </h2>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <span className="text-xs font-black text-white/30 tracking-[0.2em] uppercase">
+                      {filteredSeries.length} {t.series}
+                    </span>
                     {isFetchingSeries && (
                       <Loader2 className="w-4 h-4 animate-spin text-primary" />
                     )}
-                    <span className="tv-browser-stat px-3 py-1 text-white/70 text-sm font-semibold">
-                      {filteredSeries.length} series
+                    <div className="h-1 w-1 rounded-full bg-white/20" />
+                    <span
+                      className={cn(
+                        "text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded",
+                        sidebarTVFocus
+                          ? "bg-emerald-500/10 text-emerald-500"
+                          : "bg-primary/10 text-primary",
+                      )}
+                    >
+                      {sidebarTVFocus ? t.choosingCategory : t.browsingList}
                     </span>
                   </div>
                 </div>
-              </div>{/* end px-8 header */}
+              </div>
+
+              <div className="px-4 py-2 relative">
+                <button
+                  data-tv-focusable
+                  onClick={() => setShowSortMenu(!showSortMenu)}
+                  className="tv-channel-row flex items-center gap-3 w-full h-[82px] px-4 text-left mx-2 my-1 hover:bg-white/6"
+                >
+                  <ChevronDown
+                    className={cn(
+                      "w-5 h-5 text-white/45 shrink-0 transition-transform",
+                      showSortMenu && "rotate-180",
+                    )}
+                  />
+                  <div className="flex-1 min-w-0">
+                    <span className="block text-lg font-medium text-white/85">Sort</span>
+                    <span className="block text-[11px] text-white/35 uppercase tracking-wide">
+                      {sortBy === "default" && "Default Order"}
+                      {sortBy === "name" && "Name (A-Z)"}
+                      {sortBy === "rating" && "Top Rated"}
+                      {sortBy === "newest" && "Newest Added"}
+                    </span>
+                  </div>
+                </button>
+
+                <AnimatePresence>
+                  {showSortMenu && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 8 }}
+                      ref={sortMenuRef}
+                      className="tv-sort-menu absolute left-4 right-4 top-full mt-1 z-50 flex flex-col gap-1 p-2"
+                    >
+                      {[
+                        { id: "default", label: "Default Order" },
+                        { id: "name", label: "Name (A-Z)" },
+                        { id: "rating", label: "Top Rated" },
+                        { id: "newest", label: "Newest Added" },
+                      ].map((option) => (
+                        <button
+                          key={option.id}
+                          data-tv-focusable
+                          onClick={() => {
+                            setSortBy(option.id as typeof sortBy);
+                            setShowSortMenu(false);
+                          }}
+                          className={cn(
+                            "tv-channel-row tv-sort-menu__item flex items-center gap-3 w-full h-[72px] px-4 text-left mx-0 my-0",
+                            sortBy === option.id && "tv-channel-row--selected",
+                          )}
+                        >
+                          <span className="text-lg font-medium text-white/85">{option.label}</span>
+                        </button>
+                      ))}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {activePlaylist && activePlaylist.type !== "xtream" && (
+                <div className="mx-6 mb-2 p-4 rounded-2xl bg-yellow-900/10 border border-yellow-700/10 text-yellow-200 text-sm">
+                  <strong>Note:</strong> Series require an Xtream-type playlist. Current:{" "}
+                  <span className="font-bold">{activePlaylist.type}</span>.
+                </div>
+              )}
 
               {filteredSeries.length === 0 && !isFetchingSeries ? (
                 <div className="flex flex-col items-center justify-center h-64 text-white/40">
@@ -999,36 +1121,64 @@ export default function Series() {
                   <p>{t.noSeriesFound}</p>
                 </div>
               ) : (
-                <div ref={listScrollRef} className="flex-1 overflow-y-auto px-8 pb-8 scrollbar-hide">
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
-                      gap: CARD_GAP,
-                    }}
-                  >
-                    {filteredSeries.slice(0, visibleCount).map((item, idx) => {
-                      const prog = progressStore?.[String(item.series_id)];
-                      const cardProgress =
-                        prog?.duration > 0
-                          ? prog.currentTime / prog.duration
+                <div ref={listScrollRef} className="flex-1 overflow-y-auto scrollbar-hide px-2 pb-10">
+                  {isWebOS ? (
+                    <div className="flex flex-col gap-2">
+                      {filteredSeries.slice(0, visibleCount).map((item, idx) => {
+                        const prog = progressStore?.[String(item.series_id)];
+                        const cardProgress =
+                          prog?.duration > 0
+                            ? prog.currentTime / prog.duration
+                            : undefined;
+                        const cardLabel = prog
+                          ? `S${prog.season}E${prog.episodeNum}`
                           : undefined;
-                      const cardLabel = prog
-                        ? `S${prog.season}E${prog.episodeNum}`
-                        : undefined;
-                      return (
-                        <div key={item.series_id}>
+                        return (
                           <MovieCard
+                            key={item.series_id}
+                            rowIndex={idx + 1}
+                            mediaKind="series"
                             title={item.name}
                             poster={item.cover}
                             onClick={() => handleSeriesClick(item)}
                             progress={cardProgress}
                             progressLabel={cardLabel}
                           />
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div
+                      className="px-6"
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
+                        gap: CARD_GAP,
+                      }}
+                    >
+                      {filteredSeries.slice(0, visibleCount).map((item) => {
+                        const prog = progressStore?.[String(item.series_id)];
+                        const cardProgress =
+                          prog?.duration > 0
+                            ? prog.currentTime / prog.duration
+                            : undefined;
+                        const cardLabel = prog
+                          ? `S${prog.season}E${prog.episodeNum}`
+                          : undefined;
+                        return (
+                          <div key={item.series_id}>
+                            <MovieCard
+                              title={item.name}
+                              poster={item.cover}
+                              onClick={() => handleSeriesClick(item)}
+                              progress={cardProgress}
+                              progressLabel={cardLabel}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </>
@@ -1040,329 +1190,259 @@ export default function Series() {
       <AnimatePresence>
         {selectedSeries && (
           <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8 bg-black/90 backdrop-blur-md"
-            onClick={() => setSelectedSeries(null)}
+            initial={{ opacity: 0, x: "100%" }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: "100%" }}
+            transition={{ type: "spring", damping: 25, stiffness: 200 }}
+            ref={seriesModalRef}
+            className="fixed inset-0 z-[100] bg-zinc-950 flex flex-col md:flex-row overflow-hidden"
           >
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0, y: 20 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.9, opacity: 0, y: 20 }}
-              ref={seriesModalRef}
-              className="bg-zinc-900 w-full max-w-6xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative"
-              onClick={(e) => e.stopPropagation()}
-            >
+              {/* FIXED CLOSE BUTTON - Fixed to viewport to prevent any movement */}
               <button
+                data-tv-focusable
                 onClick={() => setSelectedSeries(null)}
-                className="absolute top-6 right-6 z-10 p-2 bg-black/40 hover:bg-white/10 rounded-full transition-colors"
+                className="fixed top-12 right-12 z-[200] flex items-center justify-center w-16 h-16 bg-white/10 hover:bg-white/20 focus:bg-primary focus:text-white rounded-full transition-all duration-200 outline-none ring-4 ring-transparent focus:ring-primary/40 shadow-2xl"
+                aria-label="Close"
               >
-                <X className="w-6 h-6" />
+                <X className="w-8 h-8" />
               </button>
 
-              {/* Poster / Backdrop Section */}
-              <div className="w-full md:w-1/3 aspect-[2/3] md:aspect-auto relative group overflow-hidden">
-                {/* Backdrop hero behind poster */}
-                {seriesInfo?.info?.backdrop_path?.[0] && (
-                  <img
-                    src={seriesInfo.info.backdrop_path[0]}
-                    alt=""
-                    className="absolute inset-0 w-full h-full object-cover opacity-30 scale-110"
-                    referrerPolicy="no-referrer"
-                    loading="lazy"
-                  />
-                )}
+              {/* Backdrop Background (Subtle) */}
+              <div className="absolute inset-0 pointer-events-none opacity-20">
+                {seriesInfo?.info?.backdrop_path?.[0] ? (
+                  <img src={getHDPosterUrl(seriesInfo.info.backdrop_path[0], panelHost)} className="w-full h-full object-cover blur-2xl" alt="" referrerPolicy="no-referrer" />
+                ) : selectedSeries.cover ? (
+                  <img src={getHDPosterUrl(selectedSeries.cover, panelHost)} className="w-full h-full object-cover blur-3xl" alt="" referrerPolicy="no-referrer" />
+                ) : null}
+                <div className="absolute inset-0 bg-gradient-to-t from-zinc-950 via-zinc-950/80 to-transparent" />
+              </div>
+
+              {/* Left Section: Large Poster */}
+              <div className="w-full md:w-[38%] relative shrink-0 overflow-hidden bg-zinc-900 group">
                 {selectedSeries.cover ? (
                   <img
-                    src={selectedSeries.cover}
+                    src={getHDPosterUrl(selectedSeries.cover, panelHost)}
                     alt={selectedSeries.name}
-                    className="relative w-full h-full object-cover"
+                    className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
                     referrerPolicy="no-referrer"
-                    loading="lazy"
                   />
                 ) : (
-                  <div className="relative w-full h-full flex items-center justify-center bg-white/5">
-                    <Tv className="w-16 h-16 text-white/20" />
+                  <div className="w-full h-full flex items-center justify-center">
+                    <Tv className="w-24 h-24 text-white/5" />
                   </div>
                 )}
-                <div className="absolute inset-0 bg-gradient-to-t from-zinc-900 via-transparent to-transparent" />
+                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-zinc-950" />
               </div>
 
-              {/* Info Section */}
-              <div className="flex-1 p-8 md:p-12 overflow-y-auto">
-                <div className="flex flex-col gap-6">
-                  <div>
-                    <h2 className="text-4xl font-black text-white mb-4 leading-tight">
-                      {selectedSeries.name}
-                    </h2>
-                    <div className="flex flex-wrap items-center gap-4 text-sm font-medium">
-                      <div className="flex items-center gap-1.5 text-yellow-500">
-                        <Star className="w-4 h-4 fill-current" />
-                        <span>
-                          {seriesInfo?.info?.rating ||
-                            selectedSeries.rating ||
-                            "N/A"}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1.5 text-white/60">
-                        <Calendar className="w-4 h-4" />
-                        <span>
-                          {seriesInfo?.info?.releaseDate ||
-                            selectedSeries.releaseDate ||
-                            "Unknown Year"}
-                        </span>
-                      </div>
-                      <button
-                        onClick={() =>
-                          toggleFavorite("series", selectedSeries.series_id)
-                        }
-                        className={cn(
-                          "flex items-center gap-1.5 px-3 py-1 rounded-full transition-colors",
-                          favorites.series.includes(selectedSeries.series_id)
-                            ? "bg-primary text-white"
-                            : "bg-white/5 hover:bg-white/10 text-white/60",
-                        )}
-                      >
-                        <Star
-                          className={cn(
-                            "w-4 h-4",
-                            favorites.series.includes(
-                              selectedSeries.series_id,
-                            ) && "fill-current",
-                          )}
-                        />
-                        <span>
-                          {favorites.series.includes(selectedSeries.series_id)
-                            ? t.favorited
-                            : t.addToFavorite}
-                        </span>
-                      </button>
-                    </div>
+              {/* Right Section: Deep Details & Episodes */}
+              <div className="flex-1 p-10 md:p-14 lg:p-16 flex flex-col gap-8 overflow-y-auto scrollbar-hide relative z-10">
+                <div className="space-y-6">
+                  {/* Category Row */}
+                  <div className="flex items-center gap-3">
+                    <span className="px-3 py-1 bg-primary text-white text-[10px] font-black uppercase tracking-widest rounded-md shadow-[0_0_15px_rgba(var(--primary-rgb),0.5)]">
+                      SERIES
+                    </span>
+                    <span className="text-white/40 text-xs font-bold uppercase tracking-widest">
+                      {activeCategoryLabel}
+                    </span>
                   </div>
 
-                  <div className="flex flex-wrap gap-2">
-                    {(seriesInfo?.info?.genre || selectedSeries.genre || "")
-                      .split(",")
-                      .map((genre: string) => (
-                        <span
-                          key={genre}
-                          className="px-3 py-1 bg-primary/20 text-primary rounded-full text-xs font-bold"
-                        >
-                          {genre.trim()}
-                        </span>
-                      ))}
-                  </div>
+                  <h2 className="text-5xl lg:text-6xl font-black text-white leading-tight tracking-tight drop-shadow-2xl">
+                    {selectedSeries.name}
+                  </h2>
 
-                  <div className="space-y-4">
-                    <h3 className="text-xs font-bold text-white/40 uppercase tracking-widest">
-                      Plot Summary
-                    </h3>
-                    <p className="text-white/80 leading-relaxed text-base italic">
-                      {isLoadingInfo ? (
-                        <span className="flex items-center gap-2">
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Loading details...
-                        </span>
-                      ) : (
-                        seriesInfo?.info?.plot ||
-                        selectedSeries.plot ||
-                        "No description available for this series."
-                      )}
-                    </p>
-                  </div>
-
-                  {seriesInfo?.info?.cast && (
-                    <div className="space-y-2">
-                      <h3 className="text-xs font-bold text-white/40 uppercase tracking-widest">
-                        Cast
-                      </h3>
-                      <p className="text-white/70 text-sm leading-relaxed">
-                        {seriesInfo.info.cast}
-                      </p>
+                  {/* Metadata Row */}
+                  <div className="flex flex-wrap items-center gap-6 text-sm font-bold">
+                    <div className="flex items-center gap-2 text-yellow-500">
+                      <Star className="w-5 h-5 fill-current" />
+                      <span className="text-lg">{seriesInfo?.info?.rating || selectedSeries.rating || "N/A"}</span>
                     </div>
-                  )}
-
-                  {seriesInfo?.info?.youtube_trailer && (
-                    <a
-                      href={
-                        seriesInfo.info.youtube_trailer.startsWith("http")
-                          ? seriesInfo.info.youtube_trailer
-                          : `https://www.youtube.com/watch?v=${seriesInfo.info.youtube_trailer}`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 transition-colors text-sm font-bold w-fit"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                      Watch Trailer
-                    </a>
-                  )}
-
-                  {/* Seasons & Episodes */}
-                  <div className="space-y-6 pt-6 border-t border-white/5">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-xl font-bold flex items-center gap-2">
-                        <Tv className="w-5 h-5 text-primary" />
-                        Seasons & Episodes
-                      </h3>
-                      {/* Continue Watching button */}
-                      {(() => {
-                        const prog =
-                          progressStore[String(selectedSeries.series_id)];
-                        if (!prog || !seriesInfo?.episodes) return null;
-                        // Find the episode across all seasons
-                        let continuableEpisode: any = null;
-                        let continuableSeason: any[] = [];
-                        let continuableIdx = 0;
-                        for (const sn of Object.keys(seriesInfo.episodes)) {
-                          const eps: any[] = seriesInfo.episodes[sn];
-                          const idx = eps.findIndex(
-                            (ep) =>
-                              ep.season === prog.season &&
-                              ep.episode_num === prog.episodeNum,
-                          );
-                          if (idx !== -1) {
-                            continuableEpisode = eps[idx];
-                            continuableSeason = eps;
-                            continuableIdx = idx;
-                            break;
-                          }
-                        }
-                        if (!continuableEpisode) return null;
-                        const pct =
-                          prog.duration > 0
-                            ? prog.currentTime / prog.duration
-                            : 0;
-                        const remaining = prog.duration - prog.currentTime;
-                        return (
-                          <button
-                            onClick={() =>
-                              playEpisode(
-                                continuableEpisode,
-                                continuableSeason,
-                                continuableIdx,
-                              )
-                            }
-                            className="flex items-center gap-2 bg-primary hover:bg-primary/90 px-4 py-2 rounded-xl font-bold text-sm transition-colors"
-                          >
-                            <Clock className="w-4 h-4" />
-                            <span>
-                              Continue S{prog.season}E{prog.episodeNum}
-                            </span>
-                            <span className="text-primary-foreground/70 text-xs">
-                              {formatProgressTime(remaining)} left
-                            </span>
-                          </button>
-                        );
-                      })()}
-                    </div>
-
-                    {isLoadingInfo ? (
-                      <div className="flex items-center justify-center p-8">
-                        <Loader2 className="w-8 h-8 animate-spin text-primary" />
-                      </div>
-                    ) : (
-                      <div className="space-y-8">
-                        {Object.keys(seriesInfo?.episodes || {}).map(
-                          (seasonNum) => (
-                            <div key={seasonNum} className="space-y-4">
-                              <h4 className="text-lg font-bold text-white/60">
-                                Season {seasonNum}
-                              </h4>
-                              <div className="grid grid-cols-1 gap-3">
-                                {seriesInfo.episodes[seasonNum].map(
-                                  (episode: any, idx: number) => {
-                                    const prog =
-                                      progressStore[
-                                        String(selectedSeries.series_id)
-                                      ];
-                                    const isLastWatched =
-                                      prog &&
-                                      prog.season === episode.season &&
-                                      prog.episodeNum === episode.episode_num;
-                                    const epProgress =
-                                      isLastWatched && prog.duration > 0
-                                        ? prog.currentTime / prog.duration
-                                        : 0;
-                                    return (
-                                      <button
-                                        key={episode.id}
-                                        onClick={() =>
-                                          playEpisode(
-                                            episode,
-                                            seriesInfo.episodes[seasonNum],
-                                            idx,
-                                          )
-                                        }
-                                        className={cn(
-                                          "flex items-center justify-between p-4 rounded-xl transition-all group relative overflow-hidden",
-                                          isLastWatched
-                                            ? "bg-primary/10 border border-primary/30 hover:bg-primary/20"
-                                            : "bg-white/5 hover:bg-white/10",
-                                        )}
-                                      >
-                                        <div className="flex items-center gap-4">
-                                          <div
-                                            className={cn(
-                                              "w-10 h-10 rounded-lg flex items-center justify-center font-bold",
-                                              isLastWatched
-                                                ? "bg-primary text-white"
-                                                : "bg-primary/20 text-primary",
-                                            )}
-                                          >
-                                            {episode.episode_num}
-                                          </div>
-                                          <div className="text-left">
-                                            <div className="flex items-center gap-2">
-                                              <p className="font-bold text-white group-hover:text-primary transition-colors">
-                                                {episode.title}
-                                              </p>
-                                              {isLastWatched && (
-                                                <span className="text-[10px] font-bold px-1.5 py-0.5 bg-primary text-white rounded">
-                                                  {Math.round(epProgress * 100)}
-                                                  %
-                                                </span>
-                                              )}
-                                            </div>
-                                            <p className="text-xs text-white/40">
-                                              {isLastWatched &&
-                                              prog.duration > 0
-                                                ? `${formatProgressTime(prog.currentTime)} / ${formatProgressTime(prog.duration)}`
-                                                : `Episode ${episode.episode_num}`}
-                                            </p>
-                                          </div>
-                                        </div>
-                                        {isLastWatched ? (
-                                          <Clock className="w-5 h-5 text-primary" />
-                                        ) : (
-                                          <Play className="w-5 h-5 text-white/20 group-hover:text-primary transition-colors" />
-                                        )}
-                                        {/* Progress bar at bottom of row */}
-                                        {isLastWatched && epProgress > 0 && (
-                                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-white/10">
-                                            <div
-                                              className="h-full bg-primary"
-                                              style={{
-                                                width: `${epProgress * 100}%`,
-                                              }}
-                                            />
-                                          </div>
-                                        )}
-                                      </button>
-                                    );
-                                  },
-                                )}
-                              </div>
-                            </div>
-                          ),
-                        )}
-                      </div>
-                    )}
+                    <div className="h-4 w-[1px] bg-white/10" />
+                    <span className="text-white/60">{seriesInfo?.info?.releaseDate || selectedSeries.releaseDate || "Unknown Year"}</span>
+                    <div className="h-4 w-[1px] bg-white/10" />
+                    <span className="text-white/60">{Object.keys(seriesInfo?.episodes || {}).length} Seasons</span>
                   </div>
                 </div>
+
+                {/* Storyline */}
+                <div className="space-y-3">
+                  <h3 className="text-xs font-black uppercase tracking-[0.2em] text-primary">Storyline</h3>
+                  <p className="text-white/70 text-lg lg:text-xl leading-relaxed font-medium italic">
+                    {isLoadingInfo ? (
+                      <span className="flex items-center gap-3">
+                        <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                        Fetching details...
+                      </span>
+                    ) : (
+                      seriesInfo?.info?.plot || selectedSeries.plot || "No description available for this series."
+                    )}
+                  </p>
+                </div>
+
+                {/* Cast */}
+                {seriesInfo?.info?.cast && (
+                  <div className="space-y-1">
+                    <h4 className="text-[10px] font-black uppercase tracking-widest text-white/30">Cast</h4>
+                    <p className="text-white font-bold text-lg">{seriesInfo.info.cast}</p>
+                  </div>
+                )}
+
+                {/* Actions Area */}
+                <div className="pt-4 flex flex-wrap gap-5 items-center">
+                  <button
+                    data-tv-focusable
+                    onClick={() => toggleFavorite("series", selectedSeries.series_id)}
+                    className={cn(
+                      "px-8 py-4 rounded-2xl font-black text-lg transition-all duration-300 hover:scale-105 focus:scale-105 active:scale-95 border-2 flex items-center gap-3",
+                      favorites.series.includes(selectedSeries.series_id)
+                        ? "bg-primary border-primary text-white shadow-[0_10px_20px_rgba(var(--primary-rgb),0.3)]"
+                        : "bg-white/5 border-white/5 text-white/40 hover:bg-white/10 hover:border-white/20 focus:bg-white/20 focus:border-white/40"
+                    )}
+                  >
+                    <Star className={cn("w-6 h-6", favorites.series.includes(selectedSeries.series_id) && "fill-current")} />
+                    {favorites.series.includes(selectedSeries.series_id) ? t.favorited : t.addToFavorite}
+                  </button>
+
+                  {seriesInfo?.info?.youtube_trailer && (
+                    <button
+                      data-tv-focusable
+                      onClick={() => window.open(
+                        seriesInfo.info.youtube_trailer.startsWith("http")
+                          ? seriesInfo.info.youtube_trailer
+                          : `https://www.youtube.com/watch?v=${seriesInfo.info.youtube_trailer}`,
+                        '_blank'
+                      )}
+                      className="px-8 py-4 bg-white/5 hover:bg-white/10 focus:bg-white/10 text-white/80 hover:text-white focus:text-white rounded-2xl font-bold transition-all flex items-center gap-3 border border-white/5"
+                    >
+                      <ExternalLink className="w-6 h-6" />
+                      Trailer
+                    </button>
+                  )}
+                </div>
+
+                {/* Seasons & Episodes Section */}
+                <div className="pt-10 space-y-8">
+                  <div className="flex items-center justify-between border-b border-white/5 pb-4">
+                    <h3 className="text-2xl font-black text-white flex items-center gap-3">
+                      <Tv className="w-6 h-6 text-primary" />
+                      Episodes
+                    </h3>
+                    
+                    {/* Continue Watching */}
+                    {(() => {
+                      const prog = progressStore[String(selectedSeries.series_id)];
+                      if (!prog || episodeSeasons.length === 0) return null;
+                      
+                      let continuableEpisode: any = null;
+                      let continuableSeason: any[] = [];
+                      let continuableIdx = 0;
+                      
+                      for (const season of episodeSeasons) {
+                        const eps = season.episodes;
+                        const idx = eps.findIndex(
+                          (ep: any) => ep.season === prog.season && ep.episode_num === prog.episodeNum,
+                        );
+                        if (idx !== -1) {
+                          continuableEpisode = eps[idx];
+                          continuableSeason = eps;
+                          continuableIdx = idx;
+                          break;
+                        }
+                      }
+                      
+                      if (!continuableEpisode) return null;
+                      const remaining = prog.duration > 0 ? prog.duration - prog.currentTime : 0;
+                      
+                      return (
+                        <button
+                          data-tv-focusable
+                          onClick={() => playEpisode(continuableEpisode, continuableSeason, continuableIdx)}
+                          className="bg-primary/10 hover:bg-primary focus:bg-primary text-primary hover:text-white focus:text-white px-6 py-2 rounded-full font-black text-xs transition-all border border-primary/20"
+                        >
+                          Continue S{prog.season}E{prog.episodeNum} ({formatProgressTime(remaining)} left)
+                        </button>
+                      );
+                    })()}
+                  </div>
+
+                  {isLoadingInfo ? (
+                    <div className="flex items-center justify-center py-20">
+                      <Loader2 className="w-10 h-10 animate-spin text-primary" />
+                    </div>
+                  ) : (
+                    <div className="space-y-12">
+                      {episodeSeasons.map(({ seasonNum, episodes }) => (
+                        <div key={seasonNum} className="space-y-4">
+                          <h4 className="text-sm font-black uppercase tracking-[0.3em] text-white/30 pl-2 border-l-2 border-primary">
+                            Season {seasonNum}
+                          </h4>
+                          <div className="grid grid-cols-1 gap-3">
+                            {episodes.map((episode: any, idx: number) => {
+                              const prog = progressStore[String(selectedSeries.series_id)];
+                              const isLastWatched =
+                                prog && prog.season === episode.season && prog.episodeNum === episode.episode_num;
+                              const epProgress = isLastWatched && prog.duration > 0
+                                ? prog.currentTime / prog.duration
+                                : 0;
+
+                              return (
+                                <button
+                                  key={episode.id}
+                                  data-tv-focusable
+                                  onClick={() => playEpisode(episode, episodes, idx)}
+                                  className={cn(
+                                    "flex items-center justify-between p-5 rounded-2xl transition-all duration-300 group relative overflow-hidden",
+                                    isLastWatched
+                                      ? "bg-primary/20 border border-primary/40"
+                                      : "bg-white/5 border border-transparent hover:bg-white/10 hover:border-white/10 focus:bg-white/20 focus:border-white/20"
+                                  )}
+                                >
+                                  <div className="flex items-center gap-6">
+                                    <div className={cn(
+                                      "w-12 h-12 rounded-xl flex items-center justify-center font-black text-lg transition-colors",
+                                      isLastWatched ? "bg-primary text-white" : "bg-black/40 text-white/40 group-hover:text-white group-focus:text-white"
+                                    )}>
+                                      {episode.episode_num}
+                                    </div>
+                                    <div className="text-left space-y-0.5">
+                                      <p className="font-bold text-lg text-white group-hover:text-primary group-focus:text-primary transition-colors">
+                                        {episode.title}
+                                      </p>
+                                      <p className="text-xs font-medium text-white/40">
+                                        {isLastWatched && prog.duration > 0
+                                          ? `${formatProgressTime(prog.currentTime)} / ${formatProgressTime(prog.duration)}`
+                                          : `Episode ${episode.episode_num}`}
+                                      </p>
+                                    </div>
+                                  </div>
+                                  
+                                  <div className="flex items-center gap-4">
+                                    {isLastWatched && epProgress > 0 && (
+                                      <span className="text-[10px] font-black px-2 py-1 bg-primary text-white rounded-md">
+                                        {Math.round(epProgress * 100)}%
+                                      </span>
+                                    )}
+                                    <Play className={cn(
+                                      "w-6 h-6 transition-colors",
+                                      isLastWatched ? "text-primary" : "text-white/10 group-hover:text-white group-focus:text-white"
+                                    )} />
+                                  </div>
+                                  
+                                  {isLastWatched && epProgress > 0 && (
+                                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/5">
+                                      <div className="h-full bg-primary shadow-[0_0_10px_rgba(var(--primary-rgb),1)]" style={{ width: `${epProgress * 100}%` }} />
+                                    </div>
+                                  )}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
-            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>

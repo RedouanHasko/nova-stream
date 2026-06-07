@@ -9,14 +9,9 @@ import { PlaylistProvider, usePlaylist } from "./context/PlaylistContext";
 import { FloatingPlayerProvider } from "./context/FloatingPlayerContext";
 import FloatingPlayer from "./components/FloatingPlayer";
 import Home from "./views/Home";
-import { initTVRemote } from "./lib/remote";
 
 import { lazy, Suspense, useEffect, useRef } from "react";
 import { injectAnimationPreferences } from "./lib/animationControl";
-
-// Initialize TV remote control system globally — translates keydown events to
-// 'tv-remote-key' CustomEvents consumed by individual views/components.
-initTVRemote();
 
 // Inject animation preferences for low-power TVs on startup
 injectAnimationPreferences();
@@ -99,7 +94,7 @@ export default function App() {
     <FloatingPlayerProvider>
       <PlaylistProvider>
         <Router>
-          <div data-tv="true" style={{ minHeight: "100vh" }}>
+          <div style={{ minHeight: "100vh" }}>
           <Toaster position="top-center" richColors theme="dark" />
           <Suspense fallback={routeFallback}>
             <GuardedRoutes />

@@ -16,7 +16,13 @@ export function reportPlaybackDebug(
     ts: Date.now(),
   });
 
-  const url = `${(getMediaApiBaseUrl() || window.location.origin).replace(/\/$/, "")}/api/playback-debug`;
+  const baseUrl =
+    window.location.protocol === "file:"
+      ? (getMediaApiBaseUrl() || "")
+      : window.location.origin;
+  const url = baseUrl
+    ? `${baseUrl.replace(/\/$/, "")}/api/playback-debug`
+    : "/api/playback-debug";
 
   try {
     if (navigator.sendBeacon) {

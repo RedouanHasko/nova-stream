@@ -3,6 +3,7 @@ import { ArrowLeft, Loader2, Radio as RadioIcon, Search, Play, Pause, Volume2, M
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { getMediaApiBaseUrl } from '../lib/activationApi';
+import { getPlatformName } from '../lib/platformPlayer';
 import Sidebar from '../components/Sidebar';
 import Logo from '../components/Logo';
 import WeatherWidget from '../components/WeatherWidget';
@@ -12,6 +13,7 @@ import { cn } from '../lib/utils';
 import { usePlaylist } from '../context/PlaylistContext';
 import { toast } from 'sonner';
 import { focusNext, useTVRemote, handleHeaderZoneKey } from '../lib/remote';
+import { wrapProxyPlaybackUrl } from '../lib/streamPlaybackUrl';
 
 interface Station {
   name: string;
@@ -20,9 +22,117 @@ interface Station {
   country: string;
 }
 
+const KNOWN_STATIONS_STORAGE_KEY = 'nova_known_radio_stations';
+const MAX_KNOWN_STATIONS = 150;
+const TV_STATION_LIMIT = 120;
+const DESKTOP_STATION_LIMIT = 240;
+
+function compactStation(station: Station): Station {
+  return {
+    name: String(station.name || 'Radio Station').slice(0, 120),
+    url: String(station.url || ''),
+    // Do not persist favicons; many are long tracking/CDN URLs and can exceed
+    // storage quota quickly. Fresh search results still render their live icons.
+    favicon: '',
+    country: String(station.country || '').slice(0, 80),
+  };
+}
+
+function normalizeStationList(rows: unknown[], limit: number): Station[] {
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set<string>();
+  const normalized: Station[] = [];
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const source = row as Record<string, unknown>;
+    const url = String(source.url_resolved || source.url || '').trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+
+    normalized.push({
+      name: String(source.name || 'Radio Station').slice(0, 120),
+      url,
+      favicon: String(source.favicon || '').slice(0, 500),
+      country: String(source.country || '').slice(0, 80),
+    });
+
+    if (normalized.length >= limit) break;
+  }
+
+  return normalized;
+}
+
+function readKnownStations(): Station[] {
+  try {
+    const saved = localStorage.getItem(KNOWN_STATIONS_STORAGE_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed.map(compactStation).filter((s) => s.url) : [];
+  } catch {
+    try {
+      localStorage.removeItem(KNOWN_STATIONS_STORAGE_KEY);
+    } catch {}
+    return [];
+  }
+}
+
+function writeKnownStations(stations: Station[]) {
+  const compact = stations.map(compactStation).filter((s) => s.url).slice(-MAX_KNOWN_STATIONS);
+  try {
+    localStorage.setItem(KNOWN_STATIONS_STORAGE_KEY, JSON.stringify(compact));
+  } catch {
+    // If storage is already full from older builds, keep only a tiny recent set.
+    try {
+      localStorage.setItem(KNOWN_STATIONS_STORAGE_KEY, JSON.stringify(compact.slice(-40)));
+    } catch {
+      try {
+        localStorage.removeItem(KNOWN_STATIONS_STORAGE_KEY);
+      } catch {}
+    }
+  }
+}
+
+function RadioStationLogo({
+  station,
+  className,
+  iconClassName = "w-6 h-6 text-white/40",
+}: {
+  station: Station;
+  className: string;
+  iconClassName?: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  const platform = getPlatformName();
+  const isTvPlatform = platform === 'webos' || platform === 'tizen';
+  const rawFavicon = String(station.favicon || '').trim();
+  const src =
+    !failed && rawFavicon && !isTvPlatform
+      ? wrapProxyPlaybackUrl(rawFavicon, false)
+      : '';
+
+  return (
+    <div className={className}>
+      {src ? (
+        <img
+          src={src}
+          alt={station.name}
+          className="w-full h-full object-cover"
+          referrerPolicy="no-referrer"
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      ) : (
+        <RadioIcon className={iconClassName} />
+      )}
+    </div>
+  );
+}
+
 export default function Radio() {
   const navigate = useNavigate();
   const { settings, isParentalUnlocked, unlockParental, lockParental, favorites, toggleFavorite } = usePlaylist();
+  const isTvPlatform = getPlatformName() === 'webos' || getPlatformName() === 'tizen';
+  const stationLimit = isTvPlatform ? TV_STATION_LIMIT : DESKTOP_STATION_LIMIT;
   const [countries, setCountries] = useState<any[]>([]);
   const [selectedContinent, setSelectedContinent] = useState<string | null>(null);
   const [selectedCountry, setSelectedCountry] = useState<string | null>(null);
@@ -37,21 +147,34 @@ export default function Radio() {
   const [isFullScreenPlayer, setIsFullScreenPlayer] = useState(false);
   const [showPinModal, setShowPinModal] = useState(false);
   const [pinInput, setPinInput] = useState('');
-  const [knownStations, setKnownStations] = useState<Station[]>(() => {
-    const saved = localStorage.getItem('nova_known_radio_stations');
-    return saved ? JSON.parse(saved) : [];
-  });
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [knownStations, setKnownStations] = useState<Station[]>(readKnownStations);
+  const audioRef = useRef<HTMLVideoElement | null>(null);
   const pinModalRef = useRef<HTMLDivElement | null>(null);
   const radioRootRef = useRef<HTMLDivElement | null>(null);
+  const stationRequestAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      stationRequestAbortRef.current?.abort();
+      const audio = audioRef.current;
+      if (!audio) return;
+      try {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+      } catch {}
+    };
+  }, []);
 
   useEffect(() => {
     if (stations.length > 0) {
       setKnownStations(prev => {
-        const newStations = stations.filter(s => !prev.some(p => p.url === s.url));
+        const newStations = stations
+          .filter(s => !prev.some(p => p.url === s.url))
+          .map(compactStation);
         if (newStations.length === 0) return prev;
-        const updated = [...prev, ...newStations].slice(-500); // Keep last 500 known stations
-        localStorage.setItem('nova_known_radio_stations', JSON.stringify(updated));
+        const updated = [...prev, ...newStations].slice(-MAX_KNOWN_STATIONS);
+        writeKnownStations(updated);
         return updated;
       });
     }
@@ -73,49 +196,81 @@ export default function Radio() {
   };
 
   const handleGlobalSearch = async () => {
+    stationRequestAbortRef.current?.abort();
+    const controller = new AbortController();
+    stationRequestAbortRef.current = controller;
     setIsLoading(true);
     setSelectedCountry(null);
     setSelectedContinent(null);
     try {
-      let url = `https://de1.api.radio-browser.info/json/stations/search?limit=100&order=clickcount`;
+      let url = `https://de1.api.radio-browser.info/json/stations/search?limit=${stationLimit}&hidebroken=true&order=clickcount`;
       if (globalSearch) url += `&name=${encodeURIComponent(globalSearch)}`;
       
-      const res = await axios.get(url);
-      setStations(res.data);
+      const res = await axios.get(url, { signal: controller.signal });
+      if (!controller.signal.aborted) {
+        setStations(normalizeStationList(res.data, stationLimit));
+      }
     } catch (err) {
-      console.error('Error searching stations:', err);
+      if (!controller.signal.aborted) {
+        console.error('Error searching stations:', err);
+      }
     } finally {
-      setIsLoading(false);
+      if (!controller.signal.aborted) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    axios.get('https://de1.api.radio-browser.info/json/countries')
-      .then(res => setCountries(res.data))
-      .catch(err => console.error('Error fetching countries:', err));
+    const controller = new AbortController();
+    axios.get('https://de1.api.radio-browser.info/json/countries', { signal: controller.signal })
+      .then(res => {
+        if (!controller.signal.aborted) {
+          setCountries(Array.isArray(res.data) ? res.data.slice(0, 260) : []);
+        }
+      })
+      .catch(err => {
+        if (!controller.signal.aborted) console.error('Error fetching countries:', err);
+      });
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
     if (selectedCountry) {
+      if (selectedCountry === 'fav') return;
+      stationRequestAbortRef.current?.abort();
+      const controller = new AbortController();
+      stationRequestAbortRef.current = controller;
       setIsLoading(true);
-      axios.get(`https://de1.api.radio-browser.info/json/stations/bycountry/${selectedCountry}`)
+      axios.get(`https://de1.api.radio-browser.info/json/stations/bycountry/${encodeURIComponent(selectedCountry)}?limit=${stationLimit}&hidebroken=true&order=clickcount`, { signal: controller.signal })
         .then(res => {
-          setStations(res.data);
-          setIsLoading(false);
+          if (!controller.signal.aborted) {
+            setStations(normalizeStationList(res.data, stationLimit));
+            setIsLoading(false);
+          }
         })
         .catch(err => {
-          console.error('Error fetching stations:', err);
-          setIsLoading(false);
+          if (!controller.signal.aborted) {
+            console.error('Error fetching stations:', err);
+            setIsLoading(false);
+          }
         });
+      return () => controller.abort();
     }
-  }, [selectedCountry]);
+  }, [selectedCountry, stationLimit]);
 
   const playStation = (station: Station) => {
     if (audioRef.current) {
       setIsBuffering(true);
-      const base = getMediaApiBaseUrl() || window.location.origin;
-      const proxiedUrl = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(station.url)}`;
-      audioRef.current.src = proxiedUrl;
+      // On webOS, use direct station URL — <audio> elements play
+      // cross-origin streams without CORS issues. The proxy is only
+      // needed in development (desktop) where the backend runs.
+      const platform = getPlatformName();
+      const useProxy = platform !== 'webos' && platform !== 'tizen';
+      const audioUrl = useProxy
+        ? `${(getMediaApiBaseUrl() || window.location.origin).replace(/\/$/, '')}/api/proxy?url=${encodeURIComponent(station.url)}`
+        : station.url;
+      audioRef.current.src = audioUrl;
       audioRef.current.play().catch(err => {
         console.error('Playback error:', err);
         setIsPlaying(false);
@@ -199,6 +354,13 @@ export default function Radio() {
     ];
   }, [countries, selectedContinent]);
 
+  const activeRadioLabel = useMemo(() => {
+    if (selectedCountry === 'fav') return 'Favorites';
+    if (selectedCountry) return selectedCountry;
+    if (selectedContinent) return selectedContinent;
+    return 'Global Radio';
+  }, [selectedContinent, selectedCountry]);
+
   const handleSidebarSelect = (id: string) => {
     if (id === 'back') {
       setSelectedContinent(null);
@@ -260,16 +422,22 @@ export default function Radio() {
       if (!key) return;
 
       if (showPinModal) {
-        if (key === "back" || key === "backspace") {
+        if (key === "back" || key === "red") {
           setShowPinModal(false);
         }
         return;
       }
 
       // Header zone: left/right navigate within navbar; down escapes to content
-      if (handleHeaderZoneKey(key, { onBack: () => navigate('/') })) return;
+      if (handleHeaderZoneKey(key, { 
+        onBack: () => navigate('/'),
+        onEscapeDown: () => {
+          const first = radioRootRef.current?.querySelector<HTMLElement>('.flex-1.overflow-hidden [data-tv-focusable]');
+          first?.focus();
+        }
+      })) return;
 
-      if (key === "back" || key === "backspace") {
+      if (key === "back" || key === "red") {
         if (isFullScreenPlayer) {
           setIsFullScreenPlayer(false);
         } else if (selectedCountry) {
@@ -369,14 +537,14 @@ export default function Radio() {
                     placeholder="••••"
                   />
                   <div className="flex gap-3">
-                    <button 
+                    <button data-tv-focusable 
                       type="button"
                       onClick={() => setShowPinModal(false)}
                       className="flex-1 px-6 py-4 bg-white/5 hover:bg-white/10 rounded-2xl font-bold transition-colors"
                     >
                       Cancel
                     </button>
-                    <button 
+                    <button data-tv-focusable 
                       type="submit"
                       className="flex-1 px-6 py-4 bg-primary hover:bg-primary/90 rounded-2xl font-bold transition-colors"
                     >
@@ -389,7 +557,7 @@ export default function Radio() {
           </motion.div>
         )}
       </AnimatePresence>
-      <audio 
+      <video playsInline style={{ display: 'none' }} 
         ref={audioRef} 
         onWaiting={() => setIsBuffering(true)}
         onPlaying={() => setIsBuffering(false)}
@@ -455,7 +623,7 @@ export default function Radio() {
         </div>
       </header>
 
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className="flex flex-1 overflow-hidden relative bg-zinc-950">
         {/* Sidebar */}
         <Sidebar 
           items={sidebarItems} 
@@ -465,7 +633,7 @@ export default function Radio() {
         />
 
         {/* Main Content Area */}
-        <div className="tv-browser-content flex-1 flex flex-col relative overflow-hidden">
+        <div className="tv-live-column flex-1 flex flex-col relative overflow-hidden border-r border-white/5 bg-black/20">
           <AnimatePresence>
             {isLoading && (
               <motion.div 
@@ -482,9 +650,27 @@ export default function Radio() {
             )}
           </AnimatePresence>
 
+          <div className="flex items-center justify-between px-8 py-6 bg-linear-to-b from-white/[0.02] to-transparent border-b border-white/5">
+            <div className="flex flex-col gap-1 min-w-0">
+              <h2 className="text-3xl font-black text-white tracking-tight uppercase truncate">
+                {activeRadioLabel}
+              </h2>
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-xs font-black text-white/30 tracking-[0.2em] uppercase">
+                  {filteredStations.length} Stations
+                </span>
+                {isLoading && <Loader2 className="w-4 h-4 animate-spin text-primary" />}
+                <div className="h-1 w-1 rounded-full bg-white/20" />
+                <span className="text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded bg-primary/10 text-primary">
+                  Radio Browser
+                </span>
+              </div>
+            </div>
+          </div>
+
           {/* Radio Grid */}
-          <div className="flex-1 p-8 overflow-y-auto pb-32">
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+          <div className="flex-1 overflow-y-auto scrollbar-hide px-6 py-4 pb-32">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {filteredStations.map((s, index) => (
                 <div 
                   key={`${s.url}-${index}`} 
@@ -492,8 +678,8 @@ export default function Radio() {
                   tabIndex={0}
                   role="button"
                   className={cn(
-                    "tv-radio-card p-4 bg-white/5 border border-white/10 rounded-xl flex items-center gap-4 transition-all duration-200 hover:border-white/20 hover:bg-white/10 group cursor-pointer",
-                    currentStation?.url === s.url && "ring-2 ring-primary border-transparent bg-primary/10"
+                    "tv-radio-card tv-channel-row flex items-center gap-4 min-h-[92px] px-4 text-left transition-all group cursor-pointer bg-white/[0.03] hover:bg-white/6",
+                    currentStation?.url === s.url && "tv-channel-row--selected"
                   )}
                   onClick={() => playStation(s)}
                   onKeyDown={(e) => {
@@ -503,18 +689,15 @@ export default function Radio() {
                     }
                   }}
                 >
-                  <div className="w-12 h-12 rounded-lg bg-white/10 flex items-center justify-center overflow-hidden shrink-0 group-hover:scale-105 transition-transform">
-                    {s.favicon ? (
-                      <img src={s.favicon} alt={s.name} className="w-full h-full object-cover" onError={(e) => (e.currentTarget.src = '/radio.png')} />
-                    ) : (
-                      <RadioIcon className="w-6 h-6 text-white/40" />
-                    )}
-                  </div>
+                  <RadioStationLogo
+                    station={s}
+                    className="w-12 h-12 rounded-lg bg-white/10 flex items-center justify-center overflow-hidden shrink-0 group-hover:scale-105 transition-transform"
+                  />
                   <div className="flex-1 text-left overflow-hidden">
                     <div className="font-semibold truncate group-hover:text-primary transition-colors">{s.name}</div>
                     <div className="text-xs text-white/40 truncate">{s.country}</div>
                   </div>
-                  <button 
+                  <button data-tv-focusable 
                     onClick={(e) => {
                       e.stopPropagation();
                       toggleFavorite('radio', s.url);
@@ -545,15 +728,15 @@ export default function Radio() {
               isFullScreenPlayer ? "h-0 opacity-0 pointer-events-none translate-y-full" : "h-auto opacity-100"
             )}>
               <div className="flex items-center gap-4 w-1/3">
-                <button 
+                <button data-tv-focusable 
                   onClick={() => setIsFullScreenPlayer(true)}
                   className="relative w-14 h-14 rounded-xl bg-white/10 flex items-center justify-center overflow-hidden shrink-0 shadow-lg group cursor-pointer hover:scale-105 transition-transform"
                 >
-                  {currentStation.favicon ? (
-                    <img src={currentStation.favicon} alt={currentStation.name} className="w-full h-full object-cover" />
-                  ) : (
-                    <RadioIcon className="w-7 h-7 text-white/40" />
-                  )}
+                  <RadioStationLogo
+                    station={currentStation}
+                    className="w-full h-full flex items-center justify-center"
+                    iconClassName="w-7 h-7 text-white/40"
+                  />
                   <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
                     <Maximize2 className="w-5 h-5 text-white" />
                   </div>
@@ -574,7 +757,7 @@ export default function Radio() {
                   <div className="font-bold text-lg truncate text-white leading-tight">{currentStation.name}</div>
                   <div className="text-sm text-white/40 truncate">{currentStation.country}</div>
                 </div>
-                <button 
+                <button data-tv-focusable 
                   onClick={() => toggleFavorite('radio', currentStation.url)}
                   className="p-2 hover:bg-white/10 rounded-full transition-colors ml-2"
                 >
@@ -587,14 +770,14 @@ export default function Radio() {
               
               <div className="flex-1 flex flex-col items-center gap-1">
                 <div className="flex items-center gap-6">
-                  <button 
+                  <button data-tv-focusable 
                     onClick={handlePrev}
                     className="p-2 text-white/40 hover:text-white transition-colors"
                   >
                     <SkipBack className="w-6 h-6 fill-current" />
                   </button>
 
-                  <button 
+                  <button data-tv-focusable 
                     onClick={togglePlay} 
                     className="p-4 bg-primary text-white rounded-full hover:bg-primary/90 transition-all active:scale-95 shadow-xl shadow-primary/20 relative group"
                   >
@@ -607,7 +790,7 @@ export default function Radio() {
                     )}
                   </button>
 
-                  <button 
+                  <button data-tv-focusable 
                     onClick={handleNext}
                     className="p-2 text-white/40 hover:text-white transition-colors"
                   >
@@ -617,7 +800,7 @@ export default function Radio() {
               </div>
               
               <div className="w-1/3 flex justify-end items-center gap-4">
-                <button 
+                <button data-tv-focusable 
                   onClick={() => setIsMuted(!isMuted)}
                   className="text-white/40 hover:text-white transition-colors"
                 >
@@ -644,7 +827,7 @@ export default function Radio() {
                     style={{ left: `calc(${isMuted ? 0 : volume}% - 6px)` }}
                   />
                 </div>
-                <button 
+                <button data-tv-focusable 
                   onClick={() => setIsFullScreenPlayer(true)}
                   className="p-2 text-white/40 hover:text-white transition-colors ml-2"
                   title="Full Screen Player"
@@ -667,21 +850,13 @@ export default function Radio() {
               >
                 {/* Dynamic Background */}
                 <div className="absolute inset-0 overflow-hidden pointer-events-none">
-                  {currentStation.favicon ? (
-                    <img 
-                      src={currentStation.favicon} 
-                      alt="" 
-                      className="w-full h-full object-cover blur-[100px] opacity-30 scale-150"
-                    />
-                  ) : (
-                    <div className="w-full h-full bg-gradient-to-br from-primary/20 via-black to-zinc-900" />
-                  )}
+                  <div className="w-full h-full bg-gradient-to-br from-primary/20 via-black to-zinc-900" />
                   <div className="absolute inset-0 bg-black/40" />
                 </div>
 
                 {/* Header */}
                 <header className="relative z-10 flex items-center justify-between p-8">
-                  <button 
+                  <button data-tv-focusable 
                     onClick={() => setIsFullScreenPlayer(false)}
                     className="p-4 bg-white/5 hover:bg-white/10 rounded-full backdrop-blur-md transition-all group"
                   >
@@ -709,13 +884,11 @@ export default function Radio() {
                         transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
                         className="relative w-64 h-64 md:w-80 md:h-80 rounded-[40px] overflow-hidden shadow-[0_0_50px_rgba(var(--primary-rgb),0.3)] border-4 border-white/10"
                       >
-                        {currentStation.favicon ? (
-                          <img src={currentStation.favicon} alt={currentStation.name} className="w-full h-full object-cover" />
-                        ) : (
-                          <div className="w-full h-full bg-zinc-800 flex items-center justify-center">
-                            <RadioIcon className="w-32 h-32 text-white/10" />
-                          </div>
-                        )}
+                        <RadioStationLogo
+                          station={currentStation}
+                          className="w-full h-full bg-zinc-800 flex items-center justify-center"
+                          iconClassName="w-32 h-32 text-white/10"
+                        />
                         {isBuffering && (
                           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center">
                             <Loader2 className="w-16 h-16 text-primary animate-spin" />
@@ -771,14 +944,14 @@ export default function Radio() {
                       {/* Large Controls */}
                       <div className="flex flex-col gap-8">
                         <div className="flex items-center justify-center lg:justify-start gap-8">
-                          <button 
+                          <button data-tv-focusable 
                             onClick={handlePrev}
                             className="p-6 bg-white/5 hover:bg-white/10 rounded-full transition-all hover:scale-110 active:scale-95"
                           >
                             <SkipBack className="w-10 h-10 text-white fill-current" />
                           </button>
 
-                          <button 
+                          <button data-tv-focusable 
                             onClick={togglePlay}
                             className="p-10 bg-primary text-white rounded-full hover:scale-110 active:scale-95 transition-all shadow-[0_0_50px_rgba(var(--primary-rgb),0.5)]"
                           >
@@ -791,7 +964,7 @@ export default function Radio() {
                             )}
                           </button>
 
-                          <button 
+                          <button data-tv-focusable 
                             onClick={handleNext}
                             className="p-6 bg-white/5 hover:bg-white/10 rounded-full transition-all hover:scale-110 active:scale-95"
                           >
@@ -801,7 +974,7 @@ export default function Radio() {
 
                         {/* Large Volume Slider */}
                         <div className="flex items-center gap-6 max-w-md mx-auto lg:mx-0">
-                          <button 
+                          <button data-tv-focusable 
                             onClick={() => setIsMuted(!isMuted)}
                             className="p-3 bg-white/5 hover:bg-white/10 rounded-full transition-colors"
                           >
@@ -843,7 +1016,7 @@ export default function Radio() {
                     </div>
                   </div>
                   <div className="flex items-center gap-4">
-                    <button 
+                    <button data-tv-focusable 
                       onClick={() => toggleFavorite('radio', currentStation.url)}
                       className="p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors flex items-center gap-2"
                     >
@@ -855,7 +1028,7 @@ export default function Radio() {
                         {favorites.radio.includes(currentStation.url) ? 'Favorited' : 'Add to Favorites'}
                       </span>
                     </button>
-                    <button className="p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors flex items-center gap-2">
+                    <button data-tv-focusable className="p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors flex items-center gap-2">
                       <Share2 className="w-5 h-5" />
                       <span className="font-bold text-sm">Share Station</span>
                     </button>

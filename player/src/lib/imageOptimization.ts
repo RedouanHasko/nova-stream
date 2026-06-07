@@ -1,9 +1,11 @@
 /**
- * Image optimization utilities for webOS TV
- * Generates optimized poster/thumbnail URLs with size constraints
+ * Poster/thumbnail helpers for browser dev (proxy) and webOS TV (direct panel URLs).
  */
 
+import { useEffect, useState } from "react";
 import { getMediaApiBaseUrl } from "./activationApi";
+import { isWebOsTv } from "./isWebOsTv";
+import { resolvePanelImageUrl } from "./panelAssetUrl";
 
 export interface ImageOptimizationConfig {
   width?: number;
@@ -19,109 +21,176 @@ const DEFAULT_CONFIG: ImageOptimizationConfig = {
   quality: 75,
 };
 
-/**
- * Generate optimized poster URL via backend proxy
- * Falls back to original URL if optimization not available
- */
+const urlCache = new Map<string, string>();
+const CACHE_LIMIT = 1000;
+
 export const getOptimizedPosterUrl = (
   originalUrl: string | null | undefined,
-  config: ImageOptimizationConfig = {}
+  config: ImageOptimizationConfig = {},
+  panelHost = "",
 ): string => {
-  if (!originalUrl) return "";
+  const raw = resolvePanelImageUrl(panelHost, originalUrl);
+  if (!raw) return "";
+
+  const cacheKey = `${raw}|${JSON.stringify(config)}`;
+  if (urlCache.has(cacheKey)) {
+    return urlCache.get(cacheKey)!;
+  }
+
+  if (raw.startsWith("data:") || raw.startsWith("/")) {
+    return raw;
+  }
 
   const merged = { ...DEFAULT_CONFIG, ...config };
   const base = getMediaApiBaseUrl() || window.location.origin;
 
-  // For data URLs or local assets, return as-is
-  if (originalUrl.startsWith("data:") || originalUrl.startsWith("/")) {
-    return originalUrl;
-  }
-
-  // Build proxy URL with optimization params
+  let result = "";
   try {
     const params = new URLSearchParams({
-      url: originalUrl,
+      url: raw,
       w: String(merged.width),
       h: String(merged.height),
       fm: merged.format,
       q: String(merged.quality),
     });
-    return `${base}/api/proxy?${params.toString()}`;
+    result = `${base}/api/proxy?${params.toString()}`;
   } catch {
-    // Fallback to original URL through proxy
-    return `${base}/api/proxy?url=${encodeURIComponent(originalUrl)}`;
+    result = `${base}/api/proxy?url=${encodeURIComponent(raw)}`;
   }
+
+  if (urlCache.size >= CACHE_LIMIT) {
+    const firstKey = urlCache.keys().next().value;
+    if (firstKey) urlCache.delete(firstKey);
+  }
+  urlCache.set(cacheKey, result);
+
+  return result;
 };
 
 /**
- * Get thumbnail URL (smaller version for list previews)
- * Used when rendering in scrollable lists to reduce memory
+ * Grid thumbnails: absolute panel URL on TV; proxied resize in browser dev.
  */
 export const getThumbnailUrl = (
-  originalUrl: string | null | undefined
+  originalUrl: string | null | undefined,
+  panelHost = "",
 ): string => {
-  return getOptimizedPosterUrl(originalUrl, {
+  const absolute = resolvePanelImageUrl(panelHost, originalUrl);
+  if (!absolute) return "";
+  if (isWebOsTv()) return absolute;
+  return getOptimizedPosterUrl(absolute, {
     width: 150,
     height: 225,
-    quality: 60, // Lower quality for thumbnails
+    quality: 60,
   });
 };
 
-/**
- * Get high-quality poster URL (for detail/preview screens)
- */
 export const getHDPosterUrl = (
-  originalUrl: string | null | undefined
+  originalUrl: string | null | undefined,
+  panelHost = "",
 ): string => {
-  return getOptimizedPosterUrl(originalUrl, {
+  const absolute = resolvePanelImageUrl(panelHost, originalUrl);
+  if (!absolute) return "";
+  if (isWebOsTv()) return absolute;
+  return getOptimizedPosterUrl(absolute, {
     width: 400,
     height: 600,
     quality: 85,
   });
 };
 
-/**
- * Preload image to warm up browser cache
- * Returns promise that resolves when image is cached
- */
-export const preloadImage = (url: string): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    if (!url) {
-      resolve();
-      return;
-    }
-    const img = new Image();
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error(`Failed to load image: ${url}`));
-    img.src = url;
+let activeDecodes = 0;
+const MAX_CONCURRENT_DECODES = 4;
+const pendingDecodes: Array<() => void> = [];
+
+const acquireDecodeSlot = (): Promise<void> => {
+  if (activeDecodes < MAX_CONCURRENT_DECODES) {
+    activeDecodes++;
+    return Promise.resolve();
+  }
+  return new Promise<void>((r) => {
+    pendingDecodes.push(r);
   });
 };
 
-/**
- * Batch preload multiple images with concurrency control
- * Prevents overwhelming network on TV
- */
-export const preloadImageBatch = async (
-  urls: string[],
-  maxConcurrent: 2
-): Promise<void> => {
-  const queue = [...urls];
-  const active: Promise<void>[] = [];
-
-  while (queue.length > 0 || active.length > 0) {
-    while (active.length < maxConcurrent && queue.length > 0) {
-      const url = queue.shift()!;
-      const promise = preloadImage(url)
-        .catch(() => {}) // Ignore individual failures
-        .then(() => {
-          const idx = active.indexOf(promise);
-          if (idx !== -1) active.splice(idx, 1);
-        });
-      active.push(promise);
-    }
-
-    if (active.length > 0) {
-      await Promise.race(active);
-    }
+const releaseDecodeSlot = (): void => {
+  const next = pendingDecodes.shift();
+  if (next) {
+    next();
+  } else {
+    activeDecodes = Math.max(0, activeDecodes - 1);
   }
+};
+
+export const loadImageQueued = (
+  img: HTMLImageElement,
+  src: string,
+): Promise<void> => {
+  if (!src) return Promise.resolve();
+  return acquireDecodeSlot()
+    .then(() => {
+      img.src = src;
+      if (typeof img.decode === "function") {
+        return img.decode().then(() => {}).catch(() => {});
+      }
+      return new Promise<void>((resolve) => {
+        if (img.complete && img.naturalWidth > 0) {
+          resolve();
+          return;
+        }
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+      });
+    })
+    .finally(() => {
+      releaseDecodeSlot();
+    });
+};
+
+/**
+ * TV grids: set src when visible. Browser: same with intersection observer.
+ */
+export const useTvLazyImage = (
+  imgRef: React.RefObject<HTMLImageElement | null>,
+  src: string,
+  threshold = 400,
+) => {
+  const [loaded, setLoaded] = useState(false);
+  const [visible, setVisible] = useState(!src ? false : isWebOsTv());
+
+  useEffect(() => {
+    setLoaded(false);
+    setVisible(!src ? false : isWebOsTv());
+  }, [src]);
+
+  useEffect(() => {
+    if (isWebOsTv() || !src) return;
+    const el = imgRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: `${threshold}px` },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [imgRef, src, threshold]);
+
+  useEffect(() => {
+    if (!visible || !src) return;
+    const el = imgRef.current;
+    if (!el) return;
+    let cancelled = false;
+    loadImageQueued(el, src).then(() => {
+      if (!cancelled) setLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, src, imgRef]);
+
+  return loaded;
 };

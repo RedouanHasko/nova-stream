@@ -104,7 +104,11 @@ export function getAnimationClassName(): string {
  * Call once on app startup
  */
 export function injectAnimationPreferences() {
+  if (typeof document === "undefined") return;
   if (!shouldAnimate()) {
+    const applyLowPowerMarker = () => {
+      document.body?.setAttribute("data-low-power", "true");
+    };
     const style = document.createElement("style");
     style.textContent = `
       [data-low-power="true"] * {
@@ -121,8 +125,15 @@ export function injectAnimationPreferences() {
     `;
     document.head.appendChild(style);
 
-    // Mark body as low-power
-    document.body.setAttribute("data-low-power", "true");
+    // Mark body as low-power once it exists. Some TV engines execute startup
+    // code earlier than desktop browsers during packaged app launch.
+    if (document.body) {
+      applyLowPowerMarker();
+    } else {
+      document.addEventListener("DOMContentLoaded", applyLowPowerMarker, {
+        once: true,
+      });
+    }
   }
 }
 

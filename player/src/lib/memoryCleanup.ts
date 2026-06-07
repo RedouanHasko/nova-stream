@@ -131,13 +131,10 @@ export function hintGarbageCollection() {
 export function useMemoryMonitoring(thresholdMB: number = 100) {
   useInterval(
     () => {
-      // @ts-expect-error performance.memory is non-standard but available in Chrome/V8
       if ((performance as any).memory) {
-        // @ts-expect-error performance.memory is non-standard but available in Chrome/V8
         const used = (performance as any).memory.usedJSHeapSize / 1048576; // MB
         if (used > thresholdMB) {
           console.warn(
-            // @ts-expect-error performance.memory is non-standard but available in Chrome/V8
             `Memory usage high: ${used.toFixed(2)} MB / ${((performance as any).memory.jsHeapSizeLimit / 1048576).toFixed(2)} MB`
           );
         }

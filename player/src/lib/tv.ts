@@ -21,5 +21,48 @@ export function detectPlatform(): TVPlatform {
 
 export const tvPlatform = detectPlatform();
 
-/** Whether we should reduce GPU-heavy effects (blur, shadows, complex animations) */
-export const isLowPowerTV = isTV && (tvPlatform === "webos" || tvPlatform === "tizen" || tvPlatform === "generic_tv");
+export type SmartTvMemoryProfile = {
+  platform: TVPlatform;
+  isTv: boolean;
+  isLowMemory: boolean;
+  maxJsHeapMb: number;
+  maxTotalMb: number;
+  imageConcurrency: number;
+  initialGridItems: number;
+  notes: string;
+};
+
+export function getSmartTvMemoryProfile(): SmartTvMemoryProfile {
+  const platform = detectPlatform();
+  const tv = isTV;
+
+  // Web apps cannot reliably query Samsung/webOS RAM. Treat TV engines as
+  // low-memory unless proven otherwise by native shell/device profiling.
+  const lowMemory =
+    tv &&
+    (platform === "webos" ||
+      platform === "tizen" ||
+      platform === "android_tv" ||
+      platform === "fire_tv" ||
+      platform === "generic_tv");
+
+  return {
+    platform,
+    isTv: tv,
+    isLowMemory: lowMemory,
+    // Keep JS allocations well below the user's requested 200 MB ceiling so
+    // the native decoder, GPU textures, and OS services have breathing room.
+    maxJsHeapMb: lowMemory ? 120 : 256,
+    maxTotalMb: lowMemory ? 200 : 350,
+    imageConcurrency: lowMemory ? 2 : 4,
+    initialGridItems: lowMemory ? 24 : 60,
+    notes: lowMemory
+      ? "Conservative TV mode for low-RAM smart TVs."
+      : "Standard browser/desktop memory profile.",
+  };
+}
+
+export const smartTvMemoryProfile = getSmartTvMemoryProfile();
+
+/** Whether we should reduce GPU-heavy effects (blur, shadows, complex animations). */
+export const isLowPowerTV = smartTvMemoryProfile.isLowMemory;

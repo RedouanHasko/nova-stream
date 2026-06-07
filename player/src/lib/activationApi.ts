@@ -44,9 +44,9 @@ function getDefaultPlayerMediaBase(): string {
   if (typeof window === "undefined") return "";
   const lanHost = getConfiguredLanHost();
   if (lanHost) {
-    return `http://${lanHost}:4000`;
+    return `http://${lanHost}:5000`;
   }
-  return "http://192.168.56.1:4000";
+  return "http://192.168.56.1:5000";
 }
 
 function getConfiguredLanHost(): string {
@@ -72,16 +72,6 @@ function normalizeBase(raw: string): string {
 function coerceMediaBase(base: string): string {
   const normalized = normalizeBase(base);
   if (!normalized) return "";
-
-  try {
-    const parsed = new URL(normalized);
-    if (parsed.port === "5000" && isLocalHostname(parsed.hostname)) {
-      return `${parsed.protocol}//${parsed.hostname}:4000`;
-    }
-  } catch {
-    // Fall through and return normalized as-is.
-  }
-
   return normalized;
 }
 
@@ -146,25 +136,15 @@ function getMediaApiBase(): string {
 
   const { protocol, hostname, origin, port } = window.location;
   if (protocol === "file:") {
-    // Packaged app mode: media/proxy routes must stay inside player runtime.
+    // Packaged app mode: media/proxy routes must use reachable backend base.
     const storedBase = getStoredMediaApiBase();
     if (storedBase) {
-      try {
-        const parsed = new URL(storedBase);
-        if (parsed.port === "5000") {
-          const remapped = `${parsed.protocol}//${parsed.hostname}:4000`;
-          persistMediaApiBase(remapped);
-          return remapped;
-        }
-      } catch {
-        // Ignore parse failure and continue with other candidates.
-      }
       return storedBase;
     }
 
     const lanHost = getConfiguredLanHost();
     if (lanHost) {
-      const lanBase = `http://${lanHost}:4000`;
+      const lanBase = `http://${lanHost}:5000`;
       persistMediaApiBase(lanBase);
       return lanBase;
     }
@@ -179,10 +159,10 @@ function getMediaApiBase(): string {
   if (storedBase) return storedBase;
 
   if (isLocalHostname(hostname)) {
-    if (port === "4000") {
+    if (port === "5000") {
       return origin;
     }
-    return `${protocol}//${hostname}:4000`;
+    return `${protocol}//${hostname}:5000`;
   }
 
   return origin;

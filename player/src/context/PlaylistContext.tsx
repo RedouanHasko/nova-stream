@@ -31,7 +31,6 @@ import {
 import {
   buildCachedActivationResponse,
   clearActivationCache,
-  getActivationRefreshIntervalMs,
   readActivationCache,
   writeActivationCache,
 } from "../lib/activationCache";
@@ -46,6 +45,15 @@ import {
   SeriesStream,
 } from "../services/iptvService";
 import { requestDedup } from "../lib/requestDedup";
+import { isWebOsTv } from "../lib/isWebOsTv";
+import { readLiveFavSnapshots } from "../lib/liveFavoriteSnapshots";
+import {
+  indexCategoryCounts,
+  readStoredCategoryCounts,
+  writeStoredCategoryCounts,
+  type CatalogSection,
+  type CategoryCountMap,
+} from "../services/categoryCountIndex";
 
 interface PlaylistData {
   liveCategories: Category[];
@@ -58,6 +66,8 @@ interface PlaylistData {
 
 interface Favorites {
   live: number[];
+  /** Full live rows keyed by stream_id — required for Favorites list on webOS (no full catalog in RAM). */
+  liveById?: Record<string, LiveStream>;
   vod: number[];
   series: number[];
   radio: string[];
@@ -126,6 +136,7 @@ interface PlaylistContextType {
   toggleFavorite: (
     type: "live" | "vod" | "series" | "radio",
     id: number | string,
+    liveChannel?: LiveStream,
   ) => void;
   fetchLive: () => Promise<void>;
   isFetchingLive: boolean;
@@ -133,7 +144,11 @@ interface PlaylistContextType {
   isFetchingVod: boolean;
   fetchSeries: () => Promise<void>;
   isFetchingSeries: boolean;
+  setLiveStreams: (streams: LiveStream[]) => void;
+  fetchLiveByCategory: (categoryId: string) => Promise<void>;
   clearCache: () => void;
+  /** Clears in-memory stream catalogs (live/VOD/series) without touching categories or auth. */
+  clearStreams: () => void;
   settings: Settings;
   updateSettings: (newSettings: Partial<Settings>) => void;
   clearHistory: (type: "live" | "vod" | "series") => void;
@@ -150,6 +165,17 @@ interface PlaylistContextType {
     vod: number;
     series: number;
   };
+  /** Per-category totals for TV mode (indexed in background without full catalogs). */
+  categoryCounts: {
+    live: CategoryCountMap;
+    vod: CategoryCountMap;
+    series: CategoryCountMap;
+  };
+  setCategoryCount: (
+    section: CatalogSection,
+    categoryId: string,
+    count: number,
+  ) => void;
   activationStatus: ActivationStatus;
   isActivationLoading: boolean;
   refreshActivationStatus: (forceNetwork?: boolean) => Promise<void>;
@@ -201,8 +227,31 @@ const INITIAL_DATA: PlaylistData = {
   seriesStreams: [],
 };
 
+const normalizeFavoriteIds = (ids: unknown[]): number[] =>
+  ids
+    .map((id) => Number(id))
+    .filter((id) => Number.isFinite(id) && id > 0);
+
+const normalizeFavoritesPayload = (raw: unknown): Favorites => {
+  const base =
+    raw && typeof raw === "object"
+      ? (raw as Partial<Favorites>)
+      : {};
+  return {
+    live: normalizeFavoriteIds(base.live || []),
+    liveById:
+      base.liveById && typeof base.liveById === "object"
+        ? (base.liveById as Record<string, LiveStream>)
+        : {},
+    vod: normalizeFavoriteIds(base.vod || []),
+    series: normalizeFavoriteIds(base.series || []),
+    radio: Array.isArray(base.radio) ? base.radio.map(String) : [],
+  };
+};
+
 const INITIAL_FAVORITES: Favorites = {
   live: [],
+  liveById: {},
   vod: [],
   series: [],
   radio: [],
@@ -325,11 +374,38 @@ function persistLocalPlaylists(playlists: PlaylistInfo[]) {
 function mapBackendPlaylists(playlists: DeviceActivationResponse["playlists"]): PlaylistInfo[] {
   if (!Array.isArray(playlists)) return [];
 
+  const parseXtreamCredentialsFromUrl = (urlValue: unknown) => {
+    if (typeof urlValue !== "string" || !urlValue.trim()) return null;
+    try {
+      const parsed = new URL(urlValue);
+      const username = parsed.searchParams.get("username") || "";
+      const password = parsed.searchParams.get("password") || "";
+      if (!username || !password) return null;
+
+      return {
+        host: `${parsed.protocol}//${parsed.host}`,
+        username,
+        password,
+      };
+    } catch {
+      return null;
+    }
+  };
+
   return playlists
     .map((playlist, index) => {
       const rawType = (playlist?.type || "m3u").toString().toLowerCase();
-      const type = rawType === "xtream" ? "xtream" : "m3u";
-      const credentials = playlist?.credentials || null;
+      const credentialsFromPayload =
+        playlist?.credentials && typeof playlist.credentials === "object"
+          ? playlist.credentials
+          : null;
+      const derivedCredentials = parseXtreamCredentialsFromUrl(playlist?.url);
+      const credentials = credentialsFromPayload || derivedCredentials;
+      const type =
+        rawType === "xtream" ||
+        Boolean(credentials?.host && credentials?.username && credentials?.password)
+          ? "xtream"
+          : "m3u";
 
       const id = `backend:${
         playlist?.assignmentId ?? playlist?.id ?? `${index}:${playlist?.name || "playlist"}`
@@ -444,6 +520,12 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const [localPlaylists, setLocalPlaylists] = useState<PlaylistInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [playlistData, setPlaylistData] = useState<PlaylistData>(INITIAL_DATA);
+  const [categoryCounts, setCategoryCounts] = useState<{
+    live: CategoryCountMap;
+    vod: CategoryCountMap;
+    series: CategoryCountMap;
+  }>({ live: {}, vod: {}, series: {} });
+  const countIndexAbortRef = useRef<AbortController | null>(null);
   const [favorites, setFavorites] = useState<Favorites>(INITIAL_FAVORITES);
   const [settings, setSettings] = useState<Settings>(INITIAL_SETTINGS);
   const [isParentalUnlocked, setIsParentalUnlocked] = useState(false);
@@ -470,6 +552,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activationRefreshInFlightRef = useRef(false);
   const activationRetryAfterTsRef = useRef(0);
+  const lastOpenSyncAtRef = useRef(0);
 
   const playlists = [...localPlaylists];
 
@@ -501,7 +584,10 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     root.style.setProperty("--primary-color", `rgb(${rgb})`);
     root.style.setProperty("--primary-hover", `rgba(${rgb}, 0.9)`);
     root.style.setProperty("--subtitle-color", settings.subtitleColor);
-    root.lang = getLang(settings.language || "english");
+    const lang = getLang(settings.language || "english");
+    root.lang = lang;
+    // Keep TV navigation and page layout stable; language changes only translate text.
+    root.dir = "ltr";
     const bg = settings.backgroundImage || resolveDefaultBackgroundUrl();
     document.body.style.backgroundImage = `linear-gradient(rgba(0,0,0,0.6),rgba(0,0,0,0.6)),url('${bg}')`;
   }, [
@@ -598,7 +684,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (!verification.activated) {
-        const editableLocal = localPlaylists.filter(
+        const editableLocal = playlistsRef.current.filter(
           (playlist) => !playlist.managedByBackend,
         );
         setLocalPlaylists(editableLocal);
@@ -621,7 +707,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         const mergedPlaylists = mergePlaylistsWithBackend(
-          localPlaylists,
+          playlistsRef.current,
           verification.playlists,
         );
         setLocalPlaylists(mergedPlaylists);
@@ -694,7 +780,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       setIsActivationLoading(false);
       activationRefreshInFlightRef.current = false;
     }
-  }, [deviceIdentity, localPlaylists]);
+  }, [deviceIdentity]);
 
   const startFreeTrial = useCallback(async () => {
     if (!deviceIdentity) return;
@@ -704,7 +790,7 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       const result = await startDeviceTrial(deviceIdentity);
       setActivationStatus(normalizeActivationStatus(result, deviceIdentity));
       if (result.activated) {
-        await refreshActivationStatus();
+        await refreshActivationStatus(true);
         toast.success("Free trial activated");
       } else {
         toast.error(getTrialFailureMessage(result));
@@ -739,7 +825,17 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       const savedFavs = localStorage.getItem(`nova_favs_${activeId}`);
       if (savedFavs) {
         try {
-          setFavorites(JSON.parse(savedFavs));
+          const normalized = normalizeFavoritesPayload(
+            JSON.parse(savedFavs),
+          );
+          const legacySnaps = readLiveFavSnapshots(activeId);
+          if (Object.keys(legacySnaps).length > 0) {
+            normalized.liveById = {
+              ...legacySnaps,
+              ...(normalized.liveById || {}),
+            };
+          }
+          setFavorites(normalized);
         } catch (e) {
           setFavorites(INITIAL_FAVORITES);
         }
@@ -777,7 +873,15 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         }
       }
     }
-  }, [activeId]);
+  }, [
+    activePlaylist?.id,
+    activePlaylist?.type,
+    activePlaylist?.host,
+    activePlaylist?.username,
+    activePlaylist?.password,
+    activePlaylist?.url,
+    activePlaylist?.backendUpdatedAt,
+  ]);
 
   // ── Progressive prefetch on connect ───────────────────────────────
   // 1) Hydrate instantly from cache (memory/IndexedDB).
@@ -852,18 +956,28 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     setPrefetchProgress({ completed: 0, total: 3, label: "Starting..." });
     completedSections = 0;
 
-    // Fast bootstrap from cache so channels/movies/series appear immediately.
-    IPTVService.getCachedBootstrap(host, user, pass)
+    const isWebOSTv = isWebOsTv();
+
+    // webOS: hydrate category sidebars only — never replay huge stream JSON from IDB.
+    const cacheBootstrap = isWebOSTv
+      ? IPTVService.getCachedCatalogCategoriesOnly(host, user, pass)
+      : IPTVService.getCachedBootstrap(host, user, pass);
+
+    cacheBootstrap
       .then((cached) => {
         if (activeIdRef.current !== id) return;
 
+        if (isWebOSTv) {
+          IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+        }
+
         if (
           cached.liveCategories.length ||
-          cached.liveStreams.length ||
+          (!isWebOSTv && cached.liveStreams.length) ||
           cached.vodCategories.length ||
-          cached.vodStreams.length ||
+          (!isWebOSTv && cached.vodStreams.length) ||
           cached.seriesCategories.length ||
-          cached.seriesStreams.length
+          (!isWebOSTv && cached.seriesStreams.length)
         ) {
           setPlaylistData((prev) => ({
             ...prev,
@@ -871,35 +985,46 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
               cached.liveCategories.length > 0
                 ? cached.liveCategories
                 : prev.liveCategories,
-            liveStreams:
-              cached.liveStreams.length > 0
+            liveStreams: isWebOSTv
+              ? prev.liveStreams
+              : cached.liveStreams.length > 0
                 ? cached.liveStreams
                 : prev.liveStreams,
             vodCategories:
               cached.vodCategories.length > 0
                 ? cached.vodCategories
                 : prev.vodCategories,
-            vodStreams:
-              cached.vodStreams.length > 0 ? cached.vodStreams : prev.vodStreams,
+            vodStreams: isWebOSTv
+              ? prev.vodStreams
+              : cached.vodStreams.length > 0
+                ? cached.vodStreams
+                : prev.vodStreams,
             seriesCategories:
               cached.seriesCategories.length > 0
                 ? cached.seriesCategories
                 : prev.seriesCategories,
-            seriesStreams:
-              cached.seriesStreams.length > 0
+            seriesStreams: isWebOSTv
+              ? prev.seriesStreams
+              : cached.seriesStreams.length > 0
                 ? cached.seriesStreams
                 : prev.seriesStreams,
           }));
         }
 
-        if (cached.liveStreams.length > 0 || cached.liveCategories.length > 0) {
+        if (
+          (!isWebOSTv && cached.liveStreams.length > 0) ||
+          cached.liveCategories.length > 0
+        ) {
           markSectionReady("live", "Live loaded from cache");
         }
-        if (cached.vodStreams.length > 0 || cached.vodCategories.length > 0) {
+        if (
+          (!isWebOSTv && cached.vodStreams.length > 0) ||
+          cached.vodCategories.length > 0
+        ) {
           markSectionReady("vod", "Movies loaded from cache");
         }
         if (
-          cached.seriesStreams.length > 0 ||
+          (!isWebOSTv && cached.seriesStreams.length > 0) ||
           cached.seriesCategories.length > 0
         ) {
           markSectionReady("series", "Series loaded from cache");
@@ -910,17 +1035,30 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     const loadSection = async (section: "live" | "vod" | "series") => {
       try {
         if (section === "live") {
-          const [liveCategories, liveStreams] = await Promise.all([
-            IPTVService.getLiveCategories(host, user, pass),
-            IPTVService.getLiveStreams(host, user, pass),
-          ]);
+          const liveCategories = await IPTVService.getLiveCategories(
+            host,
+            user,
+            pass,
+          );
           if (activeIdRef.current !== id) return;
 
           setPlaylistData((prev) => ({
             ...prev,
             liveCategories,
-            liveStreams,
           }));
+          setSectionLoadProgress((prev) => ({ ...prev, live: 50 }));
+
+          if (!isWebOSTv) {
+            const liveStreams = await IPTVService.getLiveStreams(host, user, pass);
+            if (activeIdRef.current !== id) return;
+
+            setPlaylistData((prev) => ({
+              ...prev,
+              liveStreams,
+            }));
+          } else {
+            IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          }
 
           try {
             const existing = localStorage.getItem(`nova_cats_${id}`);
@@ -938,17 +1076,30 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (section === "vod") {
-          const [vodCategories, vodStreams] = await Promise.all([
-            IPTVService.getVodCategories(host, user, pass),
-            IPTVService.getVodStreams(host, user, pass),
-          ]);
+          const vodCategories = await IPTVService.getVodCategories(
+            host,
+            user,
+            pass,
+          );
           if (activeIdRef.current !== id) return;
 
           setPlaylistData((prev) => ({
             ...prev,
             vodCategories,
-            vodStreams,
           }));
+          setSectionLoadProgress((prev) => ({ ...prev, vod: 50 }));
+
+          if (!isWebOSTv) {
+            const vodStreams = await IPTVService.getVodStreams(host, user, pass);
+            if (activeIdRef.current !== id) return;
+
+            setPlaylistData((prev) => ({
+              ...prev,
+              vodStreams,
+            }));
+          } else {
+            IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          }
 
           try {
             const existing = localStorage.getItem(`nova_cats_${id}`);
@@ -966,17 +1117,30 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (section === "series") {
-          const [seriesCategories, seriesStreams] = await Promise.all([
-            IPTVService.getSeriesCategories(host, user, pass),
-            IPTVService.getSeries(host, user, pass),
-          ]);
+          const seriesCategories = await IPTVService.getSeriesCategories(
+            host,
+            user,
+            pass,
+          );
           if (activeIdRef.current !== id) return;
 
           setPlaylistData((prev) => ({
             ...prev,
             seriesCategories,
-            seriesStreams,
           }));
+          setSectionLoadProgress((prev) => ({ ...prev, series: 50 }));
+
+          if (!isWebOSTv) {
+            const seriesStreams = await IPTVService.getSeries(host, user, pass);
+            if (activeIdRef.current !== id) return;
+
+            setPlaylistData((prev) => ({
+              ...prev,
+              seriesStreams,
+            }));
+          } else {
+            IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          }
 
           try {
             const existing = localStorage.getItem(`nova_cats_${id}`);
@@ -1005,37 +1169,109 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
-    Promise.all([
-      loadSection("live"),
-      loadSection("vod"),
-      loadSection("series"),
-    ])
+    // Desktop: full catalogs. webOS: categories only — lists load per category on demand.
+    Promise.all([loadSection("live"), loadSection("vod"), loadSection("series")])
       .catch(() => {})
       .finally(() => {
         if (activeIdRef.current !== id) return;
         setIsPrefetching(false);
       });
 
-    // Background refresh every 30 min to pick up updates without blocking UI
+    // Background refresh cadence: much less frequent on webOS to avoid
+    // starving live playback on constrained TV hardware.
+    const refreshIntervalMs = isWebOSTv ? 120 * 60 * 1000 : 30 * 60 * 1000;
+
+    // Background refresh to pick up updates without blocking UI
     if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
     refreshTimerRef.current = setInterval(
       () => {
         if (activeIdRef.current !== id) return;
-        IPTVService.backgroundRefresh(host, user, pass)
+
+        const isLiveRoute =
+          typeof window !== "undefined" &&
+          /\/live/i.test(window.location.pathname || "");
+        const isAppVisible = document.visibilityState === "visible";
+
+        // While actively watching live on webOS, skip catalog refresh entirely.
+        // Some providers enforce low connection limits and these requests can
+        // stall or interrupt the live stream.
+        if (isWebOSTv && isLiveRoute && isAppVisible) {
+          return;
+        }
+
+        const refreshPromise = isWebOSTv
+          ? IPTVService.backgroundRefreshCategoriesOnly(host, user, pass)
+          : IPTVService.backgroundRefresh(host, user, pass);
+
+        refreshPromise
           .then((data) => {
             if (!data || activeIdRef.current !== id) return;
-            setPlaylistData({
-              liveCategories: data.liveCategories || [],
-              liveStreams: data.liveStreams || [],
-              vodCategories: data.vodCategories || [],
-              vodStreams: data.vodStreams || [],
-              seriesCategories: data.seriesCategories || [],
-              seriesStreams: data.seriesStreams || [],
-            });
+
+            if (isWebOSTv) {
+              const cats = data as {
+                liveCategories: Category[];
+                vodCategories: Category[];
+                seriesCategories: Category[];
+              };
+              setPlaylistData((prev) => ({
+                ...prev,
+                liveCategories:
+                  Array.isArray(cats.liveCategories) && cats.liveCategories.length > 0
+                    ? cats.liveCategories
+                    : prev.liveCategories,
+                vodCategories:
+                  Array.isArray(cats.vodCategories) && cats.vodCategories.length > 0
+                    ? cats.vodCategories
+                    : prev.vodCategories,
+                seriesCategories:
+                  Array.isArray(cats.seriesCategories) &&
+                  cats.seriesCategories.length > 0
+                    ? cats.seriesCategories
+                    : prev.seriesCategories,
+              }));
+              IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+              return;
+            }
+
+            const full = data as {
+              liveCategories: Category[];
+              liveStreams: LiveStream[];
+              vodCategories: Category[];
+              vodStreams: MovieStream[];
+              seriesCategories: Category[];
+              seriesStreams: SeriesStream[];
+            };
+            const liveStreams = full.liveStreams || [];
+            setPlaylistData((prev) => ({
+              liveCategories:
+                Array.isArray(full.liveCategories) && full.liveCategories.length > 0
+                  ? full.liveCategories
+                  : prev.liveCategories,
+              liveStreams:
+                Array.isArray(liveStreams) && liveStreams.length > 0
+                  ? liveStreams
+                  : prev.liveStreams,
+              vodCategories:
+                Array.isArray(full.vodCategories) && full.vodCategories.length > 0
+                  ? full.vodCategories
+                  : prev.vodCategories,
+              vodStreams:
+                Array.isArray(full.vodStreams) && full.vodStreams.length > 0
+                  ? full.vodStreams
+                  : prev.vodStreams,
+              seriesCategories:
+                Array.isArray(full.seriesCategories) && full.seriesCategories.length > 0
+                  ? full.seriesCategories
+                  : prev.seriesCategories,
+              seriesStreams:
+                Array.isArray(full.seriesStreams) && full.seriesStreams.length > 0
+                  ? full.seriesStreams
+                  : prev.seriesStreams,
+            }));
           })
           .catch(() => {}); // Silent — background refresh is best-effort
       },
-      30 * 60 * 1000,
+      refreshIntervalMs,
     );
 
     return () => {
@@ -1045,6 +1281,143 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
       }
     };
   }, [activeId]);
+
+  // Hydrate sidebar count index from localStorage when switching playlists.
+  useEffect(() => {
+    const id = activePlaylist?.id;
+    if (!id) {
+      setCategoryCounts({ live: {}, vod: {}, series: {} });
+      return;
+    }
+    const stored = readStoredCategoryCounts(id);
+    setCategoryCounts({
+      live: stored.live ?? {},
+      vod: stored.vod ?? {},
+      series: stored.series ?? {},
+    });
+  }, [activePlaylist?.id]);
+
+  const setCategoryCount = useCallback(
+    (section: CatalogSection, categoryId: string, count: number) => {
+      const id = String(categoryId || "").trim();
+      if (!id || !Number.isFinite(count) || count < 0) return;
+      setCategoryCounts((prev) => {
+        const nextSection = { ...prev[section], [id]: count };
+        const next = { ...prev, [section]: nextSection };
+        const plId = activeIdRef.current;
+        if (plId) writeStoredCategoryCounts(plId, section, nextSection);
+        return next;
+      });
+    },
+    [],
+  );
+
+  // Background per-category API scans — stores counts only (how other IPTV apps show totals on TV).
+  useEffect(() => {
+    const pl = activePlaylist;
+    if (!pl || pl.type !== "xtream" || !pl.host || !pl.username || !pl.password) {
+      return;
+    }
+
+    const host = pl.host;
+    const user = pl.username;
+    const pass = pl.password;
+    const playlistId = pl.id;
+    const tvMode = isWebOsTv();
+
+    if (tvMode) {
+      // Low-memory TVs should learn counts from categories as users open them.
+      // Scanning every category at startup can saturate single-connection IPTV
+      // providers and churn cache/memory before playback even starts.
+      countIndexAbortRef.current?.abort();
+      return;
+    }
+
+    const jobs: Array<{
+      section: CatalogSection;
+      categories: Category[];
+      skip: boolean;
+    }> = [
+      {
+        section: "live",
+        categories: playlistData.liveCategories,
+        skip: !tvMode && playlistData.liveStreams.length > 0,
+      },
+      {
+        section: "vod",
+        categories: playlistData.vodCategories,
+        skip: !tvMode && playlistData.vodStreams.length > 0,
+      },
+      {
+        section: "series",
+        categories: playlistData.seriesCategories,
+        skip: !tvMode && playlistData.seriesStreams.length > 0,
+      },
+    ];
+
+    countIndexAbortRef.current?.abort();
+    const controller = new AbortController();
+    countIndexAbortRef.current = controller;
+
+    void (async () => {
+      for (const job of jobs) {
+        if (controller.signal.aborted || job.skip || job.categories.length === 0) {
+          continue;
+        }
+
+        try {
+          const final = await indexCategoryCounts(
+            job.section,
+            host,
+            user,
+            pass,
+            job.categories,
+            {
+              signal: controller.signal,
+              concurrency: tvMode ? 2 : 4,
+              onBatch: (partial) => {
+                if (controller.signal.aborted || activeIdRef.current !== playlistId) {
+                  return;
+                }
+                setCategoryCounts((prev) => ({
+                  ...prev,
+                  [job.section]: { ...prev[job.section], ...partial },
+                }));
+              },
+            },
+          );
+
+          if (controller.signal.aborted || activeIdRef.current !== playlistId) {
+            return;
+          }
+
+          setCategoryCounts((prev) => ({
+            ...prev,
+            [job.section]: { ...prev[job.section], ...final },
+          }));
+          writeStoredCategoryCounts(playlistId, job.section, final);
+        } catch {
+          // best-effort — sidebar falls back to 0 until a category is opened
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [
+    activePlaylist?.id,
+    activePlaylist?.type,
+    activePlaylist?.host,
+    activePlaylist?.username,
+    activePlaylist?.password,
+    playlistData.liveCategories,
+    playlistData.vodCategories,
+    playlistData.seriesCategories,
+    playlistData.liveStreams.length,
+    playlistData.vodStreams.length,
+    playlistData.seriesStreams.length,
+  ]);
 
   const updateSettings = (newSettings: Partial<Settings>) => {
     if (!activeId) return;
@@ -1077,14 +1450,52 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const toggleFavorite = (
     type: "live" | "vod" | "series" | "radio",
     id: number | string,
+    liveChannel?: LiveStream,
   ) => {
     if (!activeId) return;
 
     setFavorites((prev) => {
-      const current = prev[type] as any[];
-      const isFav = current.includes(id);
+      if (type === "live") {
+        const streamId = Number(id);
+        if (!Number.isFinite(streamId) || streamId <= 0) return prev;
+
+        const liveIds = normalizeFavoriteIds(prev.live);
+        const isFav = liveIds.includes(streamId);
+        const liveById = { ...(prev.liveById || {}) };
+        const key = String(streamId);
+
+        if (isFav) {
+          delete liveById[key];
+          const newFavs: Favorites = {
+            ...prev,
+            live: liveIds.filter((i) => i !== streamId),
+            liveById,
+          };
+          localStorage.setItem(
+            `nova_favs_${activeId}`,
+            JSON.stringify(newFavs),
+          );
+          return newFavs;
+        }
+
+        if (liveChannel?.stream_id) {
+          liveById[key] = liveChannel;
+        }
+        const newFavs: Favorites = {
+          ...prev,
+          live: [...liveIds, streamId],
+          liveById,
+        };
+        localStorage.setItem(`nova_favs_${activeId}`, JSON.stringify(newFavs));
+        return newFavs;
+      }
+
+      const current = prev[type] as Array<number | string>;
+      const isFav = current.some(
+        (entry) => String(entry) === String(id),
+      );
       const updated = isFav
-        ? current.filter((i) => i !== id)
+        ? current.filter((entry) => String(entry) !== String(id))
         : [...current, id];
       const newFavs = { ...prev, [type]: updated };
       localStorage.setItem(`nova_favs_${activeId}`, JSON.stringify(newFavs));
@@ -1109,45 +1520,44 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!deviceIdentity) return;
 
-    refreshActivationStatus().catch(() => {});
-    const intervalId = window.setInterval(() => {
-      refreshActivationStatus().catch(() => {});
-    }, getActivationRefreshIntervalMs());
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [deviceIdentity, refreshActivationStatus]);
-
-  // Force backend activation checks frequently so block/unblock actions are
-  // enforced quickly even when cached activation is still valid.
-  useEffect(() => {
-    if (!deviceIdentity) return;
-
-    const runForcedCheck = () => {
+    const runOpenSync = () => {
+      const now = Date.now();
+      // webOS can emit multiple launch/visibility/focus events in quick bursts.
+      // Coalesce them into a single backend verification to avoid rate limiting.
+      if (now - lastOpenSyncAtRef.current < 15_000) {
+        return;
+      }
+      lastOpenSyncAtRef.current = now;
       refreshActivationStatus(true).catch(() => {});
     };
 
-    const heartbeatId = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        runForcedCheck();
-      }
-    }, 15_000);
+    // Only sync with backend when app is opened/reopened.
+    runOpenSync();
 
+    const onLaunch = () => runOpenSync();
+    const onRelaunch = () => runOpenSync();
+    const onPageShow = () => runOpenSync();
+    const onFocus = () => runOpenSync();
+    const onOnline = () => runOpenSync();
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
-        runForcedCheck();
+        runOpenSync();
       }
     };
 
-    const onFocus = () => runForcedCheck();
-
+    document.addEventListener("nova:app-launch", onLaunch);
+    document.addEventListener("nova:app-relaunch", onRelaunch);
+    window.addEventListener("pageshow", onPageShow);
     window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
     document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
-      window.clearInterval(heartbeatId);
+      document.removeEventListener("nova:app-launch", onLaunch);
+      document.removeEventListener("nova:app-relaunch", onRelaunch);
+      window.removeEventListener("pageshow", onPageShow);
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [deviceIdentity, refreshActivationStatus]);
@@ -1276,8 +1686,15 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
   const fetchLive = useCallback(async () => {
     const pl = activePlaylistRef.current;
     if (!pl || pl.type !== "xtream") return;
-    // Data already loaded by prefetch
-    if (playlistData.liveStreams.length > 0) return;
+    const tvMode = isWebOsTv();
+    if (!tvMode && playlistData.liveStreams.length > 0) return;
+    if (
+      tvMode &&
+      playlistData.liveCategories.length > 0 &&
+      playlistData.liveStreams.length > 0
+    ) {
+      return;
+    }
 
     const host = pl.host!;
     const user = pl.username!;
@@ -1287,10 +1704,18 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     setIsFetchingLive(true);
     try {
       await requestDedup.deduplicate(dedupKey, async () => {
-        const [cats, streams] = await Promise.all([
-          IPTVService.getLiveCategories(host, user, pass),
-          IPTVService.getLiveStreams(host, user, pass),
-        ]);
+        const cats = await IPTVService.getLiveCategories(host, user, pass);
+        if (tvMode) {
+          IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          if (activeIdRef.current === pl.id) {
+            setPlaylistData((p) => ({
+              ...p,
+              liveCategories: cats,
+            }));
+          }
+          return;
+        }
+        const streams = await IPTVService.getLiveStreams(host, user, pass);
         if (activeIdRef.current === pl.id) {
           setPlaylistData((p) => ({
             ...p,
@@ -1306,13 +1731,18 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsFetchingLive(false);
     }
-  }, [playlistData.liveStreams.length]);
+  }, [
+    playlistData.liveStreams.length,
+    playlistData.liveCategories.length,
+  ]);
 
   const fetchVod = useCallback(async () => {
     const pl = activePlaylistRef.current;
     if (!pl || pl.type !== "xtream") return;
-    // Data already loaded by prefetch
-    if (playlistData.vodStreams.length > 0) return;
+
+    const tvMode = isWebOsTv();
+    if (!tvMode && playlistData.vodStreams.length > 0) return;
+    if (tvMode && playlistData.vodCategories.length > 0) return;
 
     const host = pl.host!;
     const user = pl.username!;
@@ -1322,6 +1752,15 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     setIsFetchingVod(true);
     try {
       await requestDedup.deduplicate(dedupKey, async () => {
+        if (tvMode) {
+          const cats = await IPTVService.getVodCategories(host, user, pass);
+          IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          if (activeIdRef.current === pl.id) {
+            setPlaylistData((p) => ({ ...p, vodCategories: cats }));
+          }
+          return;
+        }
+
         const [catsResult, streamsResult] = await Promise.allSettled([
           IPTVService.getVodCategories(host, user, pass),
           IPTVService.getVodStreams(host, user, pass),
@@ -1376,13 +1815,15 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsFetchingVod(false);
     }
-  }, [playlistData.vodStreams.length]);
+  }, [playlistData.vodStreams.length, playlistData.vodCategories.length]);
 
   const fetchSeries = useCallback(async () => {
     const pl = activePlaylistRef.current;
     if (!pl || pl.type !== "xtream") return;
-    // Data already loaded by prefetch
-    if (playlistData.seriesStreams.length > 0) return;
+
+    const tvMode = isWebOsTv();
+    if (!tvMode && playlistData.seriesStreams.length > 0) return;
+    if (tvMode && playlistData.seriesCategories.length > 0) return;
 
     const host = pl.host!;
     const user = pl.username!;
@@ -1392,6 +1833,15 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     setIsFetchingSeries(true);
     try {
       await requestDedup.deduplicate(dedupKey, async () => {
+        if (tvMode) {
+          const cats = await IPTVService.getSeriesCategories(host, user, pass);
+          IPTVService.evictGlobalStreamCatalogFromMemory(host, user, pass);
+          if (activeIdRef.current === pl.id) {
+            setPlaylistData((p) => ({ ...p, seriesCategories: cats }));
+          }
+          return;
+        }
+
         const [catsResult, streamsResult] = await Promise.allSettled([
           IPTVService.getSeriesCategories(host, user, pass),
           IPTVService.getSeries(host, user, pass),
@@ -1450,11 +1900,68 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsFetchingSeries(false);
     }
-  }, [playlistData.seriesStreams.length]);
+  }, [playlistData.seriesStreams.length, playlistData.seriesCategories.length]);
+
+  const setLiveStreams = useCallback((streams: LiveStream[]) => {
+    setPlaylistData((prev) => ({ ...prev, liveStreams: streams }));
+  }, []);
+
+  const fetchLiveByCategory = useCallback(async (categoryId: string) => {
+    const pl = activePlaylistRef.current;
+    if (!pl || pl.type !== "xtream" || !pl.host || !pl.username || !pl.password) return;
+    setIsFetchingLive(true);
+    try {
+      const streams = await IPTVService.getLiveStreams(
+        pl.host,
+        pl.username,
+        pl.password,
+        categoryId,
+      );
+      if (activeIdRef.current === pl.id) {
+        setPlaylistData((prev) => ({
+          ...prev,
+          liveStreams: streams,
+        }));
+        setCategoryCount(
+          "live",
+          categoryId,
+          Array.isArray(streams) ? streams.length : 0,
+        );
+      }
+    } catch (err) {
+      console.error("Failed to fetch live streams for category:", categoryId, err);
+      throw err;
+    } finally {
+      setIsFetchingLive(false);
+    }
+  }, [setCategoryCount]);
 
   const clearCache = () => {
     setPlaylistData(INITIAL_DATA);
+    setCategoryCounts({ live: {}, vod: {}, series: {} });
+    const playlistId = activeIdRef.current;
+    if (playlistId) {
+      [
+        `nova_cats_${playlistId}`,
+        `nova_cat_counts_${playlistId}_live`,
+        `nova_cat_counts_${playlistId}_vod`,
+        `nova_cat_counts_${playlistId}_series`,
+      ].forEach((key) => {
+        try {
+          localStorage.removeItem(key);
+        } catch {}
+      });
+    }
     IPTVService.clearAllCaches();
+  };
+
+  const clearStreams = () => {
+    setPlaylistData((prev) => ({
+      ...prev,
+      liveStreams: [],
+      vodStreams: [],
+      seriesStreams: [],
+    }));
   };
 
   return (
@@ -1477,7 +1984,10 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         isFetchingVod,
         fetchSeries,
         isFetchingSeries,
+        setLiveStreams,
+        fetchLiveByCategory,
         clearCache,
+        clearStreams,
         settings,
         updateSettings,
         clearHistory,
@@ -1490,6 +2000,8 @@ export function PlaylistProvider({ children }: { children: React.ReactNode }) {
         isVodInitialLoading,
         isSeriesInitialLoading,
         sectionLoadProgress,
+        categoryCounts,
+        setCategoryCount,
         activationStatus,
         isActivationLoading,
         refreshActivationStatus,

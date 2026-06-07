@@ -1,4 +1,4 @@
-﻿import { useState, FormEvent, useEffect } from "react";
+import { useState, FormEvent, useEffect } from "react";
 import {
   ArrowLeft,
   Link as LinkIcon,
@@ -88,14 +88,20 @@ export default function PlaylistSetup() {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
-      if (key === "back") { navigate("/"); return; }
-      if (key === "up" || key === "left") focusNext("up");
-      else if (key === "down" || key === "right") focusNext("down");
-      else if (key === "enter") (document.activeElement as HTMLElement | null)?.click();
+      if (key === "back" || key === "red") { navigate("/"); return; }
+      if (key === "up") focusNext("up");
+      else if (key === "down") focusNext("down");
+      else if (key === "left") focusNext("left");
+      else if (key === "right") focusNext("right");
+      else if (key === "enter" || key === "select") {
+        const el = document.activeElement as HTMLElement | null;
+        el?.click();
+      }
     };
     window.addEventListener("tv-remote-key", handler);
     requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>("button, input")?.focus();
+      const first = document.querySelector<HTMLElement>("[data-tv-focusable], button, input");
+      first?.focus();
     });
     return () => window.removeEventListener("tv-remote-key", handler);
   }, [navigate]);
@@ -156,6 +162,7 @@ export default function PlaylistSetup() {
     <div className="flex flex-col min-h-screen p-8 max-w-4xl mx-auto w-full">
       <div className="flex items-center gap-6 mb-12">
           <button
+            data-tv-focusable
             onClick={() => navigate(-1)}
             className="p-2 hover:bg-white/10 rounded-full transition-colors"
             aria-label="Go back"
@@ -171,6 +178,7 @@ export default function PlaylistSetup() {
 
       <div className="flex gap-4 mb-8 bg-black/20 p-1.5 rounded-xl self-center">
         <button
+          data-tv-focusable
           onClick={() => setMode("m3u")}
           className={cn("flex items-center gap-2 px-8 py-3 rounded-lg font-semibold transition-all",
             mode === "m3u" ? "bg-primary text-white shadow-lg" : "text-white/40 hover:text-white/60")}
@@ -178,6 +186,7 @@ export default function PlaylistSetup() {
           <LinkIcon className="w-5 h-5" />M3U Link
         </button>
         <button
+          data-tv-focusable
           onClick={() => setMode("xtream")}
           className={cn("flex items-center gap-2 px-8 py-3 rounded-lg font-semibold transition-all",
             mode === "xtream" ? "bg-primary text-white shadow-lg" : "text-white/40 hover:text-white/60")}
@@ -195,7 +204,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.playlistName}</label>
                   <div className="relative">
                     <Globe className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="text" placeholder={t.playlistName} value={m3uName}
+                    <input data-tv-focusable required type="text" placeholder={t.playlistName} value={m3uName}
                       onChange={(e) => setM3uName(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -204,7 +213,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.m3uUrl}</label>
                   <div className="relative">
                     <LinkIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="url" placeholder="http://example.com/playlist.m3u" value={m3uUrl}
+                    <input data-tv-focusable required type="url" placeholder="http://example.com/playlist.m3u" value={m3uUrl}
                       onChange={(e) => setM3uUrl(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -216,7 +225,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.playlistName}</label>
                   <div className="relative">
                     <Globe className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="text" placeholder={t.playlistName} value={xtreamName}
+                    <input data-tv-focusable required type="text" placeholder={t.playlistName} value={xtreamName}
                       onChange={(e) => setXtreamName(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -225,7 +234,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.serverUrl}</label>
                   <div className="relative">
                     <Server className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="url" placeholder="http://provider-dns.com:8080" value={xtreamHost}
+                    <input data-tv-focusable required type="url" placeholder="http://provider-dns.com:8080" value={xtreamHost}
                       onChange={(e) => setXtreamHost(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -234,7 +243,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.username}</label>
                   <div className="relative">
                     <User className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="text" placeholder={t.username} value={xtreamUser}
+                    <input data-tv-focusable required type="text" placeholder={t.username} value={xtreamUser}
                       onChange={(e) => setXtreamUser(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -243,7 +252,7 @@ export default function PlaylistSetup() {
                   <label className="text-sm font-medium text-white/40 ml-1">{t.password}</label>
                   <div className="relative">
                     <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/20" />
-                    <input required type="password" placeholder="••••••••" value={xtreamPass}
+                    <input data-tv-focusable required type="password" placeholder="••••••••" value={xtreamPass}
                       onChange={(e) => setXtreamPass(e.target.value)}
                       className="w-full bg-white/5 border border-white/10 rounded-xl py-4 pl-12 pr-4 focus:outline-none focus:border-primary transition-colors" />
                   </div>
@@ -253,6 +262,7 @@ export default function PlaylistSetup() {
           </AnimatePresence>
 
           <button
+            data-tv-focusable
             disabled={isLoading}
             type="submit"
             className={cn(

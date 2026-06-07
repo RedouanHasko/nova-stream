@@ -1,4 +1,4 @@
-﻿import {
+import {
   useState,
   useEffect,
   useMemo,
@@ -8,6 +8,7 @@
   startTransition,
   memo,
 } from "react";
+import { useTvLazyImage } from "../lib/imageOptimization";
 import {
   ArrowLeft,
   Search,
@@ -49,9 +50,22 @@ import {
 } from "../services/iptvService";
 import Hls from "hls.js";
 import mpegts from "mpegts.js";
-import { trySwitchPlatformAudioTrack, trySwitchPlatformSubtitleTrack, getPlatformName, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack, webosGetTracks, normalizePlatformTracks, webosReadNativeTracks } from "../lib/platformPlayer";
+import { trySwitchPlatformAudioTrack, trySwitchPlatformSubtitleTrack, getPlatformName, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack, webosGetTracks, normalizePlatformTracks, webosReadNativeTracks, readShakaTracks, trySelectShakaAudioTrack, trySelectShakaSubtitleTrack, destroyShakaPlayer } from "../lib/platformPlayer";
 import { getMediaApiBaseUrl } from "../lib/activationApi";
 import { focusNext, useTVRemote, handleHeaderZoneKey, focusHeader } from "../lib/remote";
+import { xtreamLiveUrl } from "../lib/xtreamUrls";
+import { wrapPlaybackUrlsForPlatform } from "../lib/streamPlaybackUrl";
+import {
+  resolveFavoriteLiveStreams,
+  readLiveFavSnapshots,
+  saveLiveFavSnapshot,
+  removeLiveFavSnapshot,
+} from "../lib/liveFavoriteSnapshots";
+import { getThumbnailUrl } from "../lib/imageOptimization";
+
+/** Which Live TV panel owns D-pad navigation. */
+type LiveNavZone = "sidebar" | "channels" | "preview";
+const MAX_SEEN_LIVE_CHANNELS = 500;
 
 const EpgItem = ({
   program,
@@ -60,6 +74,7 @@ const EpgItem = ({
   program: EpgProgram;
   timeFormat: "12h" | "24h";
 }) => {
+  const t = useT();
   const now = Date.now();
   const startMs = new Date(program.start).getTime();
   const endMs = new Date(program.end).getTime();
@@ -92,70 +107,42 @@ const EpgItem = ({
   };
 
   return (
-    <div
+    <button
+      type="button"
+      data-tv-focusable
       className={cn(
-        "relative flex gap-4 py-3 px-3 rounded-xl border-b border-white/5 last:border-0 group transition-colors",
-        isNowPlaying && "bg-primary/10 border-primary/20",
-        !isNowPlaying && !isUpcoming && "opacity-50",
+        "tv-channel-row tv-epg-guide-row flex items-center gap-3 w-full min-h-[82px] px-4 text-left transition-all mx-2 my-1 overflow-hidden",
+        "hover:bg-white/6",
+        isNowPlaying && "tv-channel-row--selected",
+        !isNowPlaying && !isUpcoming && "opacity-55",
       )}
     >
-      {/* Time column */}
-      <div className="flex flex-col items-center justify-start min-w-[70px] text-sm font-mono pt-0.5">
-        <span
-          className={cn(
-            "font-bold",
-            isNowPlaying ? "text-primary" : "text-white/50",
-          )}
-        >
+      <div className="w-[72px] shrink-0 flex flex-col text-xs font-mono">
+        <span className={cn("font-bold", isNowPlaying ? "text-primary" : "text-white/50")}>
           {startTime}
         </span>
-        <span className="text-white/30 text-xs">{endTime}</span>
+        <span className="text-white/35">{endTime}</span>
         {durationMin > 0 && (
-          <span className="text-white/20 text-[10px] mt-1">
-            {durationMin} min
-          </span>
+          <span className="text-white/25 text-[10px] mt-0.5">{durationMin}m</span>
         )}
       </div>
-
-      {/* Content column */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          {isNowPlaying && (
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-primary/20 rounded-full text-[10px] font-bold text-primary uppercase tracking-wider shrink-0">
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-primary" />
-              </span>
-              Now
-            </span>
+      <div className="flex-1 min-w-0 py-1">
+        <span
+          className={cn(
+            "block text-lg font-medium truncate",
+            isNowPlaying ? "text-white" : "text-white/80",
           )}
-          {!isNowPlaying && isUpcoming && (
-            <span className="px-2 py-0.5 bg-white/5 rounded-full text-[10px] font-bold text-white/40 uppercase tracking-wider shrink-0">
-              Up Next
-            </span>
-          )}
-          <h4
-            className={cn(
-              "font-bold truncate",
-              isNowPlaying
-                ? "text-white"
-                : "text-white/70 group-hover:text-white transition-colors",
-            )}
-          >
-            {safeDecode(program.title)}
-          </h4>
-        </div>
+        >
+          {safeDecode(program.title)}
+        </span>
+        <span className="block text-[11px] text-white/35 uppercase tracking-wide">
+          {isNowPlaying ? t.nowPlaying : isUpcoming ? t.upNext : t.program}
+        </span>
         {program.description && (
-          <p
-            className={cn(
-              "text-sm line-clamp-2 mt-1 leading-relaxed",
-              isNowPlaying ? "text-white/60" : "text-white/30",
-            )}
-          >
+          <p className="tv-epg-description tv-epg-description--one text-sm text-white/40 mt-0.5">
             {safeDecode(program.description)}
           </p>
         )}
-        {/* Progress bar for currently playing */}
         {isNowPlaying && (
           <div className="mt-2 h-1 w-full bg-white/10 rounded-full overflow-hidden">
             <div
@@ -165,7 +152,13 @@ const EpgItem = ({
           </div>
         )}
       </div>
-    </div>
+      {isNowPlaying && (
+        <div className="flex items-center gap-1 px-2 py-1 bg-primary/20 rounded text-[10px] text-primary font-bold uppercase shrink-0">
+          <Play className="w-3 h-3 fill-primary" />
+          Now
+        </div>
+      )}
+    </button>
   );
 };
 
@@ -175,6 +168,7 @@ const MiniPlayer = ({
   title,
   onNext,
   onPrev,
+  startupPreferenceKey,
   videoRef: externalVideoRef,
 }: {
   urls: string[];
@@ -182,15 +176,14 @@ const MiniPlayer = ({
   title: string;
   onNext?: () => void;
   onPrev?: () => void;
+  startupPreferenceKey?: string;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
 }) => {
   const { settings } = usePlaylist();
   const internalVideoRef = useRef<HTMLVideoElement>(null);
   const videoRef = externalVideoRef || internalVideoRef;
-  const platformPlayerRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const mpegtsRef = useRef<any>(null);
   const [isPlaying, setIsPlaying] = useState(true);
   const [showControls, setShowControls] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -206,6 +199,7 @@ const MiniPlayer = ({
 
   const lastVolumeRef = useRef(0.8);
   const startupTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const activeUrlRef = useRef<string>("");
 
   // HLS State
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
@@ -225,17 +219,46 @@ const MiniPlayer = ({
   const [streamAttemptIndex, setStreamAttemptIndex] = useState(0);
 
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const mountedRef = useRef(true);
+  const platform = getPlatformName();
+  const isNativeTvPlayer = platform === "webos" || platform === "tizen";
 
-  const streamCandidates = useMemo(() => {
-    const sanitized = (Array.isArray(urls) ? urls : [])
-      .map((item) => String(item || "").trim())
-      .filter(Boolean);
-    return Array.from(new Set(sanitized));
-  }, [urls]);
+  const forceStopCurrentPlayback = useCallback(() => {
+    if (startupTimerRef.current) {
+      clearTimeout(startupTimerRef.current);
+      startupTimerRef.current = null;
+    }
+
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    const video = videoRef.current;
+    if (video) {
+      try {
+        video.pause();
+      } catch {}
+      try {
+        video.removeAttribute("src");
+        video.load();
+        video.preload = "none"; // Prevent preloading to reduce memory usage
+      } catch {}
+    }
+  }, [videoRef]);
+
+  const streamCandidates = useMemo(
+    () => wrapPlaybackUrlsForPlatform(Array.isArray(urls) ? urls : []),
+    [urls],
+  );
+  const streamCandidatesKey = useMemo(
+    () => streamCandidates.join("|"),
+    [streamCandidates],
+  );
 
   useEffect(() => {
     setStreamAttemptIndex(0);
-  }, [streamCandidates.join("|")]);
+  }, [streamCandidatesKey]);
 
   const resetControlsTimeout = useCallback(() => {
     if (isLocked) return;
@@ -258,6 +281,14 @@ const MiniPlayer = ({
       if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
     };
   }, [resetControlsTimeout]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      forceStopCurrentPlayback();
+    };
+  }, [forceStopCurrentPlayback]);
 
   // TV remote control â€” only active when the player is fullscreen so keys
   // don't conflict with the channel-list navigation in the parent view.
@@ -295,218 +326,235 @@ const MiniPlayer = ({
     return () => window.removeEventListener("tv-remote-key", handler);
   }, [isFullscreen, isPlaying, isLocked, onPrev, onNext, resetControlsTimeout, videoRef]);
 
+  // ========== SIMPLE WEBOS PLAYBACK ENGINE ==========
   useEffect(() => {
     const activeUrl = streamCandidates[streamAttemptIndex] || "";
-    if (!activeUrl || !videoRef.current) return;
-    const video = videoRef.current;
-    const platform = getPlatformName();
-    const base = getMediaApiBaseUrl() || window.location.origin;
-    const proxiedUrl = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(activeUrl)}`;
-    const isPackagedMode = window.location.protocol === "file:";
-    const isDefaultFallbackMediaBase = /192\.168\.56\.1:(4000|5000)/i.test(base);
-    const canUseProxyFallback = !(isPackagedMode && isDefaultFallbackMediaBase);
-    const canTryNextCandidate = streamAttemptIndex < streamCandidates.length - 1;
-    const tryNextCandidate = () => {
-      if (!canTryNextCandidate) return false;
-      setStreamAttemptIndex((previous) => previous + 1);
-      return true;
-    };
-    // â”€â”€â”€ NEW CLEAN PLAYBACK ENGINE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (!activeUrl || !videoRef.current || !mountedRef.current) return;
 
-    // Reset state for new channel
+    const video = videoRef.current;
+    const isM3U8 = activeUrl.toLowerCase().includes(".m3u8");
+
+    // Store current URL for cleanup check
+    activeUrlRef.current = activeUrl;
+
+    // Reset state
     setIsLoading(true);
     setIsBuffering(false);
     setIsPlaying(true);
-    setAudioTracks([]);
-    setSubtitleTracks([]);
-    setCurrentAudioTrack(-1);
-    setCurrentSubtitleTrack(-1);
 
-    // Tear down previous engine
-    if (startupTimerRef.current) { clearTimeout(startupTimerRef.current); startupTimerRef.current = null; }
-    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
-    if (mpegtsRef.current) { mpegtsRef.current.destroy(); mpegtsRef.current = null; }
+    // Clean up previous playback
+    forceStopCurrentPlayback();
 
-    let cleaned = false;
-    let nativeErrorHandler: (() => void) | null = null;
+    // Timeout for startup
+    startupTimerRef.current = setTimeout(() => {
+      if (mountedRef.current && activeUrlRef.current === activeUrl) {
+        setIsLoading(false);
+        setIsBuffering(false);
+      }
+    }, isNativeTvPlayer ? 5000 : 10000);
 
-    const onCanPlay = () => { setIsLoading(false); setIsBuffering(false); };
-    const onPlaying = () => { setIsLoading(false); setIsBuffering(false); };
-    const onWaiting = () => setIsBuffering(true);
-    video.addEventListener("canplay", onCanPlay);
-    video.addEventListener("playing", onPlaying);
-    video.addEventListener("waiting", onWaiting);
-
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      if (startupTimerRef.current) { clearTimeout(startupTimerRef.current); startupTimerRef.current = null; }
-      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
-      if (mpegtsRef.current) { mpegtsRef.current.destroy(); mpegtsRef.current = null; }
-      if (nativeErrorHandler) { video.removeEventListener("error", nativeErrorHandler); nativeErrorHandler = null; }
-      video.removeEventListener("canplay", onCanPlay);
-      video.removeEventListener("playing", onPlaying);
-      video.removeEventListener("waiting", onWaiting);
+    const refreshNativeTracks = () => {
+      if (!isNativeTvPlayer || !video) return;
+      const { audios, subtitles } = webosReadNativeTracks(video);
+      if (audios.length > 0) {
+        setAudioTracks(audios);
+        const nativeList = (video as HTMLVideoElement & { audioTracks?: { enabled: boolean }[] }).audioTracks;
+        let active = 0;
+        if (nativeList?.length) {
+          for (let i = 0; i < nativeList.length; i++) {
+            if (nativeList[i]?.enabled) {
+              active = i;
+              break;
+            }
+          }
+        }
+        setCurrentAudioTrack(active);
+      }
+      if (subtitles.length > 0) {
+        setSubtitleTracks(subtitles);
+      }
     };
 
-    // Browser-parity playback path for all platforms, including webOS.
-    // This keeps stream handling consistent across desktop and TV.
-    const ext = activeUrl.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
-    const isM3U8 = ext === "m3u8" || !["ts", "mp4", "mkv", "avi"].includes(ext);
-    const isTS = ext === "ts";
-    // In packaged TV mode, prefer backend proxy first (same as browser parity
-    // workflow) to avoid provider CORS/playlist issues on device engines.
-    const preferProxyFirst =
-      window.location.protocol === "file:" &&
-      canUseProxyFallback &&
-      platform !== "webos";
-    const primaryUrl = preferProxyFirst ? proxiedUrl : activeUrl;
-    const secondaryUrl = preferProxyFirst ? activeUrl : (canUseProxyFallback ? proxiedUrl : activeUrl);
+    const onCanPlay = () => {
+      if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
+      setIsLoading(false);
+      setIsBuffering(false);
+      refreshNativeTracks();
+    };
+    const onPlaying = () => {
+      if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
+      setIsLoading(false);
+      setIsBuffering(false);
+    };
+    const onError = () => {
+      if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
+      console.error("Video error:", video.error);
+      setIsLoading(false);
+      setIsBuffering(false);
+      setIsPlaying(false);
+      // Try next extension/URL candidate (m3u8 → ts → mp4) when panel blocks one format.
+      if (streamAttemptIndex < streamCandidates.length - 1) {
+        setStreamAttemptIndex((i) => i + 1);
+        return;
+      }
+    };
+    const onWaiting = () => {
+      if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
+      setIsBuffering(true);
+    };
 
-    if (isM3U8 && Hls.isSupported()) {
-      const isUltra = stabilityMode === "ultra";
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("error", onError);
+    video.addEventListener("waiting", onWaiting);
+
+    // ===== Native TV: hardware decode (HLS .m3u8 or MPEG-TS .ts / .mp4) =====
+    if (isNativeTvPlayer) {
+      const startNativeTvPlayback = () => {
+        try {
+          video.pause();
+          video.removeAttribute("src");
+          while (video.firstChild) video.removeChild(video.firstChild);
+          const source = document.createElement("source");
+          source.src = activeUrl;
+          const lower = activeUrl.toLowerCase();
+          if (lower.includes(".m3u8")) {
+            source.type = "application/vnd.apple.mpegurl";
+          } else if (lower.includes(".ts")) {
+            source.type = "video/mp2t";
+          } else {
+            source.type = "video/mp4";
+          }
+          video.appendChild(source);
+          video.load();
+        } catch {
+      video.src = activeUrl;
+      video.load();
+        }
+        const tryPlay = () => {
+      video.play().catch((err) => {
+        console.error("Native TV live play failed:", err);
+            if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
+          setIsLoading(false);
+          setIsBuffering(false);
+          setIsPlaying(false);
+            if (streamAttemptIndex < streamCandidates.length - 1) {
+              setStreamAttemptIndex((i) => i + 1);
+        }
+      });
+        };
+        tryPlay();
+        video.addEventListener("loadedmetadata", tryPlay, { once: true });
+      };
+      startNativeTvPlayback();
+      return () => {
+        if (startupTimerRef.current) clearTimeout(startupTimerRef.current);
+        video.removeEventListener("canplay", onCanPlay);
+        video.removeEventListener("playing", onPlaying);
+        video.removeEventListener("error", onError);
+        video.removeEventListener("waiting", onWaiting);
+        try {
+        video.pause();
+        video.removeAttribute("src");
+          while (video.firstChild) video.removeChild(video.firstChild);
+        video.load();
+        } catch {}
+      };
+    }
+
+    // ===== DESKTOP: hls.js =====
+    if (!isNativeTvPlayer && isM3U8 && Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
         enableSoftwareAES: false,
         lowLatencyMode: false,
-        startLevel: -1,
-        maxBufferLength: isUltra ? 30 : 15,
-        maxMaxBufferLength: isUltra ? 60 : 30,
-        maxBufferSize: (isUltra ? 48 : 24) * 1000 * 1000,
-        fragLoadingMaxRetry: 10,
-        manifestLoadingMaxRetry: 5,
-        levelLoadingMaxRetry: 5,
-        fragLoadingTimeOut: 30_000,
-        manifestLoadingTimeOut: 20_000,
-        levelLoadingTimeOut: 20_000,
+        initialLiveManifestSize: 1,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 8,
+        maxBufferLength: 10,
+        maxMaxBufferLength: 20,
+        backBufferLength: 20,
+        maxBufferSize: 12 * 1000 * 1000,
         capLevelToPlayerSize: true,
         autoStartLoad: true,
       });
       hlsRef.current = hls;
-      let switchedToSecondary = false;
-      hls.loadSource(primaryUrl);
+      hls.loadSource(activeUrl);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (!mountedRef.current || activeUrlRef.current !== activeUrl) return;
         setIsLoading(false);
         setAudioTracks(hls.audioTracks || []);
         setCurrentAudioTrack(hls.audioTrack);
         setSubtitleTracks(hls.subtitleTracks || []);
         setCurrentSubtitleTrack(hls.subtitleTrack);
-        video.play().catch(() => setIsPlaying(false));
-      });
-      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (_e: any, data: any) => setCurrentAudioTrack(data.id));
-      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (_e: any, data: any) => setCurrentSubtitleTrack(data.id));
-      let hlsRetries = 0;
-      hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
-        if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !switchedToSecondary && secondaryUrl !== primaryUrl) {
-          switchedToSecondary = true;
-          hlsRetries = 0;
-          hls.loadSource(secondaryUrl);
-          hls.startLoad();
-        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR && hlsRetries < 3) {
-          hlsRetries++;
-          hls.startLoad();
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsRetries < 2) {
-          hlsRetries++;
-          hls.recoverMediaError();
-        } else {
-          if (tryNextCandidate()) return;
-          hls.destroy();
-          hlsRef.current = null;
-          video.src = secondaryUrl;
-          video.load();
-          video.play().catch(() => {});
-        }
-      });
-    } else if (isM3U8 && video.canPlayType("application/vnd.apple.mpegurl")) {
-      // Safari / native HLS
-      let switchedToSecondary = false;
-      const nativeErr = () => {
-        if (switchedToSecondary || cleaned) return;
-        switchedToSecondary = true;
-        if (secondaryUrl === primaryUrl) {
-          // No usable proxy fallback for this environment.
-          if (tryNextCandidate()) return;
-          setIsPlaying(false);
-          return;
-        }
-        video.src = secondaryUrl;
-        video.load();
-        video.play().catch(() => setIsPlaying(false));
-      };
-      video.addEventListener("error", nativeErr, { once: true });
-      video.src = primaryUrl;
-      video.load();
-      video.play().catch(() => setIsPlaying(false));
-    } else if (isTS && (mpegts.getFeatureList().mseLivePlayback || mpegts.getFeatureList().msePlayback)) {
-      let switchedToSecondary = false;
-      const player = mpegts.createPlayer(
-        { type: "mpegts", url: primaryUrl, isLive: true, cors: true, withCredentials: false },
-        {
-          enableWorker: true,
-          enableStashBuffer: true,
-          stashInitialSize: stabilityMode === "ultra" ? 1024 * 1024 : 1024 * 256,
-          autoCleanupSourceBuffer: true,
-          liveBufferLatencyChasing: stabilityMode === "stable",
-        },
-      );
-      mpegtsRef.current = player;
-      player.attachMediaElement(video);
-      player.load();
-      const _pp = player.play();
-      if (_pp instanceof Promise) _pp.catch(() => {});
-      player.on(mpegts.Events.ERROR, () => {
-        if (!switchedToSecondary && secondaryUrl !== primaryUrl) {
-          switchedToSecondary = true;
-          player.destroy();
-          mpegtsRef.current = null;
-          const fallbackPlayer = mpegts.createPlayer(
-            { type: "mpegts", url: secondaryUrl, isLive: true, cors: true, withCredentials: false },
-            {
-              enableWorker: true,
-              enableStashBuffer: true,
-              stashInitialSize: stabilityMode === "ultra" ? 1024 * 1024 : 1024 * 256,
-              autoCleanupSourceBuffer: true,
-              liveBufferLatencyChasing: stabilityMode === "stable",
-            },
-          );
-          mpegtsRef.current = fallbackPlayer;
-          fallbackPlayer.attachMediaElement(video);
-          fallbackPlayer.load();
-          const p = fallbackPlayer.play();
-          if (p instanceof Promise) p.catch(() => {});
-          return;
-        }
-        player.destroy();
-        mpegtsRef.current = null;
-        if (tryNextCandidate()) return;
-        video.src = secondaryUrl;
         video.play().catch(() => {});
       });
-    } else {
-      let switchedToSecondary = false;
-      const nativeErr = () => {
-        if (switchedToSecondary || cleaned) return;
-        switchedToSecondary = true;
-        if (secondaryUrl === primaryUrl) {
-          // No usable proxy fallback for this environment.
-          if (tryNextCandidate()) return;
-          setIsPlaying(false);
-          return;
+      hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
+        if (!mountedRef.current || !data.fatal) return;
+        hls.destroy();
+        hlsRef.current = null;
+        if (streamAttemptIndex < streamCandidates.length - 1) {
+          setStreamAttemptIndex((i) => i + 1);
         }
-        video.src = secondaryUrl;
-        video.load();
-        video.play().catch(() => setIsPlaying(false));
-      };
-      video.addEventListener("error", nativeErr, { once: true });
-      video.src = primaryUrl;
+      });
+    } else if (!isNativeTvPlayer && video.canPlayType("application/vnd.apple.mpegurl")) {
+      // Safari native HLS
+      video.src = activeUrl;
       video.load();
-      video.play().catch(() => setIsPlaying(false));
+      video.play().catch(() => {});
+    } else {
+      // Direct playback for other formats
+      video.src = activeUrl;
+      video.load();
+      video.play().catch(() => {});
     }
 
-    return cleanup;
-  }, [stabilityMode, streamAttemptIndex, streamCandidates]);
+    // Cleanup function
+    return () => {
+      if (startupTimerRef.current) clearTimeout(startupTimerRef.current);
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("error", onError);
+      video.removeEventListener("waiting", onWaiting);
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [
+    streamAttemptIndex,
+    streamCandidates.length,
+    streamCandidatesKey,
+    isNativeTvPlayer,
+  ]);
+
+  /** Switch live audio (native webOS/Tizen APIs or hls.js on desktop). */
+  const switchLiveAudioTrack = (trackIndex: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (isNativeTvPlayer) {
+      if (trySwitchPlatformAudioTrack(video, trackIndex)) {
+        setCurrentAudioTrack(trackIndex);
+        return;
+      }
+      const nativeAudio = (video as HTMLVideoElement & { audioTracks?: { enabled: boolean; label?: string }[] }).audioTracks;
+      if (nativeAudio && typeof nativeAudio.length === "number") {
+        for (let i = 0; i < nativeAudio.length; i++) {
+          nativeAudio[i].enabled = i === trackIndex;
+        }
+        setCurrentAudioTrack(trackIndex);
+      }
+      return;
+    }
+    if (hlsRef.current) {
+      hlsRef.current.audioTrack = trackIndex;
+      setCurrentAudioTrack(trackIndex);
+    }
+  };
 
   const togglePlay = (e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -589,39 +637,24 @@ const MiniPlayer = ({
     <div
       ref={containerRef}
       className={cn(
-        "w-full h-full relative group bg-black overflow-hidden",
-        isFullscreen ? "flex items-center justify-center" : "",
+        "w-full h-full relative group overflow-hidden bg-black rounded-3xl border border-white/5 shadow-2xl",
+        isLoading ? "cursor-wait" : "cursor-default",
       )}
       onMouseMove={resetControlsTimeout}
       onClick={resetControlsTimeout}
     >
-      {/* Subtitle Styles */}
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `
-        video::cue {
-          background-color: rgba(0, 0, 0, 0.6);
-          color: ${settings.subtitleColor};
-          font-size: ${settings.subtitleSize === "small" ? "0.8em" : settings.subtitleSize === "large" ? "1.2em" : "1em"};
-          font-family: sans-serif;
-        }
-      `,
-        }}
-      />
-
       <video
         ref={videoRef}
         className={cn(
-          "w-full h-full transition-all duration-300",
+          "w-full h-full transition-transform duration-700",
           aspectRatio === "contain" && "object-contain",
           aspectRatio === "cover" && "object-cover",
           aspectRatio === "fill" && "object-fill",
-          isFullscreen ? "max-h-screen" : "",
         )}
-        style={{ transform: "translateZ(0)", willChange: "transform" }}
         poster={poster || undefined}
+        autoPlay
         playsInline
-        preload="auto"
+        preload={isNativeTvPlayer ? "metadata" : "auto"}
         onPlay={() => {
           setIsPlaying(true);
           setIsBuffering(false);
@@ -636,443 +669,173 @@ const MiniPlayer = ({
         onStalled={() => setIsBuffering(true)}
       />
 
-      {/* Loading / Buffering Indicator */}
+      {/* Modern Loading State */}
       {(isLoading || isBuffering) && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/40 z-20">
-          <Loader2 className="w-12 h-12 text-primary animate-spin" />
+        <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-[2px] z-20">
+          <div className="flex flex-col items-center gap-4">
+             <Loader2 className="w-16 h-16 text-primary animate-spin" />
+             <span className="text-xs font-black uppercase tracking-widest text-white/60">Optimizing Stream...</span>
+          </div>
         </div>
       )}
 
-      {/* Lock Overlay */}
-      {isLocked && showControls && (
-        <div className="absolute inset-0 flex items-center justify-center z-50 pointer-events-none">
-          <motion.div
-            initial={{ scale: 0.8, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="bg-black/60 p-4 rounded-full backdrop-blur-md"
-          >
-            <Lock className="w-12 h-12 text-white/40" />
-          </motion.div>
-        </div>
-      )}
-
-      {/* Controls Overlay */}
+      {/* Premium TV Controls Overlay */}
       <div
         className={cn(
-          "absolute inset-0 flex flex-col justify-between bg-gradient-to-b from-black/60 via-transparent to-black/60 transition-opacity duration-300 z-10",
+          "absolute inset-0 flex flex-col justify-between transition-all duration-500 z-10",
           showControls || !isPlaying
-            ? "opacity-100"
-            : "opacity-0 pointer-events-none",
+            ? "opacity-100 translate-y-0"
+            : "opacity-0 translate-y-4 pointer-events-none",
         )}
       >
-        {/* Top Bar */}
-        <div className="p-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        {/* Top Info Bar (Netflix Style) */}
+        <div className="bg-linear-to-b from-black/80 via-black/20 to-transparent p-6">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <div className="flex flex-col">
+                <div className="flex items-center gap-3">
+                  <h2 className="text-2xl font-black text-white tracking-tight drop-shadow-md">
+                    {title}
+                  </h2>
+                  <div className="flex items-center gap-1.5 rounded-md bg-red-600 px-2 py-0.5 shadow-[0_0_15px_rgba(220,38,38,0.5)]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
+                    <span className="text-[10px] font-black uppercase text-white">Live</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
             {isFullscreen && (
-              <button
-                onClick={toggleFullscreen}
-                className="p-2 hover:bg-white/10 rounded-full transition-colors"
-              >
-                <ArrowLeft className="w-6 h-6 text-white" />
-              </button>
+              <div className="flex items-center gap-4">
+                 <button data-tv-focusable onClick={toggleFullscreen} className="bg-white/10 hover:bg-white/20 p-3 rounded-2xl backdrop-blur-xl border border-white/5 text-white transition-all focus:scale-110">
+                   <ArrowLeft className="w-6 h-6" />
+                 </button>
+                 <Logo size="sm" />
+              </div>
             )}
-            <div className="flex flex-col">
-              <h2
-                className={cn(
-                  "font-bold text-white truncate",
-                  isFullscreen ? "text-xl" : "text-sm",
-                )}
-              >
-                {title}
-              </h2>
-              {isFullscreen && (
-                <div className="flex items-center gap-2">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
-                  </span>
-                  <span className="text-red-500 font-bold uppercase tracking-widest text-[10px]">
-                    Live
-                  </span>
-                </div>
-              )}
-              {stabilityMode === "ultra" && (
-                <div className="flex items-center gap-1 mt-0.5">
-                  <div className="px-1.5 py-0.5 bg-blue-500/20 border border-blue-500/30 rounded text-[8px] text-blue-400 font-bold uppercase tracking-wider">
-                    Ultra Stable Mode
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsLocked(!isLocked);
-              }}
-              className={cn(
-                "p-2 rounded-full transition-colors",
-                isLocked
-                  ? "bg-red-500 text-white"
-                  : "hover:bg-white/10 text-white",
-              )}
-            >
-              {isLocked ? (
-                <Lock className="w-5 h-5" />
-              ) : (
-                <Unlock className="w-5 h-5" />
-              )}
-            </button>
-            {isFullscreen && <Logo size="sm" />}
           </div>
         </div>
 
-        {/* Center Controls */}
-        <div className="flex-1 flex items-center justify-center gap-12">
-          {!isLocked && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onPrev?.();
-              }}
-              className="p-4 bg-white/10 hover:bg-white/20 rounded-full backdrop-blur-sm transition-all hover:scale-110"
-            >
-              <ChevronLeft className="w-8 h-8 text-white" />
-            </button>
-          )}
-
-          <button
-            onClick={togglePlay}
-            className={cn(
-              "bg-primary/80 hover:bg-primary p-6 rounded-full shadow-2xl transition-all hover:scale-110 backdrop-blur-sm",
-              !isPlaying && "scale-125",
-              isLocked && "opacity-50 cursor-not-allowed",
-            )}
-          >
-            {isPlaying ? (
-              <Pause className="w-8 h-8 text-white fill-white" />
-            ) : (
-              <Play className="w-8 h-8 text-white fill-white ml-1" />
-            )}
-          </button>
-
-          {!isLocked && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onNext?.();
-              }}
-              className="p-4 bg-white/10 hover:bg-white/20 rounded-full backdrop-blur-sm transition-all hover:scale-110"
-            >
-              <ChevronRight className="w-8 h-8 text-white" />
-            </button>
-          )}
-        </div>
-
-        {/* Bottom Bar */}
-        <div className="p-4 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            {/* Volume */}
-            <div className="flex items-center gap-2 group/volume">
-              <button
-                onClick={toggleMuteButton}
-                className="p-2 hover:bg-white/10 rounded-full transition-colors"
-                title={isMuted || volume === 0 ? "Unmute" : "Mute"}
-              >
-                {isMuted || volume === 0 ? (
-                  <VolumeX className="w-5 h-5 text-white" />
-                ) : (
-                  <Volume2 className="w-5 h-5 text-white" />
-                )}
-              </button>
-              {!isLocked && (
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  value={isMuted ? 0 : volume}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value);
-                    setVolume(val);
-                    if (val > 0) lastVolumeRef.current = val / 100;
-                    setIsMuted(val === 0 ? true : false);
-                  }}
-                  className="w-0 group-hover/volume:w-20 transition-all duration-300 accent-primary"
-                />
-              )}
-            </div>
+        {/* Center Navigation Arrows (Visible on Hover/Focus) */}
+        {!isLocked && isFullscreen && (
+          <div className="flex-1 flex items-center justify-between px-10">
+             <button data-tv-focusable onClick={(e) => { e.stopPropagation(); onPrev?.(); }} className="p-6 bg-black/40 hover:bg-primary/80 rounded-full backdrop-blur-md border border-white/5 text-white transition-all focus:scale-125 focus:bg-primary">
+               <ChevronLeft className="w-10 h-10" />
+             </button>
+             <button data-tv-focusable onClick={(e) => { e.stopPropagation(); onNext?.(); }} className="p-6 bg-black/40 hover:bg-primary/80 rounded-full backdrop-blur-md border border-white/5 text-white transition-all focus:scale-125 focus:bg-primary">
+               <ChevronRight className="w-10 h-10" />
+             </button>
           </div>
+        )}
 
-          <div className="flex items-center gap-2">
-            {!isLocked && (
-              <>
-                {/* Aspect Ratio */}
-                <div className="relative">
-                  <button
-                    onClick={() => handleMenuClick("aspect")}
-                    className={cn(
-                      "p-2 rounded-full transition-colors",
-                      activeMenu === "aspect"
-                        ? "bg-primary text-white"
-                        : "hover:bg-white/10 text-white",
-                    )}
-                  >
-                    <Monitor className="w-5 h-5" />
+        {/* Bottom Control Bar */}
+        <div className="bg-linear-to-t from-black/90 via-black/40 to-transparent p-6 pt-12">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+               <button data-tv-focusable onClick={togglePlay} className="bg-white text-black p-4 rounded-2xl transition-all focus:scale-110 focus:ring-4 focus:ring-white/40">
+                  {isPlaying ? <Pause className="w-6 h-6 fill-current" /> : <Play className="w-6 h-6 fill-current ml-0.5" />}
+               </button>
+               
+               <button data-tv-focusable onClick={toggleMuteButton} className="bg-white/10 text-white p-4 rounded-2xl transition-all focus:bg-white/20 focus:scale-110">
+                  {isMuted || volume === 0 ? <VolumeX className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
+               </button>
+            </div>
+
+            <div className="flex items-center gap-3">
+               {/* Horizontal Quick Actions */}
+               <button data-tv-focusable onClick={() => handleMenuClick("aspect")} className={cn("flex items-center gap-2 px-5 py-3 rounded-2xl transition-all", activeMenu === "aspect" ? "bg-primary text-white" : "bg-white/10 text-white/60 focus:bg-white/20")}>
+                  <Monitor className="w-5 h-5" />
+                  <span className="text-xs font-black uppercase">{aspectRatio}</span>
+               </button>
+
+               <button data-tv-focusable onClick={() => handleMenuClick("stability")} className={cn("flex items-center gap-2 px-5 py-3 rounded-2xl transition-all", activeMenu === "stability" ? "bg-primary text-white" : "bg-white/10 text-white/60 focus:bg-white/20")}>
+                  <Clock className="w-5 h-5" />
+                  <span className="text-xs font-black uppercase">{stabilityMode === "ultra" ? "Ultra" : "Stable"}</span>
+               </button>
+
+               {audioTracks.length > 1 && (
+                 <button data-tv-focusable onClick={() => handleMenuClick("audio")} className={cn("flex items-center gap-2 px-5 py-3 rounded-2xl transition-all", activeMenu === "audio" ? "bg-green-600 text-white" : "bg-white/10 text-white/60 focus:bg-green-600/30")}>
+                    <Music className="w-5 h-5" />
+                    <span className="text-xs font-black uppercase">Audio</span>
+                 </button>
+               )}
+
+               {!isFullscreen && (
+                  <button data-tv-focusable onClick={toggleFullscreen} className="bg-white/10 text-white p-4 rounded-2xl focus:bg-white/20">
+                     <Maximize2 className="w-5 h-5" />
                   </button>
-                  <AnimatePresence>
-                    {activeMenu === "aspect" && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: 10 }}
-                        className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[140px] shadow-2xl"
-                      >
-                        <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                          Aspect Ratio
-                        </div>
-                        {(["contain", "cover", "fill"] as const).map(
-                          (ratio) => (
-                            <button
-                              key={ratio}
-                              onClick={() => {
-                                setAspectRatio(ratio);
-                                setActiveMenu("none");
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-2 rounded-lg text-xs capitalize transition-colors",
-                                aspectRatio === ratio
-                                  ? "bg-primary text-white"
-                                  : "hover:bg-white/10 text-white/80",
-                              )}
-                            >
-                              {ratio}
-                            </button>
-                          ),
-                        )}
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
+               )}
 
-                {/* Stability Mode */}
-                <div className="relative">
-                  <button
-                    onClick={() => handleMenuClick("stability")}
-                    className={cn(
-                      "p-2 rounded-full transition-colors",
-                      activeMenu === "stability"
-                        ? "bg-primary text-white"
-                        : "hover:bg-white/10 text-white",
-                    )}
-                    title="Stability Mode"
-                  >
-                    <Clock className="w-5 h-5" />
+               {isPipAvailable && !isFullscreen && (
+                  <button data-tv-focusable onClick={togglePip} className="bg-white/10 text-white p-4 rounded-2xl focus:bg-white/20">
+                     <PictureInPicture2 className="w-5 h-5" />
                   </button>
-                  <AnimatePresence>
-                    {activeMenu === "stability" && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: 10 }}
-                        className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[160px] shadow-2xl"
-                      >
-                        <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                          Stability Mode
-                        </div>
-                        {(["stable", "ultra"] as const).map((mode) => (
-                          <button
-                            key={mode}
-                            onClick={() => {
-                              setStabilityMode(mode);
-                              setActiveMenu("none");
-                            }}
-                            className={cn(
-                              "w-full text-left px-3 py-2 rounded-lg text-xs capitalize transition-colors",
-                              stabilityMode === mode
-                                ? "bg-primary text-white"
-                                : "hover:bg-white/10 text-white/80",
-                            )}
-                          >
-                            <div className="font-bold">
-                              {mode === "stable" ? "Stable" : "Ultra Stable"}
-                            </div>
-                            <div className="text-[10px] opacity-60">
-                              {mode === "stable"
-                                ? "Balanced buffer"
-                                : "Maximum buffering"}
-                            </div>
-                          </button>
-                        ))}
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-
-                {/* PiP */}
-                {isPipAvailable && (
-                  <button
-                    onClick={togglePip}
-                    className="p-2 hover:bg-white/10 rounded-full transition-colors text-white"
-                  >
-                    <PictureInPicture2 className="w-5 h-5" />
-                  </button>
-                )}
-
-                {/* Audio Tracks */}
-                {audioTracks.length > 1 && (
-                  <div className="relative">
-                    <button
-                      onClick={() => handleMenuClick("audio")}
-                      className={cn(
-                        "p-2 rounded-full transition-colors",
-                        activeMenu === "audio"
-                          ? "bg-primary text-white"
-                          : "hover:bg-white/10 text-white",
-                      )}
-                    >
-                      <Music className="w-5 h-5" />
-                    </button>
-                    <AnimatePresence>
-                      {activeMenu === "audio" && (
-                        <motion.div
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: 10 }}
-                          className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[140px] shadow-2xl"
-                        >
-                          <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                            Audio
-                          </div>
-                          {audioTracks.map((track, idx) => (
-                            <button
-                              key={idx}
-                              onClick={() => {
-                                const v = (document.querySelector('video') as HTMLVideoElement) || null;
-                                // Try platform API first (Tizen AVPlay)
-                                if (trySwitchPlatformAudioTrack(v, idx)) {
-                                  setActiveMenu("none");
-                                  setCurrentAudioTrack(idx);
-                                  return;
-                                }
-                                if (hlsRef.current) hlsRef.current.audioTrack = idx;
-                                setActiveMenu("none");
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-2 rounded-lg text-xs transition-colors",
-                                currentAudioTrack === idx
-                                  ? "bg-primary text-white"
-                                  : "hover:bg-white/10 text-white/80",
-                              )}
-                            >
-                              {track.name || `Track ${idx + 1}`}
-                            </button>
-                          ))}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                )}
-
-                {/* Subtitles */}
-                {subtitleTracks.length > 0 && (
-                  <div className="relative">
-                    <button
-                      onClick={() => handleMenuClick("subtitle")}
-                      className={cn(
-                        "p-2 rounded-full transition-colors",
-                        activeMenu === "subtitle"
-                          ? "bg-primary text-white"
-                          : "hover:bg-white/10 text-white",
-                      )}
-                    >
-                      <Subtitles className="w-5 h-5" />
-                    </button>
-                    <AnimatePresence>
-                      {activeMenu === "subtitle" && (
-                        <motion.div
-                          initial={{ opacity: 0, y: 10 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: 10 }}
-                          className="absolute bottom-full right-0 mb-2 bg-black/90 border border-white/10 rounded-xl p-2 min-w-[140px] shadow-2xl"
-                        >
-                          <div className="text-[10px] font-bold text-white/40 uppercase px-3 py-1">
-                            Subtitles
-                          </div>
-                          <button
-                            onClick={() => {
-                              const v = (document.querySelector('video') as HTMLVideoElement) || null;
-                              if (trySwitchPlatformSubtitleTrack(v, -1)) {
-                                setActiveMenu("none");
-                                setCurrentSubtitleTrack(-1);
-                                return;
-                              }
-                              if (hlsRef.current) hlsRef.current.subtitleTrack = -1;
-                              setActiveMenu("none");
-                            }}
-                            className={cn(
-                              "w-full text-left px-3 py-2 rounded-lg text-xs transition-colors",
-                              currentSubtitleTrack === -1
-                                ? "bg-primary text-white"
-                                : "hover:bg-white/10 text-white/80",
-                            )}
-                          >
-                            Off
-                          </button>
-                          {subtitleTracks.map((track, idx) => (
-                            <button
-                              key={idx}
-                              onClick={() => {
-                                const v = (document.querySelector('video') as HTMLVideoElement) || null;
-                                if (trySwitchPlatformSubtitleTrack(v, idx)) {
-                                  setActiveMenu("none");
-                                  setCurrentSubtitleTrack(idx);
-                                  return;
-                                }
-                                if (hlsRef.current) hlsRef.current.subtitleTrack = idx;
-                                setActiveMenu("none");
-                              }}
-                              className={cn(
-                                "w-full text-left px-3 py-2 rounded-lg text-xs transition-colors",
-                                currentSubtitleTrack === idx
-                                  ? "bg-primary text-white"
-                                  : "hover:bg-white/10 text-white/80",
-                              )}
-                            >
-                              {track.name || `Track ${idx + 1}`}
-                            </button>
-                          ))}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                )}
-
-
-              </>
-            )}
-
-            <button
-              onClick={toggleFullscreen}
-              className="p-2 hover:bg-white/10 rounded-full transition-colors text-white"
-            >
-              <Maximize2 className="w-5 h-5" />
-            </button>
+               )}
+            </div>
           </div>
         </div>
       </div>
+
+      {/* Floating Menus (TV Style) */}
+      <AnimatePresence>
+        {activeMenu !== "none" && (
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="absolute inset-0 z-30 flex items-center justify-center bg-black/60 backdrop-blur-md p-10">
+            <div className="w-full max-w-lg bg-zinc-900/90 border border-white/10 rounded-3xl p-8 shadow-2xl">
+               <div className="flex items-center justify-between mb-8">
+                  <h3 className="text-3xl font-black text-white uppercase tracking-tighter">
+                     {activeMenu === "aspect" ? "Display Ratio" : activeMenu === "stability" ? "Stability Mode" : "Audio Track"}
+                  </h3>
+                  <button data-tv-focusable onClick={() => setActiveMenu("none")} className="p-3 rounded-full bg-white/5 text-white">
+                     <ArrowLeft className="w-6 h-6" />
+                  </button>
+               </div>
+
+               <div className="flex flex-col gap-3">
+                  {activeMenu === "aspect" && (["contain", "cover", "fill"] as const).map((ratio) => (
+                    <button key={ratio} data-tv-focusable onClick={() => { setAspectRatio(ratio); setActiveMenu("none"); }} className={cn("w-full py-5 rounded-2xl text-xl font-bold uppercase transition-all", aspectRatio === ratio ? "bg-primary text-white scale-105" : "bg-white/5 text-white/40 hover:bg-white/10")}>
+                       {ratio}
+                    </button>
+                  ))}
+
+                  {activeMenu === "stability" && (["stable", "ultra"] as const).map((mode) => (
+                    <button key={mode} data-tv-focusable onClick={() => { setStabilityMode(mode); setActiveMenu("none"); }} className={cn("w-full py-5 rounded-2xl text-xl font-bold uppercase transition-all", stabilityMode === mode ? "bg-primary text-white scale-105" : "bg-white/5 text-white/40")}>
+                       {mode === "stable" ? "Balanced" : "Maximum Stability"}
+                    </button>
+                  ))}
+
+                  {activeMenu === "audio" && audioTracks.map((track, idx) => (
+                    <button key={idx} data-tv-focusable onClick={() => { switchLiveAudioTrack(idx); setActiveMenu("none"); }} className={cn("w-full py-5 rounded-2xl text-xl font-bold uppercase transition-all", currentAudioTrack === idx ? "bg-primary text-white scale-105" : "bg-white/5 text-white/40")}>
+                       {track.name || track.label || `Track ${idx + 1}`}
+                    </button>
+                  ))}
+               </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
-};
+}
 
 // Module-level cache of image URLs that have failed to load.
 // Persists across component mounts so failed logos are never retried.
+// Bounded to 500 entries to prevent unbounded memory growth.
 const failedImageCache = new Set<string>();
-
-// Images in <img> tags load cross-origin natively without CORS proxying.
-const toProxyAssetUrl = (src?: string) => (src?.trim() || "");
+const FAILED_IMAGE_CACHE_MAX = 500;
+const failedImageCacheAdd = (url: string) => {
+  if (failedImageCache.size >= FAILED_IMAGE_CACHE_MAX) {
+    const first = failedImageCache.values().next().value;
+    if (first) failedImageCache.delete(first);
+  }
+  failedImageCache.add(url);
+};
 
 const CHANNEL_BATCH_SIZE = 50;
+// webOS sliding window: max rendered DOM rows to prevent OOM on low-RAM TVs.
+// Items above/below the window are unmounted; scroll position is maintained via padding.
+const MAX_VISIBLE_ROWS = 60;
+const WINDOW_OVERSCAN = 15;
+const ITEM_HEIGHT = 82;
 const CATEGORY_DIVIDER_PATTERN = /^#+\s*[^#]+\s*#+$/;
 
 const normalizeCategoryId = (value: unknown) => String(value ?? "").trim();
@@ -1083,15 +846,20 @@ const isListableLiveChannel = (channel: LiveStream) => {
 };
 
 const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
-  const resolvedSrc = toProxyAssetUrl(src);
+  const { activePlaylist } = usePlaylist();
+  const resolvedSrc = getThumbnailUrl(src, activePlaylist?.host || "");
+  const imgRef = useRef<HTMLImageElement>(null);
+  const iconLoaded = useTvLazyImage(imgRef, resolvedSrc || "", 300);
   const [error, setError] = useState(
     () => !resolvedSrc || failedImageCache.has(resolvedSrc),
   );
 
-  // Virtual lists reuse component instances with new props â€” the useState
+  // Virtual lists reuse component instances with new props — the useState
   // initializer only runs on mount, so we must sync `error` whenever `src` changes.
   useEffect(() => {
-    setError(!resolvedSrc || failedImageCache.has(resolvedSrc));
+    if (!resolvedSrc || failedImageCache.has(resolvedSrc)) {
+      setError(true);
+    }
   }, [resolvedSrc]);
 
   const getInitials = (name: string) => {
@@ -1130,30 +898,30 @@ const ChannelIcon = ({ src, alt }: { src: string; alt: string }) => {
 
   return (
     <img
-      src={resolvedSrc}
+      ref={imgRef}
       alt={alt}
       className="w-full h-full object-contain"
       referrerPolicy="no-referrer"
-      loading="lazy"
-      decoding="async"
       onError={() => {
-        failedImageCache.add(resolvedSrc);
+        failedImageCacheAdd(resolvedSrc);
         setError(true);
       }}
     />
   );
 };
 
-const ChannelRow = memo(({ channel, isSelected, isFavorite, isTVFocused, onSelect, onHover }: {
+const ChannelRow = memo(({ channel, isSelected, isFavorite, isTVFocused, onSelect, onHover, style }: {
   channel: any;
   isSelected: boolean;
   isFavorite: boolean;
   isTVFocused?: boolean;
   onSelect: (ch: any) => void;
   onHover: (ch: any) => void;
+  style?: React.CSSProperties;
 }) => {
+  const t = useT();
   return (
-    <div>
+    <div style={style}>
       <button
         data-tv-focusable
         onMouseEnter={() => onHover(channel)}
@@ -1165,9 +933,10 @@ const ChannelRow = memo(({ channel, isSelected, isFavorite, isTVFocused, onSelec
           isSelected && "tv-channel-row--selected",
           isTVFocused && !isSelected && "tv-channel-row--focus",
         )}
+        style={{ contentVisibility: "auto", containIntrinsicSize: "82px" }}
       >
         <div className="w-10 text-xs text-white/40 font-semibold tabular-nums">{channel.num ?? "-"}</div>
-        <div className="w-12 h-8 bg-white/5 rounded overflow-hidden flex-shrink-0">
+        <div className="tv-channel-logo-shell w-12 h-8 flex-shrink-0">
           <ChannelIcon src={channel.stream_icon} alt={channel.name} />
         </div>
         <div className="flex-1 min-w-0">
@@ -1180,7 +949,7 @@ const ChannelRow = memo(({ channel, isSelected, isFavorite, isTVFocused, onSelec
             {channel.name}
           </span>
           <span className="block text-[11px] text-white/35 uppercase tracking-wide">
-            Live Channel
+            {t.liveChannel}
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -1207,6 +976,7 @@ export default function LiveTV() {
     isConnected,
     playlistData,
     fetchLive,
+    fetchLiveByCategory,
     isFetchingLive,
     favorites,
     toggleFavorite,
@@ -1215,16 +985,25 @@ export default function LiveTV() {
     isParentalUnlocked,
     unlockParental,
     lockParental,
+    setLiveStreams,
+    categoryCounts: indexedCategoryCounts,
   } = usePlaylist();
 
-  // Default to first real category on first render
-  const [activeCategory, setActiveCategory] = useState(() => {
-    const cats = playlistData.liveCategories || [];
-    return cats.length > 0 ? normalizeCategoryId(cats[0].category_id) : "all";
-  });
+  // MUST be defined early - used throughout the component
+  const isWebOS = document.documentElement.dataset.tv === "true";
+  const platform = getPlatformName();
+
+  // Desktop defaults to "all"; webOS loads one category at a time to stay within RAM.
+  const [activeCategory, setActiveCategory] = useState(() =>
+    isWebOS ? "" : "all",
+  );
   const [selectedChannel, setSelectedChannel] = useState<LiveStream | null>(
     null,
   );
+  const selectedChannelRef = useRef<LiveStream | null>(null);
+  useEffect(() => {
+    selectedChannelRef.current = selectedChannel;
+  }, [selectedChannel]);
   const [hoveredChannel, setHoveredChannel] = useState<LiveStream | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const playerRef = useRef<HTMLVideoElement>(null);
@@ -1238,6 +1017,7 @@ export default function LiveTV() {
     string | null
   >(null);
   const epgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const epgAbortRef = useRef<AbortController | null>(null);
   const colorActionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastNonFavoriteCategoryRef = useRef(activeCategory);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -1263,7 +1043,12 @@ export default function LiveTV() {
       liveRetryStateRef.current = { playlistKey, attempts: 0 };
     }
 
-    if ((playlistData.liveStreams?.length || 0) > 0) {
+    if (!isWebOS && (playlistData.liveStreams?.length || 0) > 0) {
+      liveRetryStateRef.current = { playlistKey, attempts: 0 };
+      return;
+    }
+
+    if (isWebOS && (playlistData.liveCategories?.length || 0) > 0) {
       liveRetryStateRef.current = { playlistKey, attempts: 0 };
       return;
     }
@@ -1272,8 +1057,7 @@ export default function LiveTV() {
       return;
     }
 
-    // Recover from partial prefetch states where categories loaded but live streams did not.
-    // Also covers first-open cases where live data has not been requested yet.
+    // Recover from partial prefetch: categories without streams (desktop) or missing categories (webOS).
     liveRetryStateRef.current = {
       playlistKey,
       attempts: liveRetryStateRef.current.attempts + 1,
@@ -1290,12 +1074,16 @@ export default function LiveTV() {
     fetchLive,
     isConnected,
     isFetchingLive,
+    isWebOS,
     playlistData.liveCategories?.length,
     playlistData.liveStreams?.length,
   ]);
 
   useEffect(() => {
     if (epgTimerRef.current) clearTimeout(epgTimerRef.current);
+    epgAbortRef.current?.abort();
+    const abortController = new AbortController();
+    epgAbortRef.current = abortController;
     epgTimerRef.current = setTimeout(async () => {
       if (
         !selectedChannel ||
@@ -1315,6 +1103,7 @@ export default function LiveTV() {
           selectedChannel.stream_id,
           selectedChannel.epg_channel_id,
           selectedChannel.name,
+          abortController.signal,
         );
         const listings = Array.isArray(response?.epg_listings)
           ? [...response.epg_listings].sort(
@@ -1324,16 +1113,23 @@ export default function LiveTV() {
           : [];
         setEpgData(listings);
       } catch {
-        // EPG is best-effort â€” many channels simply don't have it; swallow silently
-        setEpgData([]);
+        if (!abortController.signal.aborted) {
+          setEpgData([]);
+        }
       } finally {
-        setIsEpgLoading(false);
+        if (!abortController.signal.aborted) {
+          setIsEpgLoading(false);
+        }
       }
-    }, 400);
+    }, 1500);
     return () => {
       if (epgTimerRef.current) clearTimeout(epgTimerRef.current);
+      if (epgAbortRef.current === abortController) {
+        epgAbortRef.current = null;
+      }
+      abortController.abort();
     };
-  }, [selectedChannel, activePlaylist]);
+  }, [selectedChannel?.stream_id, selectedChannel?.epg_channel_id, activePlaylist?.id]);
 
   useEffect(() => {
     const timer = setInterval(() => setGuideNow(Date.now()), 30_000);
@@ -1388,7 +1184,102 @@ export default function LiveTV() {
     isParentalUnlocked,
   ]);
 
+  // webOS: default to first real category only when nothing is selected yet (keep Favorites).
+  useEffect(() => {
+    if (!isWebOS || categories.length === 0) return;
+    const normalized = normalizeCategoryId(activeCategory);
+    if (normalized) return;
+    const firstId = normalizeCategoryId(categories[0].category_id);
+    if (firstId) setActiveCategory(firstId);
+  }, [isWebOS, categories, activeCategory]);
+
+  const [favLiveStreams, setFavLiveStreams] = useState<LiveStream[]>([]);
+  const seenLiveChannelsRef = useRef<Map<number, LiveStream>>(new Map());
+
+  const reloadFavoriteLiveStreams = useCallback(() => {
+    if (!activePlaylist?.id) {
+      setFavLiveStreams([]);
+      return;
+    }
+
+    const legacy = readLiveFavSnapshots(activePlaylist.id);
+    const mergedById = {
+      ...legacy,
+      ...(favorites.liveById || {}),
+    };
+
+    const memoryChannels = [
+      ...seenLiveChannelsRef.current.values(),
+      ...(playlistData.liveStreams || []),
+    ];
+
+    const resolved = resolveFavoriteLiveStreams(
+      activePlaylist.id,
+      favorites.live,
+      mergedById,
+      memoryChannels,
+    );
+    setFavLiveStreams(resolved);
+  }, [
+    activePlaylist?.id,
+    favorites.live,
+    favorites.liveById,
+    playlistData.liveStreams,
+  ]);
+
+  useEffect(() => {
+    if (normalizeCategoryId(activeCategory) !== "fav") return;
+    reloadFavoriteLiveStreams();
+  }, [activeCategory, reloadFavoriteLiveStreams]);
+
+  const toggleLiveFavorite = useCallback(
+    (channel: LiveStream) => {
+      if (!activePlaylist?.id || !channel?.stream_id) return;
+      const id = Number(channel.stream_id);
+      const isFav = favorites.live.some((fid) => Number(fid) === id);
+
+      seenLiveChannelsRef.current.set(id, channel);
+      if (isFav) {
+        removeLiveFavSnapshot(activePlaylist.id, id);
+      } else {
+        saveLiveFavSnapshot(activePlaylist.id, channel);
+      }
+      toggleFavorite("live", id, channel);
+
+      if (isFav) {
+        setFavLiveStreams((list) =>
+          list.filter((row) => Number(row.stream_id) !== id),
+        );
+      } else {
+        setFavLiveStreams((list) => {
+          const without = list.filter((row) => Number(row.stream_id) !== id);
+          return [...without, channel];
+        });
+      }
+      queueMicrotask(() => reloadFavoriteLiveStreams());
+    },
+    [
+      activePlaylist?.id,
+      favorites.live,
+      toggleFavorite,
+      reloadFavoriteLiveStreams,
+    ],
+  );
+
+  // webOS: load channels for the active category only (never the full live catalog).
+  useEffect(() => {
+    if (!isWebOS || !activePlaylist) return;
+    const catId = normalizeCategoryId(activeCategory);
+    if (!catId || catId === "all" || catId === "fav") return;
+    fetchLiveByCategory(catId).catch((error) => {
+      console.error("Live category fetch failed:", error);
+    });
+  }, [isWebOS, activeCategory, activePlaylist?.id, fetchLiveByCategory]);
+
   const streams = useMemo(() => {
+    if (normalizeCategoryId(activeCategory) === "fav") {
+      return favLiveStreams;
+    }
     const allStreams = playlistData.liveStreams || [];
     if (isParentalUnlocked) return allStreams;
 
@@ -1404,6 +1295,8 @@ export default function LiveTV() {
     // Prevent accidental full hide from leaving channels list empty.
     return visible.length > 0 ? visible : allStreams;
   }, [
+    activeCategory,
+    favLiveStreams,
     playlistData.liveStreams,
     settings.hiddenCategories.live,
     isParentalUnlocked,
@@ -1419,11 +1312,14 @@ export default function LiveTV() {
     );
 
     if (!stillExists) {
-      setActiveCategory("all");
+      const fallback = isWebOS
+        ? normalizeCategoryId(categories[0]?.category_id) || "all"
+        : "all";
+      setActiveCategory(fallback);
       setFocusIndex(0);
       setHoveredChannel(null);
     }
-  }, [activeCategory, categories]);
+  }, [activeCategory, categories, isWebOS]);
 
   const listableChannels = useMemo(
     () => streams.filter(isListableLiveChannel),
@@ -1431,29 +1327,34 @@ export default function LiveTV() {
   );
 
   const categoryCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
+    if (isWebOS) return indexedCategoryCounts.live;
+    const counts: Record<string, number> = { ...indexedCategoryCounts.live };
     for (let index = 0; index < listableChannels.length; index += 1) {
       const categoryId = normalizeCategoryId(listableChannels[index].category_id);
       if (!categoryId) continue;
       counts[categoryId] = (counts[categoryId] || 0) + 1;
     }
     return counts;
-  }, [listableChannels]);
+  }, [isWebOS, indexedCategoryCounts.live, listableChannels]);
+
+  const favoriteIdSet = useMemo(
+    () => new Set(favorites.live.map((id) => Number(id))),
+    [favorites.live],
+  );
 
   const filteredChannels = useMemo(() => {
     if (!Array.isArray(listableChannels)) return [];
+    const isFavCategory = normalizeCategoryId(activeCategory) === "fav";
     let filtered = listableChannels.filter((channel) => {
       const matchesSearch = channel.name
         .toLowerCase()
         .includes(searchQuery.toLowerCase());
       const matchesCategory =
         activeCategory === "all" ||
+        isFavCategory ||
         normalizeCategoryId(channel.category_id) ===
           normalizeCategoryId(activeCategory);
-      const matchesFav =
-        activeCategory === "fav"
-          ? favorites.live.includes(channel.stream_id)
-          : true;
+      const matchesFav = !isFavCategory || favoriteIdSet.has(Number(channel.stream_id));
       return matchesSearch && matchesCategory && matchesFav;
     });
 
@@ -1479,43 +1380,59 @@ export default function LiveTV() {
     searchQuery,
     activeCategory,
     favorites.live,
+    favoriteIdSet,
     settings.liveSort,
   ]);
 
   // Defer rendering of the channel list for UI responsiveness
   const deferredChannels = useDeferredValue(filteredChannels);
 
-  // When categories load and we're still on "all", switch to first real category
-  useEffect(() => {
-    if (activeCategory === "all" && categories.length > 0) {
-      setActiveCategory(normalizeCategoryId(categories[0].category_id));
-    }
-  }, [categories]);
-
-  // Clear selected channel when category changes (don't auto-select)
-  useEffect(() => {
-    setSelectedChannel(null);
-  }, [activeCategory]);
-
   const [displayLimit, setDisplayLimit] = useState(CHANNEL_BATCH_SIZE);
+  const [windowStart, setWindowStart] = useState(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const previewPanelRef = useRef<HTMLDivElement>(null);
   const shouldFocusListAfterCategorySelectRef = useRef(false);
+  const focusSidebarCategoryAtRef = useRef<(index?: number) => void>(() => {});
 
-  // Reset display limit when category or search changes
+  // Reset display limit and window when category or search changes
   useEffect(() => {
     setDisplayLimit(CHANNEL_BATCH_SIZE);
+    setWindowStart(0);
     setFocusIndex(0);
     setHoveredChannel(null);
     if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0;
   }, [activeCategory, searchQuery]);
 
-  const displayedChannels = useMemo(
-    () => deferredChannels.slice(0, displayLimit),
-    [deferredChannels, displayLimit],
-  );
+  // On webOS: sliding window cap to limit DOM nodes. On desktop: batched loading.
+  const displayedChannels = useMemo(() => {
+    if (isWebOS) {
+      const end = Math.min(windowStart + MAX_VISIBLE_ROWS, deferredChannels.length);
+      return deferredChannels.slice(windowStart, end);
+    }
+    return deferredChannels.slice(0, displayLimit);
+  }, [deferredChannels, displayLimit, windowStart, isWebOS]);
+
+  useEffect(() => {
+    for (const ch of playlistData.liveStreams || []) {
+      const id = Number(ch.stream_id);
+      if (Number.isFinite(id) && id > 0) {
+        seenLiveChannelsRef.current.set(id, ch);
+      }
+    }
+    for (const ch of displayedChannels) {
+      const id = Number(ch.stream_id);
+      if (Number.isFinite(id) && id > 0) {
+        seenLiveChannelsRef.current.set(id, ch);
+      }
+    }
+    while (seenLiveChannelsRef.current.size > MAX_SEEN_LIVE_CHANNELS) {
+      const oldestKey = seenLiveChannelsRef.current.keys().next().value;
+      if (oldestKey == null) break;
+      seenLiveChannelsRef.current.delete(oldestKey);
+    }
+  }, [playlistData.liveStreams, displayedChannels]);
 
   const loadMoreChannels = useCallback(() => {
     setDisplayLimit((previous) =>
@@ -1525,18 +1442,21 @@ export default function LiveTV() {
 
   const handleChannelListScroll = useCallback(
     (event: React.UIEvent<HTMLDivElement>) => {
+      if (isWebOS) return; // webOS uses D-pad controlled sliding window
       const element = event.currentTarget;
+      // Desktop: batched loading, grow displayLimit on scroll
       const remaining =
         element.scrollHeight - element.scrollTop - element.clientHeight;
       if (remaining <= 240 && displayLimit < deferredChannels.length) {
         loadMoreChannels();
       }
     },
-    [deferredChannels.length, displayLimit, loadMoreChannels],
+    [deferredChannels.length, displayLimit, loadMoreChannels, isWebOS],
   );
 
-  // IntersectionObserver to load more when sentinel comes into view
+  // IntersectionObserver to load more when sentinel comes into view (desktop only)
   useEffect(() => {
+    if (isWebOS) return;
     const sentinel = sentinelRef.current;
     if (!sentinel) return;
     const observer = new IntersectionObserver(
@@ -1549,13 +1469,34 @@ export default function LiveTV() {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [displayLimit, deferredChannels.length, loadMoreChannels]);
+  }, [displayLimit, deferredChannels.length, loadMoreChannels, isWebOS]);
   // TV navigation state
   const [focusIndex, setFocusIndex] = useState(0);
-  // Which panel owns D-pad focus: sidebar categories or channel list
-  const [sidebarTVFocus, setSidebarTVFocus] = useState(false);
+  const [navZone, setNavZone] = useState<LiveNavZone>("channels");
   // Color button action feedback
   const [colorAction, setColorAction] = useState<string>("");
+
+  const handleSelectChannel = useCallback((channel: LiveStream | null) => {
+    if (!channel) return;
+    const current = selectedChannelRef.current;
+    if (current?.stream_id === channel.stream_id) {
+      if (isWebOS && playerRef.current) {
+        const video = playerRef.current;
+        if (video.paused || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          video.play().catch(() => {});
+        }
+      }
+      return;
+    }
+    // Synchronous update on TV keeps video.play() inside the remote "enter" gesture.
+    if (isWebOS) {
+      setSelectedChannel(channel);
+    } else {
+    startTransition(() => {
+      setSelectedChannel(channel);
+    });
+    }
+  }, [isWebOS]);
 
   const focusChannelListAt = useCallback(
     (targetIndex = 0) => {
@@ -1563,7 +1504,7 @@ export default function LiveTV() {
       if (total <= 0) return false;
 
       const nextIndex = Math.max(0, Math.min(targetIndex, total - 1));
-      setSidebarTVFocus(false);
+      setNavZone("channels");
       setFocusIndex(nextIndex);
       setHoveredChannel(displayedChannels[nextIndex]);
 
@@ -1572,8 +1513,15 @@ export default function LiveTV() {
         if (!root) return;
         const rows = root.querySelectorAll<HTMLButtonElement>("button[data-tv-focusable]");
         const row = rows[nextIndex] || rows[0];
-        row?.focus();
-        row?.scrollIntoView({ block: "nearest", behavior: "auto" });
+        row?.focus({ preventScroll: true });
+        if (row) {
+          const targetTop =
+            row.offsetTop - root.clientHeight / 2 + row.offsetHeight / 2;
+          root.scrollTo({
+            top: Math.max(0, targetTop),
+            behavior: "smooth",
+          });
+        }
       });
 
       return true;
@@ -1620,33 +1568,48 @@ export default function LiveTV() {
   }, [settings.liveSort, showColorAction, updateSettings]);
 
   const toggleFavoriteFilter = useCallback(() => {
-    if (activeCategory === "fav") {
+    if (normalizeCategoryId(activeCategory) === "fav") {
+      const last = normalizeCategoryId(lastNonFavoriteCategoryRef.current);
       const fallbackCategory =
-        lastNonFavoriteCategoryRef.current &&
-        (lastNonFavoriteCategoryRef.current === "all" ||
-          categories.some(
-            (category) =>
-              category.category_id === lastNonFavoriteCategoryRef.current,
-          ))
-          ? lastNonFavoriteCategoryRef.current
-          : categories[0]?.category_id || "all";
+        last &&
+        last !== "fav" &&
+        last !== "all" &&
+        categories.some((c) => normalizeCategoryId(c.category_id) === last)
+          ? last
+          : normalizeCategoryId(categories[0]?.category_id) || "all";
       setActiveCategory(fallbackCategory);
+      setNavZone("channels");
       showColorAction("Favorites filter off");
       return;
     }
 
-    if (activeCategory !== "all") {
+    if (normalizeCategoryId(activeCategory) !== "all") {
       lastNonFavoriteCategoryRef.current = activeCategory;
     }
     setActiveCategory("fav");
+    reloadFavoriteLiveStreams();
+    shouldFocusListAfterCategorySelectRef.current = true;
+    setNavZone("channels");
     showColorAction("Favorites filter on");
-  }, [activeCategory, categories, showColorAction]);
+  }, [
+    activeCategory,
+    categories,
+    showColorAction,
+    reloadFavoriteLiveStreams,
+  ]);
 
   const focusSearch = useCallback(() => {
     searchInputRef.current?.focus();
     searchInputRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
     showColorAction(searchQuery ? "Search focused" : "Search ready");
   }, [searchQuery, showColorAction]);
+
+  const focusLiveHeader = useCallback(() => {
+    setNavZone("channels");
+    requestAnimationFrame(() => {
+      focusHeader();
+    });
+  }, []);
 
   const focusFirstPreviewControl = useCallback(() => {
     const root = previewPanelRef.current;
@@ -1655,6 +1618,7 @@ export default function LiveTV() {
       "[data-tv-focusable], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])",
     );
     if (!first) return false;
+    setNavZone("preview");
     first.focus();
     return true;
   }, []);
@@ -1676,6 +1640,7 @@ export default function LiveTV() {
 
       // When focus is in the right preview panel, navigate controls spatially.
       if (inPreviewPanel) {
+        if (navZone !== "preview") setNavZone("preview");
         if (key === "enter" || key === "select") {
           active?.click();
           return;
@@ -1687,10 +1652,9 @@ export default function LiveTV() {
         if (key === "left") {
           const before = document.activeElement as HTMLElement | null;
           focusNext("left", { root: previewPanelRef.current });
-          // If there is no more control to the left in preview panel,
-          // hand control back to the channel list navigation.
           if (document.activeElement === before) {
-            before?.blur();
+            setNavZone("channels");
+            focusChannelListAt(focusIndex);
           }
           return;
         }
@@ -1701,12 +1665,23 @@ export default function LiveTV() {
       }
 
       // Header zone: left/right navigate within navbar; down escapes to channel list
-      if (handleHeaderZoneKey(key, { onBack: () => navigate('/') })) return;
+      if (handleHeaderZoneKey(key, { 
+        onBack: () => navigate('/'),
+        onEscapeDown: () => {
+          setNavZone("sidebar");
+          requestAnimationFrame(() => focusSidebarCategoryAtRef.current());
+        }
+      })) return;
 
-      // While sidebar owns focus, channel-list navigation must remain frozen.
-      if (sidebarTVFocus) {
+      // Sidebar owns focus — channel list stays frozen (Sidebar handles keys in capture phase).
+      if (navZone === "sidebar") {
+        if (key === "channelup") {
+          focusLiveHeader();
+          return;
+        }
         if (key === "back") {
-          setSidebarTVFocus(false);
+          setNavZone("channels");
+          focusChannelListAt(focusIndex);
           return;
         }
         return;
@@ -1736,13 +1711,27 @@ export default function LiveTV() {
       if (!displayedChannels.length) return;
 
       if (key === "up") {
-        if (focusIndex === 0) {
-          // Escape channel list upward to the header navbar
-          focusHeader();
+        const rows = scrollContainerRef.current?.querySelectorAll<HTMLButtonElement>("button[data-tv-focusable]");
+        const activeRow = document.activeElement as HTMLElement | null;
+        const firstVisibleRow = rows?.[0] || null;
+        if (focusIndex === 0 || (firstVisibleRow && activeRow === firstVisibleRow)) {
+          // Escape channel list upward to the header navbar.
+          focusLiveHeader();
           return;
         }
         setFocusIndex((prev) => {
           const next = Math.max(prev - 1, 0);
+          setHoveredChannel(displayedChannels[next]);
+          // Slide window up if we're at the top edge
+          if (isWebOS && next < 5 && windowStart > 0) {
+            const slideBy = MAX_VISIBLE_ROWS / 2;
+            const newWindowStart = Math.max(0, windowStart - slideBy);
+            // Calculate new relative focusIndex that keeps the same absolute channel
+            const absoluteIdx = windowStart + next;
+            const newRelativeIdx = absoluteIdx - newWindowStart;
+            setWindowStart(newWindowStart);
+            return Math.max(0, Math.min(newRelativeIdx, MAX_VISIBLE_ROWS - 1));
+          }
           setHoveredChannel(displayedChannels[next]);
           return next;
         });
@@ -1751,25 +1740,41 @@ export default function LiveTV() {
           let next = prev + 1;
           if (next >= displayedChannels.length)
             next = displayedChannels.length - 1;
-          // Load more if navigating near the end
-          if (next >= displayLimit - 5 && displayLimit < deferredChannels.length) {
-            loadMoreChannels();
+          if (isWebOS) {
+            // Slide window down if we're near the bottom edge
+            if (next >= displayedChannels.length - 5 && windowStart + MAX_VISIBLE_ROWS < deferredChannels.length) {
+              const slideBy = MAX_VISIBLE_ROWS / 2;
+              const newWindowStart = Math.min(windowStart + slideBy, Math.max(0, deferredChannels.length - MAX_VISIBLE_ROWS));
+              // Calculate new relative focusIndex that keeps the same absolute channel
+              const absoluteIdx = windowStart + next;
+              const newRelativeIdx = absoluteIdx - newWindowStart;
+              setWindowStart(newWindowStart);
+              setHoveredChannel(deferredChannels[absoluteIdx]);
+              return Math.max(0, Math.min(newRelativeIdx, MAX_VISIBLE_ROWS - 1));
+            }
+          } else {
+            // Load more on desktop
+            if (next >= displayLimit - 5 && displayLimit < deferredChannels.length) {
+              loadMoreChannels();
+            }
           }
           setHoveredChannel(displayedChannels[next]);
           return next;
         });
       } else if (key === "left") {
-        setSidebarTVFocus(true);
+        setNavZone("sidebar");
+        requestAnimationFrame(() => focusSidebarCategoryAtRef.current());
       } else if (key === "right") {
+        setNavZone("preview");
         focusFirstPreviewControl();
       } else if (key === "enter" || key === "select") {
-        setSelectedChannel(displayedChannels[focusIndex]);
+        handleSelectChannel(displayedChannels[focusIndex]);
       } else if (key === "red") {
         const ch = displayedChannels[focusIndex];
         if (ch) {
-          toggleFavorite("live", ch.stream_id);
+          toggleLiveFavorite(ch);
           showColorAction(
-            favorites.live.includes(ch.stream_id)
+            favoriteIdSet.has(Number(ch.stream_id))
               ? "Removed from Favorites"
               : "Added to Favorites",
           );
@@ -1782,20 +1787,36 @@ export default function LiveTV() {
     };
   }, [
     cycleLiveSort,
+    handleSelectChannel,
     displayedChannels,
     deferredChannels.length,
     displayLimit,
     favorites.live,
     focusIndex,
     focusSearch,
+    focusLiveHeader,
     focusFirstPreviewControl,
     navigate,
     selectedChannel,
     showPinModal,
-    sidebarTVFocus,
+    navZone,
     showColorAction,
     toggleFavoriteFilter,
+    toggleLiveFavorite,
+    focusChannelListAt,
+    windowStart,
+    isWebOS,
+    loadMoreChannels,
   ]);
+
+  // TV navigation should be highlight-only. Starting playback on every focused
+  // row creates decoder/network churn on low-memory webOS devices.
+  useEffect(() => {
+    if (!isWebOS || navZone === "sidebar" || showPinModal) return;
+    const ch = displayedChannels[focusIndex];
+    if (!ch) return;
+    setHoveredChannel(ch);
+  }, [focusIndex, displayedChannels, navZone, showPinModal, isWebOS]);
 
   useEffect(() => {
     if (activeCategory !== "fav") {
@@ -1803,12 +1824,19 @@ export default function LiveTV() {
     }
   }, [activeCategory]);
 
-    // Scroll focused channel into view when d-pad navigation changes the index
+    // Keep the focused channel centered while D-pad navigation moves through long lists.
     useEffect(() => {
       const container = scrollContainerRef.current;
       if (!container) return;
-      const row = container.children[focusIndex] as HTMLElement | undefined;
-      row?.scrollIntoView({ block: "nearest", behavior: "auto" });
+      const rows = container.querySelectorAll<HTMLElement>("button[data-tv-focusable]");
+      const row = rows[focusIndex];
+      if (!row) return;
+      const targetTop =
+        row.offsetTop - container.clientHeight / 2 + row.offsetHeight / 2;
+      container.scrollTo({
+        top: Math.max(0, targetTop),
+        behavior: "smooth",
+      });
     }, [focusIndex]);
 
   useEffect(() => {
@@ -1819,7 +1847,7 @@ export default function LiveTV() {
 
   useEffect(() => {
     if (!showPinModal) return;
-    setSidebarTVFocus(false);
+    setNavZone("channels");
     const first = pinModalRef.current?.querySelector<HTMLElement>(
       "[data-tv-focusable], button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
     );
@@ -1871,15 +1899,60 @@ export default function LiveTV() {
       const platform = getPlatformName();
       const baseOrder =
         platform === "webos"
+          ? ["m3u8", "ts", "mp4"]
+          : ["m3u8", "ts", "mp4"];
+      // webOS: native `<video>` only — try multiple extensions on error (see MiniPlayer).
+      if (platform === "webos") {
+        const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+        const simulator = /simulator|emulator/i.test(ua);
+        const exts = simulator
           ? ["ts", "m3u8", "mp4"]
           : ["m3u8", "ts", "mp4"];
+        return exts.map((ext) =>
+          xtreamLiveUrl(
+            activePlaylist.host,
+            activePlaylist.username,
+            activePlaylist.password,
+            channel.stream_id,
+            ext,
+          ),
+        );
+      }
+
+      // On other platforms, use flexible format fallback
+      const rememberedExt = (() => {
+        if (!activePlaylist?.id) return null;
+        try {
+          const saved = localStorage.getItem(
+            `nova_live_ext_pref_${activePlaylist.id}`,
+          );
+          return ["ts", "m3u8", "mp4"].includes(String(saved || ""))
+            ? String(saved)
+            : null;
+        } catch {
+          return null;
+        }
+      })();
+
       const orderedExts = Array.from(
         new Set([preferredExt, ...baseOrder].filter(Boolean)),
       );
+      if (rememberedExt) {
+        const rememberedIndex = orderedExts.indexOf(rememberedExt);
+        if (rememberedIndex > 0) {
+          orderedExts.splice(rememberedIndex, 1);
+          orderedExts.unshift(rememberedExt);
+        }
+      }
 
-      return orderedExts.map(
-        (ext) =>
-          `${activePlaylist.host}/live/${activePlaylist.username}/${activePlaylist.password}/${channel.stream_id}.${ext}`,
+      return orderedExts.map((ext) =>
+        xtreamLiveUrl(
+          activePlaylist.host,
+          activePlaylist.username,
+          activePlaylist.password,
+          channel.stream_id,
+          ext,
+        ),
       );
     },
     [activePlaylist, settings.streamFormat],
@@ -1892,19 +1965,32 @@ export default function LiveTV() {
         { id: "fav", name: t.favorites, count: favorites.live.length },
       ];
 
-    return [
-      { id: "all", name: t.allChannels, count: listableChannels.length },
-      { id: "fav", name: t.favorites, count: favorites.live.length },
-      ...(categories || []).map((cat) => ({
-        id: normalizeCategoryId(cat.category_id),
-        name: cat.category_name,
-        count: categoryCounts[normalizeCategoryId(cat.category_id)] || 0,
-        locked:
-          (settings.parentalLockedCategories?.live || []).includes(
-            normalizeCategoryId(cat.category_id),
-          ) && !isParentalUnlocked,
-      })),
-    ];
+    const items: Array<{ id: string; name: string; count: number; locked?: boolean }> = [];
+
+    if (!isWebOS) {
+      items.push({
+        id: "all",
+        name: t.allChannels,
+        count: listableChannels.length,
+      });
+    }
+    items.push({
+      id: "fav",
+      name: t.favorites,
+      count: favorites.live.length,
+    });
+
+    items.push(...(categories || []).map((cat) => ({
+      id: normalizeCategoryId(cat.category_id),
+      name: cat.category_name,
+      count: categoryCounts[normalizeCategoryId(cat.category_id)] || 0,
+      locked:
+        (settings.parentalLockedCategories?.live || []).includes(
+          normalizeCategoryId(cat.category_id),
+        ) && !isParentalUnlocked,
+    })));
+
+    return items;
   }, [
     listableChannels,
     t.allChannels,
@@ -1915,6 +2001,22 @@ export default function LiveTV() {
     settings.parentalLockedCategories?.live,
     isParentalUnlocked,
   ]);
+
+  useEffect(() => {
+    focusSidebarCategoryAtRef.current = (index?: number) => {
+      const idx =
+        index ??
+        sidebarItems.findIndex((item) => item.id === activeCategory);
+      const list = document.querySelector(
+        ".tv-category-rail .flex-1.overflow-y-auto",
+      );
+      const btn = list?.children[
+        idx >= 0 ? idx : 0
+      ] as HTMLElement | undefined;
+      btn?.focus({ preventScroll: true });
+      btn?.scrollIntoView({ block: "nearest", behavior: "auto" });
+    };
+  }, [sidebarItems, activeCategory]);
 
   const handlePinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1943,9 +2045,15 @@ export default function LiveTV() {
       setPendingLockedCategoryId(normalizedCategoryId);
       setShowPinModal(true);
     } else {
+      // Only clear active channel on explicit user category switch.
+      // Avoid stopping live playback from background/category sync churn.
+      setSelectedChannel(null);
       shouldFocusListAfterCategorySelectRef.current = true;
-      setSidebarTVFocus(false);
+      setNavZone("channels");
       setActiveCategory(normalizedCategoryId);
+      if (normalizedCategoryId === "fav") {
+        reloadFavoriteLiveStreams();
+      }
     }
   };
 
@@ -1986,7 +2094,7 @@ export default function LiveTV() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
+            className="fixed inset-0 z-[200] bg-black/75 backdrop-blur-md flex items-center justify-center p-4"
             onClick={() => setShowPinModal(false)}
           >
             <motion.div
@@ -2024,15 +2132,17 @@ export default function LiveTV() {
                   />
                   <div className="flex gap-3">
                     <button
+                      data-tv-focusable
                       type="button"
                       onClick={() => setShowPinModal(false)}
-                      className="flex-1 px-6 py-4 bg-white/5 hover:bg-white/10 rounded-2xl font-bold transition-colors"
+                      className="tv-channel-row flex-1 px-6 py-4 font-bold mx-0"
                     >
                       Cancel
                     </button>
                     <button
+                      data-tv-focusable
                       type="submit"
-                      className="flex-1 px-6 py-4 bg-primary hover:bg-primary/90 rounded-2xl font-bold transition-colors"
+                      className="tv-channel-row tv-channel-row--selected flex-1 px-6 py-4 font-bold mx-0"
                     >
                       Unlock
                     </button>
@@ -2047,7 +2157,7 @@ export default function LiveTV() {
       <header data-tv-zone="header" className="tv-browser-header flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-4">
-            <button
+            <button data-tv-focusable
               onClick={() => navigate("/")}
               className="tv-header-back-btn rounded-full p-2"
               title="Back to Home"
@@ -2057,28 +2167,28 @@ export default function LiveTV() {
             </button>
             <WeatherWidget />
             <nav className="tv-nav-tabs flex items-center gap-1">
-              <button
+              <button data-tv-focusable
                 onClick={() => navigate("/")}
                 className="tv-nav-tab"
               >
                 {t.home}
               </button>
-              <button className="tv-nav-tab tv-nav-tab--active">
+              <button data-tv-focusable className="tv-nav-tab tv-nav-tab--active">
                 {t.live}
               </button>
-              <button
+              <button data-tv-focusable
                 onClick={() => navigate("/movies")}
                 className="tv-nav-tab"
               >
                 {t.movies}
               </button>
-              <button
+              <button data-tv-focusable
                 onClick={() => navigate("/series")}
                 className="tv-nav-tab"
               >
                 {t.series}
               </button>
-              <button
+              <button data-tv-focusable
                 onClick={() => navigate("/radio")}
                 className="tv-nav-tab"
               >
@@ -2090,14 +2200,14 @@ export default function LiveTV() {
 
         <div className="flex items-center gap-4">
           {settings.parentalPin && (
-            <button
+            <button data-tv-focusable
               onClick={() =>
                 isParentalUnlocked ? lockParental() : setShowPinModal(true)
               }
               className={cn(
                 "tv-header-icon-btn rounded-full p-2 transition-all",
                 isParentalUnlocked
-                  ? "bg-primary text-white"
+                  ? "tv-header-icon-btn--on text-white"
                   : "bg-white/5 text-white/40 hover:bg-white/10",
               )}
               title={
@@ -2130,58 +2240,73 @@ export default function LiveTV() {
       </header>
 
       {/* Main Content */}
-      <div className="flex flex-1 overflow-hidden relative">
-        {/* Sidebar */}
+      <div className="flex flex-1 overflow-hidden relative bg-zinc-950">
+        {/* Sidebar (Premium Integrated) */}
         <Sidebar
           items={sidebarItems}
           activeId={activeCategory}
           onSelect={handleCategorySelect}
-          hasTVFocus={sidebarTVFocus && !showPinModal}
+          hasTVFocus={navZone === "sidebar" && !showPinModal}
+          onTVFocusAcquire={() => setNavZone("sidebar")}
           onTVFocusRelease={() => {
-            focusChannelListAt(focusIndex);
+            setNavZone("channels");
+            requestAnimationFrame(() => focusChannelListAt(focusIndex));
           }}
           onTVFocusEscapeUp={() => {
-            setSidebarTVFocus(false);
-            focusHeader();
+            focusLiveHeader();
           }}
         />
 
-        {/* Channel List */}
+        {/* Channel List (Professional Grid/List) */}
         <div
           ref={containerRef}
-          className="tv-browser-content flex-1 flex flex-col overflow-hidden border-r border-white/10"
+          className="tv-live-column flex-1 flex flex-col overflow-hidden border-r border-white/5 bg-black/20"
         >
-          <div className="tv-nav-strip mx-3 mt-3 mb-2 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-bold uppercase tracking-[0.14em] text-white/40">Category</span>
-              <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/90">
+          <div className="flex items-center justify-between px-8 py-6 bg-linear-to-b from-white/[0.02] to-transparent">
+            <div className="flex flex-col gap-1">
+              <h2 className="text-3xl font-black text-white tracking-tight uppercase">
                 {sidebarItems.find((item) => item.id === activeCategory)?.name || t.allChannels}
-              </span>
-              <span className="tv-browser-stat px-3 py-1 text-sm font-semibold text-white/80">
-                {deferredChannels.length} channels
-              </span>
-            </div>
-            <span
-              className={cn(
-                "rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide",
-                sidebarTVFocus ? "bg-emerald-500/20 text-emerald-200" : "bg-cyan-500/20 text-cyan-100",
-              )}
-            >
-              {sidebarTVFocus ? "Categories Focus" : "Channel List Focus"}
-            </span>
-          </div>
-          {!isConnected ? (
-            <div className="flex flex-col items-center justify-center h-full p-8 text-center gap-4">
-              <div className="p-6 bg-white/5 rounded-full">
-                <Play className="w-12 h-12 text-white/20" />
+              </h2>
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-black text-white/30 tracking-[0.2em] uppercase">
+                  {deferredChannels.length} {t.channels}
+                </span>
+                <div className="h-1 w-1 rounded-full bg-white/20" />
+                <span
+                  className={cn(
+                    "text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded",
+                    navZone === "sidebar"
+                      ? "bg-emerald-500/10 text-emerald-500"
+                      : navZone === "preview"
+                        ? "bg-white/10 text-white/50"
+                        : "bg-primary/10 text-primary",
+                  )}
+                >
+                  {navZone === "sidebar"
+                    ? t.choosingCategory
+                    : navZone === "preview"
+                      ? t.preview
+                      : t.browsingList}
+                </span>
               </div>
-              <div className="flex flex-col gap-2">
-                <h3 className="text-xl font-bold">No Playlist Connected</h3>
-                <p className="text-white/40 max-w-xs">{t.noPlaylistLiveMsg}</p>
+            </div>
+          </div>
+
+          {!isConnected ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-12 text-center gap-6">
+              <div className="w-24 h-24 bg-white/5 rounded-3xl flex items-center justify-center border border-white/10 rotate-12">
+                <Tv className="w-12 h-12 text-white/20 -rotate-12" />
+              </div>
+              <div className="max-w-xs flex flex-col gap-2">
+                <h3 className="text-2xl font-black text-white">{t.noPlaylistLiveMsg}</h3>
+                <p className="text-white/40 leading-relaxed">
+                  Connect your IPTV provider to start watching live television.
+                </p>
               </div>
               <button
+                data-tv-focusable
                 onClick={() => navigate("/playlist-setup")}
-                className="bg-primary px-8 py-3 rounded-xl font-bold hover:bg-primary-hover transition-colors"
+                className="tv-channel-row tv-channel-row--selected px-10 py-4 mx-0 font-black uppercase tracking-widest text-sm"
               >
                 {t.addPlaylistBtn}
               </button>
@@ -2190,283 +2315,248 @@ export default function LiveTV() {
             <div
               ref={scrollContainerRef}
               onScroll={handleChannelListScroll}
-              className="flex-1 overflow-y-auto scrollbar-hide min-h-0 px-2 pb-3"
+              className="flex-1 overflow-y-auto scrollbar-hide px-4 pb-10"
             >
-              {displayedChannels.map((channel, index) => (
-                <ChannelRow
-                  key={channel.stream_id}
-                  channel={channel}
-                  isSelected={selectedChannel?.stream_id === channel.stream_id}
-                  isTVFocused={index === focusIndex}
-                  isFavorite={favorites.live.includes(channel.stream_id)}
-                  onSelect={setSelectedChannel}
-                  onHover={setHoveredChannel}
-                />
-              ))}
-              {displayLimit < deferredChannels.length && (
-                <div ref={sentinelRef} className="flex items-center justify-center py-4">
-                  <Loader2 className="w-5 h-5 animate-spin text-white/40" />
-                  <span className="ml-2 text-xs text-white/40">
-                    {displayedChannels.length} / {deferredChannels.length}
-                  </span>
+              <div
+                className="flex flex-col gap-2"
+                style={isWebOS ? {
+                  paddingTop: windowStart * ITEM_HEIGHT,
+                  paddingBottom: Math.max(0, deferredChannels.length - windowStart - MAX_VISIBLE_ROWS) * ITEM_HEIGHT,
+                } : undefined}
+              >
+                {displayedChannels.map((channel, index) => (
+                  <ChannelRow
+                    key={channel.stream_id}
+                    channel={channel}
+                    isSelected={selectedChannel?.stream_id === channel.stream_id}
+                    isTVFocused={index === focusIndex}
+                    isFavorite={favoriteIdSet.has(Number(channel.stream_id))}
+                    onSelect={handleSelectChannel}
+                    onHover={setHoveredChannel}
+                  />
+                ))}
+              </div>
+              {!isWebOS && displayLimit < deferredChannels.length && (
+                <div ref={sentinelRef} className="flex flex-col items-center justify-center py-12 gap-2 opacity-40">
+                  <Loader2 className="w-8 h-8 animate-spin text-primary" />
+                  <span className="text-[10px] font-black uppercase tracking-widest">Loading More...</span>
                 </div>
               )}
             </div>
           ) : (
-            <div className="p-8 text-center text-white/40">
-              {t.noChannelsFound}
+            <div className="flex-1 flex flex-col items-center justify-center p-12 text-center gap-4 max-w-md mx-auto">
+              <p className="text-white/20 uppercase tracking-[0.2em] font-black text-sm">
+                {normalizeCategoryId(activeCategory) === "fav" &&
+                favorites.live.length > 0
+                  ? "Favorite channels are missing details — open a category, highlight a channel, press Red to save again."
+                  : t.noChannelsFound}
+              </p>
             </div>
           )}
         </div>
 
-        {/* Preview Player */}
-        <div ref={previewPanelRef} className="tv-browser-content w-[40%] flex flex-col bg-black/25">
+        {/* Right Panel: Preview & EPG */}
+        <div
+          ref={previewPanelRef}
+          className="tv-live-column w-[42%] flex flex-col bg-black/20 overflow-hidden"
+        >
           {isConnected ? (
-            <>
-              <div className="aspect-video w-full bg-black relative">
-                {selectedChannel ? (
-                  <MiniPlayer
-                    key={selectedChannel.stream_id}
-                    videoRef={playerRef}
-                    urls={buildLiveChannelUrls(selectedChannel)}
-                    poster={toProxyAssetUrl(selectedChannel.stream_icon)}
-                    title={selectedChannel.name}
-                    onNext={() => {
-                      const currentIndex = filteredChannels.findIndex(
-                        (c) => c.stream_id === selectedChannel.stream_id,
-                      );
-                      if (currentIndex < filteredChannels.length - 1) {
-                        setSelectedChannel(filteredChannels[currentIndex + 1]);
-                      }
-                    }}
-                    onPrev={() => {
-                      const currentIndex = filteredChannels.findIndex(
-                        (c) => c.stream_id === selectedChannel.stream_id,
-                      );
-                      if (currentIndex > 0) {
-                        setSelectedChannel(filteredChannels[currentIndex - 1]);
-                      }
-                    }}
-                  />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-white/[0.03] to-transparent gap-4">
-                    <div className="p-5 bg-white/5 rounded-full border border-white/10">
-                      <Tv className="w-12 h-12 text-white/20" />
-                    </div>
-                    <div className="flex flex-col items-center gap-1">
-                      <span className="text-white/50 font-semibold text-sm">
-                        Select a Channel
-                      </span>
-                      <span className="text-white/25 text-xs">
-                        Browse the list and click a channel to start watching
-                      </span>
-                    </div>
-                  </div>
-                )}
+            <div className="flex flex-col h-full">
+              <div className="px-8 py-5 border-b border-white/5 bg-linear-to-b from-white/[0.02] to-transparent">
+                <h2 className="text-2xl font-black text-white tracking-tight uppercase">
+                  {t.preview}
+                </h2>
+                <span
+                  className={cn(
+                    "mt-1 inline-block text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded",
+                    navZone === "preview" ? "bg-primary/10 text-primary" : "text-white/30",
+                  )}
+                >
+                  {navZone === "preview" ? t.browsingPreview : t.ready}
+                </span>
               </div>
-
-              <div className="p-8 flex flex-col gap-6 overflow-y-auto scrollbar-hide flex-1">
-                {selectedChannel ? (
-                  <div className="flex flex-col gap-2">
-                    <h2 className="text-3xl font-bold">
-                      {selectedChannel?.name}
-                    </h2>
-                    <div className="flex items-center gap-2 text-white/40 text-sm">
-                      <Tv className="w-4 h-4" />
-                      <span>Channel {selectedChannel?.num}</span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center justify-center py-8 text-center gap-2">
-                    <span className="text-white/30 text-sm">
-                      No channel selected
-                    </span>
-                    <span className="text-white/15 text-xs">
-                      Pick a channel from the list to see details and EPG
-                    </span>
-                  </div>
-                )}
-
-                <div className="flex gap-4">
-                  <button
-                    onClick={() => {
-                      if (playerRef.current) {
-                        if (playerRef.current.requestFullscreen) { // eslint-disable-line @typescript-eslint/no-unnecessary-condition
-                          playerRef.current.requestFullscreen();
-                        } else if (
-                          (playerRef.current as any).webkitRequestFullscreen
-                        ) {
-                          (playerRef.current as any).webkitRequestFullscreen();
-                        }
+              <div className="p-8 pb-0">
+                <div className="aspect-video w-full rounded-3xl overflow-hidden border border-white/5 shadow-2xl relative bg-black/40 group">
+                  {selectedChannel ? (
+                    <MiniPlayer
+                      videoRef={playerRef}
+                      urls={buildLiveChannelUrls(selectedChannel)}
+                      startupPreferenceKey={
+                        activePlaylist?.id
+                          ? `nova_live_ext_pref_${activePlaylist.id}`
+                          : undefined
                       }
-                    }}
-                    className="flex-1 bg-primary hover:bg-primary-hover py-3 rounded-lg font-bold transition-colors flex items-center justify-center gap-2"
-                  >
-                    <Maximize2 className="w-5 h-5" />
-                    {t.watchFullScreen}
-                  </button>
-                  <button
-                    onClick={() =>
-                      selectedChannel &&
-                      toggleFavorite("live", selectedChannel.stream_id)
-                    }
-                    className={cn(
-                      "flex-1 py-3 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2",
-                      selectedChannel &&
-                        favorites.live.includes(selectedChannel.stream_id)
-                        ? "bg-white/20"
-                        : "bg-white/10 hover:bg-white/20",
-                    )}
-                  >
-                    <Star
-                      className={cn(
-                        "w-5 h-5",
-                        selectedChannel &&
-                          favorites.live.includes(selectedChannel.stream_id) &&
-                          "fill-primary text-primary",
+                      poster={getThumbnailUrl(
+                        selectedChannel.stream_icon,
+                        activePlaylist?.host,
                       )}
+                      title={selectedChannel.name}
+                      onNext={() => {
+                        const currentIndex = filteredChannels.findIndex(
+                          (c) => c.stream_id === selectedChannel.stream_id,
+                        );
+                        if (currentIndex < filteredChannels.length - 1) {
+                          handleSelectChannel(filteredChannels[currentIndex + 1]);
+                        }
+                      }}
+                      onPrev={() => {
+                        const currentIndex = filteredChannels.findIndex(
+                          (c) => c.stream_id === selectedChannel.stream_id,
+                        );
+                        if (currentIndex > 0) {
+                          handleSelectChannel(filteredChannels[currentIndex - 1]);
+                        }
+                      }}
                     />
-                    {selectedChannel &&
-                    favorites.live.includes(selectedChannel.stream_id)
-                      ? t.favorited
-                      : t.addToFavorite}
-                  </button>
-                </div>
-
-                {selectedChannel &&
-                  (currentProgram || upcomingPrograms.length > 0) && (
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                      <div className="rounded-2xl border border-primary/20 bg-primary/10 p-4">
-                        <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-primary/80 mb-2">
-                          Live Now
-                        </div>
-                        {currentProgram ? (
-                          <>
-                            <div className="text-lg font-bold text-white">
-                              {decodeGuideText(currentProgram.title)}
-                            </div>
-                            <div className="text-sm text-white/60 mt-1">
-                              {new Date(
-                                currentProgram.start,
-                              ).toLocaleTimeString([], {
-                                hour: "2-digit",
-                                minute: "2-digit",
-                                hour12: settings.timeFormat === "12h",
-                              })}
-                              {" â€” "}
-                              {new Date(currentProgram.end).toLocaleTimeString(
-                                [],
-                                {
-                                  hour: "2-digit",
-                                  minute: "2-digit",
-                                  hour12: settings.timeFormat === "12h",
-                                },
-                              )}
-                            </div>
-                            {currentProgram.description && (
-                              <p className="text-sm text-white/70 mt-2 line-clamp-3">
-                                {decodeGuideText(currentProgram.description)}
-                              </p>
-                            )}
-                          </>
-                        ) : (
-                          <div className="text-sm text-white/50">
-                            No current program metadata available.
-                          </div>
-                        )}
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center gap-4">
+                      <div className="p-6 bg-white/5 rounded-full border border-white/5">
+                        <Tv className="w-16 h-16 text-white/10" />
                       </div>
-
-                      <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                        <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-white/50 mb-2">
-                          Coming Up
-                        </div>
-                        {upcomingPrograms.length > 0 ? (
-                          <div className="space-y-3">
-                            {upcomingPrograms.map((program, idx) => (
-                              <div
-                                key={`${program.epg_id}-${idx}`}
-                                className="flex items-start justify-between gap-3"
-                              >
-                                <div className="min-w-0">
-                                  <div className="font-semibold text-white truncate">
-                                    {decodeGuideText(program.title)}
-                                  </div>
-                                  {program.description && (
-                                    <div className="text-xs text-white/45 line-clamp-2 mt-0.5">
-                                      {decodeGuideText(program.description)}
-                                    </div>
-                                  )}
-                                </div>
-                                <div className="shrink-0 text-xs font-mono text-white/50">
-                                  {new Date(program.start).toLocaleTimeString(
-                                    [],
-                                    {
-                                      hour: "2-digit",
-                                      minute: "2-digit",
-                                      hour12: settings.timeFormat === "12h",
-                                    },
-                                  )}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="text-sm text-white/50">
-                            No upcoming program metadata available.
-                          </div>
-                        )}
-                      </div>
+                      <span className="text-white/20 font-black uppercase tracking-[0.2em] text-sm">
+                        {t.selectChannel}
+                      </span>
                     </div>
                   )}
+                </div>
+              </div>
 
-                {/* EPG Section */}
-                <div className="mt-4">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-lg font-bold flex items-center gap-2">
-                      <Clock className="w-5 h-5 text-primary" />
-                      {t.programGuide}
-                    </h3>
-                    {isEpgLoading && (
-                      <Loader2 className="w-4 h-4 text-primary animate-spin" />
+              <div className="flex-1 overflow-y-auto scrollbar-hide p-4 flex flex-col gap-4">
+                {selectedChannel && (
+                  <>
+                    <div className="tv-channel-row tv-channel-row--selected flex items-center gap-3 h-[82px] px-4 mx-2 my-1">
+                      <div className="tv-channel-logo-shell w-12 h-8 flex-shrink-0">
+                        <ChannelIcon
+                          src={selectedChannel.stream_icon}
+                          alt={selectedChannel.name}
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <span className="block text-lg font-medium text-white truncate uppercase">
+                          {selectedChannel.name}
+                        </span>
+                        <span className="block text-[11px] text-white/35 uppercase tracking-wide">
+                          CH {selectedChannel.num ?? "—"} · {t.liveLabel}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1 px-2 py-1 bg-primary/20 rounded text-[10px] text-primary font-bold uppercase shrink-0">
+                        <Play className="w-3 h-3 fill-primary" />
+                        {t.nowPlaying}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 px-2">
+                      <button
+                        data-tv-focusable
+                        onClick={() => {
+                          if (playerRef.current) {
+                            if (playerRef.current.requestFullscreen) {
+                              playerRef.current.requestFullscreen();
+                            } else if ((playerRef.current as any).webkitRequestFullscreen) {
+                              (playerRef.current as any).webkitRequestFullscreen();
+                            }
+                          }
+                        }}
+                        className="tv-channel-row flex items-center gap-3 w-full h-[82px] px-4 text-left mx-0 my-1 hover:bg-white/6"
+                      >
+                        <Maximize2 className="w-5 h-5 text-white/50 shrink-0" />
+                        <span className="text-lg font-medium text-white/85">{t.watchFullScreen}</span>
+                      </button>
+                      <button
+                        data-tv-focusable
+                        onClick={() => toggleLiveFavorite(selectedChannel)}
+                        className={cn(
+                          "tv-channel-row flex items-center gap-3 w-full h-[82px] px-4 text-left mx-0 my-1 hover:bg-white/6",
+                          favoriteIdSet.has(Number(selectedChannel.stream_id)) &&
+                            "tv-channel-row--selected",
+                        )}
+                      >
+                        <Star
+                          className={cn(
+                            "w-5 h-5 shrink-0",
+                            favoriteIdSet.has(Number(selectedChannel.stream_id))
+                              ? "fill-primary text-primary"
+                              : "text-white/45",
+                          )}
+                        />
+                        <span className="text-lg font-medium text-white/85">
+                          {favoriteIdSet.has(Number(selectedChannel.stream_id))
+                            ? t.removeFavorite
+                            : t.addToFavorite}
+                        </span>
+                      </button>
+                    </div>
+
+                    {/* Current Program (Highlight) */}
+                    {currentProgram ? (
+                      <div className="tv-channel-row tv-channel-row--selected tv-epg-current-card flex items-start gap-3 min-h-[82px] px-4 py-4 mx-2 my-1 overflow-hidden">
+                        <Clock className="w-5 h-5 text-primary shrink-0 mt-1" />
+                        <div className="flex-1 min-w-0">
+                          <span className="tv-epg-title block text-lg font-medium text-white leading-snug">
+                            {decodeGuideText(currentProgram.title)}
+                          </span>
+                          <span className="block text-[11px] text-white/35 uppercase tracking-wide mt-1">
+                            {new Date(currentProgram.start).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: settings.timeFormat === "12h",
+                            })}
+                            {" — "}
+                            {new Date(currentProgram.end).toLocaleTimeString([], {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: settings.timeFormat === "12h",
+                            })}
+                          </span>
+                          {currentProgram.description && (
+                            <p className="tv-epg-description tv-epg-description--two text-sm text-white/55 mt-2 leading-relaxed">
+                              {decodeGuideText(currentProgram.description)}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 px-2 py-1 bg-primary/20 rounded text-[10px] text-primary font-bold uppercase shrink-0">
+                          {t.nowPlaying}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="tv-channel-row flex items-center gap-3 h-[82px] px-4 mx-2 my-1 opacity-60">
+                        <Clock className="w-5 h-5 text-white/30" />
+                        <span className="text-lg font-medium text-white/50">{t.noProgramData}</span>
+                      </div>
                     )}
-                  </div>
 
-                  <div className="bg-white/5 rounded-2xl border border-white/5 overflow-hidden">
-                    {epgData.length > 0 ? (
-                      <div className="flex flex-col max-h-[400px] overflow-y-auto p-3 gap-1">
-                        {epgData.map((program, idx) => (
+                    <div className="px-6 py-2 flex items-center justify-between">
+                      <h4 className="text-xs font-black text-white/30 tracking-[0.2em] uppercase">
+                        {t.programGuide}
+                      </h4>
+                      {isEpgLoading && (
+                        <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                      )}
+                    </div>
+
+                    <div className="flex flex-col gap-2 pb-6">
+                      {epgData.length > 0 ? (
+                        epgData.map((program, idx) => (
                           <EpgItem
                             key={idx}
                             program={program}
                             timeFormat={settings.timeFormat}
                           />
-                        ))}
-                      </div>
-                    ) : isEpgLoading ? (
-                      <div className="py-8 text-center text-white/20">
-                        {t.loadingGuide}
-                      </div>
-                    ) : (
-                      <div className="py-8 px-4 text-center text-white/30 space-y-2">
-                        <div>{t.noGuideInfo}</div>
-                        <div className="text-xs text-white/20">
-                          Provider is not returning guide data for this channel
-                          right now.
+                        ))
+                      ) : (
+                        <div className="tv-channel-row flex items-center justify-center h-[82px] mx-2 my-1 text-white/25 font-bold uppercase tracking-widest text-xs">
+                          {isEpgLoading ? t.loadingGuide : t.noGuideInfo}
                         </div>
-                        {selectedChannel?.epg_channel_id && (
-                          <div className="text-[11px] text-white/20 font-mono">
-                            EPG ID: {selectedChannel.epg_channel_id}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
-            </>
+            </div>
           ) : (
-            <div className="flex-1 flex items-center justify-center p-12 text-center text-white/20">
-              Select a channel to preview
+            <div className="flex-1 flex flex-col items-center justify-center p-20 text-center gap-6 opacity-20">
+              <Tv className="w-32 h-32" />
+              <span className="text-2xl font-black uppercase tracking-[0.5em]">{t.preview}</span>
             </div>
           )}
         </div>

@@ -1,15 +1,19 @@
 import {
+  AlertTriangle,
   ArrowLeft,
-  User,
-  ShieldCheck,
+  BadgeCheck,
   Calendar,
   Globe,
-  Server,
   Hash,
+  MonitorSmartphone,
   RefreshCw,
+  Server,
+  ShieldCheck,
+  User,
   Users,
+  type LucideIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Logo from "../components/Logo";
 import { motion } from "motion/react";
@@ -19,7 +23,6 @@ import { IPTVService } from "../services/iptvService";
 import { toast } from "sonner";
 import {
   getDeviceIdentity,
-  getDeviceIdentitySummary,
   type DeviceIdentity,
 } from "../lib/deviceIdentity";
 import { cn } from "../lib/utils";
@@ -27,25 +30,34 @@ import { useT } from "../lib/i18n";
 
 export default function Account() {
   const navigate = useNavigate();
-  const { activePlaylist, isConnected, refreshAccountInfo } = usePlaylist();
+  const {
+    activePlaylist,
+    isConnected,
+    refreshAccountInfo,
+    activationStatus,
+    isActivationLoading,
+    refreshActivationStatus,
+  } = usePlaylist();
   const t = useT();
   const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity | null>(
     null,
   );
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   // TV remote navigation
   useEffect(() => {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
       if (!key) return;
-      if (key === "back") { navigate("/"); return; }
-      if (key === "up" || key === "left") focusNext("up");
-      else if (key === "down" || key === "right") focusNext("down");
-      else if (key === "enter") (document.activeElement as HTMLElement | null)?.click();
+      if (key === "back" || key === "red") { navigate("/"); return; }
+      if (key === "up" || key === "down" || key === "left" || key === "right") {
+        focusNext(key, { root: rootRef.current });
+      }
+      else if (key === "enter" || key === "select") (document.activeElement as HTMLElement | null)?.click();
     };
     window.addEventListener("tv-remote-key", handler);
     requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>("button")?.focus();
+      rootRef.current?.querySelector<HTMLElement>("[data-tv-focusable]")?.focus();
     });
     return () => window.removeEventListener("tv-remote-key", handler);
   }, [navigate]);
@@ -69,22 +81,29 @@ export default function Account() {
   }, []);
 
   const handleRefresh = async () => {
-    if (!activePlaylist) return;
+    const refreshes: Promise<unknown>[] = [refreshActivationStatus(true)];
 
-    toast.promise(refreshAccountInfo(activePlaylist.id), {
+    if (activePlaylist?.type === "xtream") {
+      refreshes.push(refreshAccountInfo(activePlaylist.id));
+    }
+
+    toast.promise(Promise.all(refreshes), {
       loading: t.refreshingAccount,
       success: t.accountUpdated,
       error: t.failedToRefresh,
     });
   };
 
-  const expiryDate = activePlaylist?.accountInfo?.user.exp_date
-    ? IPTVService.formatExpiryDate(activePlaylist.accountInfo.user.exp_date)
-    : t.unlimited;
+  const accountUser = activePlaylist?.accountInfo?.user;
+  const serverInfo = activePlaylist?.accountInfo?.server;
+  const rawExpiry = accountUser?.exp_date;
+  const hasUnlimitedIptv = !rawExpiry || rawExpiry === "0" || rawExpiry === "Unlimited";
+  const expiryDate = hasUnlimitedIptv ? t.unlimited : IPTVService.formatExpiryDate(rawExpiry);
 
   const getDaysRemaining = () => {
-    if (expiryDate === "Unlimited") return null;
-    const exp = new Date(expiryDate);
+    // Keep expiry math on the raw Xtream epoch value; formatted dates are display-only.
+    if (hasUnlimitedIptv || !rawExpiry) return null;
+    const exp = new Date(Number(rawExpiry) * 1000);
     const now = new Date();
     const diff = exp.getTime() - now.getTime();
     const days = Math.ceil(diff / (1000 * 60 * 60 * 24));
@@ -94,202 +113,207 @@ export default function Account() {
   const daysRemaining = getDaysRemaining();
 
   const status =
-    activePlaylist?.accountInfo?.user.status ||
+    accountUser?.status ||
     (isConnected ? "Active" : "Not Connected");
   const maxConnections =
-    activePlaylist?.accountInfo?.user.max_connections || "1";
+    accountUser?.max_connections || "0";
   const activeConnections =
-    activePlaylist?.accountInfo?.user.active_cons || "0";
+    accountUser?.active_cons || "0";
+  const isIptvActive = status.toLowerCase() === "active";
+  const isAppActivated = activationStatus.activated || activationStatus.reason === "trial_active";
+  const currentActivation =
+    activationStatus.activations.find((activation) => activation.status?.toLowerCase() === "active") ||
+    activationStatus.activations[0];
+  const activationExpiry =
+    currentActivation?.expiresAt ||
+    (activationStatus.trial.active ? activationStatus.trial.expiresAt : null);
+  const activationLabel = activationStatus.activated
+    ? "Activated"
+    : activationStatus.reason === "trial_active"
+      ? "Trial Active"
+      : activationStatus.reason === "trial_expired"
+        ? "Trial Expired"
+        : activationStatus.reason === "blocked"
+          ? "Blocked"
+          : "Not Activated";
+  const activationTone = isAppActivated ? "success" : activationStatus.reason === "blocked" ? "danger" : "warning";
+  const serverEndpoint =
+    activePlaylist?.type === "xtream"
+      ? serverInfo?.url
+        ? `${serverInfo.server_protocol || "http"}://${serverInfo.url}${serverInfo.port ? `:${serverInfo.port}` : ""}`
+        : activePlaylist.host || t.notConnected
+      : activePlaylist?.url || t.notConnected;
+  const playlistType = activePlaylist?.type === "xtream" ? "Xtream IPTV" : activePlaylist ? "M3U Playlist" : t.notConnected;
+
+  const formatDateTime = (value?: string | null) => {
+    if (!value) return t.unlimited;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
 
   return (
-    <div className="flex flex-col h-screen">
-      {/* Header */}
-      <header className="flex items-center justify-between px-8 py-6 bg-black/40 border-b border-white/5">
+    <div ref={rootRef} className="flex h-screen flex-col overflow-hidden bg-[radial-gradient(circle_at_10%_10%,rgba(139,0,0,0.24),transparent_34%),radial-gradient(circle_at_90%_0%,rgba(59,130,246,0.16),transparent_30%),linear-gradient(160deg,#020617,#0f172a_52%,#020617)]">
+      <header className="flex items-center justify-between border-b border-white/10 bg-black/25 px-8 py-6 backdrop-blur-xl">
         <div className="flex items-center gap-6">
           <button
+            data-tv-focusable
             onClick={() => navigate("/")}
-            className="p-2 hover:bg-white/10 rounded-full transition-colors"
+            className="rounded-full border border-white/10 bg-white/5 p-3 transition-all hover:scale-105 hover:bg-white/10 focus:outline-none focus:shadow-[0_0_0_2px_rgba(66,133,244,0.18),0_0_24px_rgba(66,133,244,0.35)]"
           >
             <ArrowLeft className="w-8 h-8" />
           </button>
           <div className="flex items-center gap-3">
-            <User className="w-8 h-8 text-primary" />
-            <h1 className="text-3xl font-bold">{t.accountInformation}</h1>
+            <div className="rounded-2xl bg-primary/15 p-3">
+              <User className="h-7 w-7 text-primary" />
+            </div>
+            <div>
+              <h1 className="text-3xl font-bold">{t.accountInformation}</h1>
+              <p className="text-sm text-white/45">App activation, device identity, and IPTV account status</p>
+            </div>
           </div>
         </div>
         <div className="flex items-center gap-4">
-          {activePlaylist?.type === "xtream" && (
-            <button
-              onClick={handleRefresh}
-              className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 rounded-xl transition-colors text-sm font-medium"
-            >
-              <RefreshCw className="w-4 h-4" /> {t.refreshInfo}
-            </button>
-          )}
+          <button
+            data-tv-focusable
+            onClick={handleRefresh}
+            disabled={isActivationLoading}
+            className="flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold transition-colors hover:bg-white/10 focus:outline-none focus:shadow-[0_0_0_2px_rgba(66,133,244,0.18),0_0_24px_rgba(66,133,244,0.35)] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCw className={cn("h-4 w-4", isActivationLoading && "animate-spin")} /> {t.refreshInfo}
+          </button>
           <Logo size="sm" />
         </div>
       </header>
 
-      {/* Content */}
-      <div className="flex-1 flex items-center justify-center p-8 overflow-y-auto">
-        <div className="max-w-5xl w-full grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Profile Card */}
+      <main className="flex flex-1 items-center overflow-y-auto p-8">
+        <div className="mx-auto grid w-full max-w-6xl grid-cols-1 gap-6">
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="bg-white/5 rounded-3xl p-8 border border-white/10 flex flex-col items-center text-center gap-6 h-fit"
+            className="rounded-[32px] border border-white/15 bg-white/[0.06] p-7 shadow-[0_24px_80px_rgba(0,0,0,0.35)] backdrop-blur-2xl"
           >
-            <div className="w-32 h-32 bg-primary/20 rounded-full flex items-center justify-center border-4 border-primary/40">
-              <User className="w-16 h-16 text-primary" />
-            </div>
-            <div>
-              <h2 className="text-3xl font-bold truncate max-w-[200px]">
-                {activePlaylist?.name || t.notConnected}
-              </h2>
-              <p className="text-white/40 mt-1">
-                {activePlaylist?.accountInfo?.user.is_trial === "1"
-                  ? "Trial Account"
-                  : "Premium Subscription"}
-              </p>
-            </div>
-            <div className="w-full h-px bg-white/10" />
-            <div className="grid grid-cols-2 w-full gap-4">
-              <div className="bg-white/5 p-4 rounded-2xl">
-                <span className="text-xs text-white/40 block mb-1">
-                  {t.status}
-                </span>
-                <span
-                  className={cn(
-                    "font-bold flex items-center justify-center gap-1 capitalize",
-                    status.toLowerCase() === "active"
-                      ? "text-green-500"
-                      : "text-red-500",
-                  )}
-                >
-                  <ShieldCheck className="w-4 h-4" /> {status}
-                </span>
+            <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-center gap-5">
+                <div className="flex h-24 w-24 items-center justify-center rounded-3xl border border-primary/35 bg-primary/15">
+                  <MonitorSmartphone className="h-12 w-12 text-primary" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold uppercase tracking-[0.22em] text-white/40">Current Device</p>
+                  <h2 className="mt-2 truncate text-4xl font-bold">{activePlaylist?.name || t.notConnected}</h2>
+                  <p className="mt-2 text-white/50">{playlistType}</p>
+                </div>
               </div>
-              <div className="bg-white/5 p-4 rounded-2xl">
-                <span className="text-xs text-white/40 block mb-1">
-                  {t.connections}
-                </span>
-                <span className="font-bold flex items-center justify-center gap-1">
-                  <Users className="w-4 h-4" /> {activeConnections}/
-                  {maxConnections}
-                </span>
-              </div>
+              <StatusPill tone={activationTone} icon={isAppActivated ? BadgeCheck : AlertTriangle} label={activationLabel} />
             </div>
-          </motion.div>
 
-          {/* Details List */}
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="lg:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4"
-          >
-            <DetailItem
-              icon={Calendar}
-              label={t.expires}
-              value={expiryDate}
-              subValue={
-                expiryDate === t.unlimited
-                  ? t.lifetime
-                  : daysRemaining !== null
-                    ? `${daysRemaining} ${t.daysRemaining}`
-                    : t.expires
-              }
-            />
-            <DetailItem
-              icon={
-                isConnected && activePlaylist?.type === "xtream"
-                  ? Server
-                  : Globe
-              }
-              label={t.serverInfo}
-              value={
-                activePlaylist?.type === "xtream"
-                  ? "Xtream Codes"
-                  : isConnected
-                    ? "M3U Playlist"
-                    : t.notConnected
-              }
-            />
-            {activePlaylist?.type === "xtream" && (
-              <DetailItem
-                icon={Globe}
-                label={t.serverUrl}
-                value={activePlaylist.host || ""}
+            <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2">
+              <MetricCard
+                icon={ShieldCheck}
+                label="App Activation"
+                value={activationLabel}
+                subValue={activationExpiry ? `Expires ${formatDateTime(activationExpiry)}` : "No app expiry"}
+                tone={activationTone}
               />
-            )}
-            {activePlaylist?.accountInfo?.server.timezone && (
-              <DetailItem
-                icon={Globe}
-                label={t.serverTimezone}
-                value={activePlaylist.accountInfo.server.timezone}
+              <MetricCard
+                icon={Calendar}
+                label="IPTV Subscription"
+                value={isIptvActive ? "Active" : status}
+                subValue={hasUnlimitedIptv ? t.lifetime : `${expiryDate}${daysRemaining !== null ? ` · ${daysRemaining} ${t.daysRemaining}` : ""}`}
+                tone={isIptvActive ? "success" : "danger"}
               />
-            )}
-            <DetailItem
-              icon={Hash}
-              label="MAC Address"
-              value={deviceIdentity?.macAddress || "Loading..."}
-              subValue={getDeviceIdentitySummary(deviceIdentity)}
-            />
-            <DetailItem
-              icon={Hash}
-              label="Device Key"
-              value={deviceIdentity?.deviceKey || "Loading..."}
-              subValue={deviceIdentity?.profile.appVersion || ""}
-            />
+              <MetricCard
+                icon={Server}
+                label="IPTV Server"
+                value={playlistType}
+                subValue={serverEndpoint}
+              />
+              <MetricCard
+                icon={Hash}
+                label="Device"
+                value={activationStatus.device?.mac || deviceIdentity?.macAddress || "Loading..."}
+                subValue={`Key: ${activationStatus.device?.deviceKey || deviceIdentity?.deviceKey || "Loading..."}`}
+              />
+              <MetricCard
+                icon={Users}
+                label={t.connections}
+                value={`${activeConnections}/${maxConnections}`}
+                subValue={accountUser?.username ? `User: ${accountUser.username}` : undefined}
+              />
+              <MetricCard
+                icon={Globe}
+                label="Platform"
+                value={activationStatus.device?.platform || deviceIdentity?.profile.platform || "Unknown"}
+                subValue={activationStatus.device?.status ? `Device status: ${activationStatus.device.status}` : undefined}
+              />
+            </div>
           </motion.div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
 
-function DetailItem({
+function StatusPill({ icon: Icon, label, tone = "neutral" }: { icon: LucideIcon; label: string; tone?: Tone }) {
+  return (
+    <div
+      className={cn(
+        "inline-flex items-center gap-2 rounded-full border px-5 py-3 text-sm font-bold uppercase tracking-[0.16em]",
+        toneClass(tone, "pill"),
+      )}
+    >
+      <Icon className="h-5 w-5" />
+      {label}
+    </div>
+  );
+}
+
+type Tone = "success" | "warning" | "danger" | "neutral";
+
+function toneClass(tone: Tone, variant: "card" | "pill") {
+  const card = {
+    success: "border-emerald-400/20 bg-emerald-500/10 text-emerald-200",
+    warning: "border-amber-400/20 bg-amber-500/10 text-amber-200",
+    danger: "border-red-400/20 bg-red-500/10 text-red-200",
+    neutral: "border-white/10 bg-white/[0.06] text-white",
+  };
+  const pill = {
+    success: "border-emerald-400/30 bg-emerald-500/15 text-emerald-200",
+    warning: "border-amber-400/30 bg-amber-500/15 text-amber-200",
+    danger: "border-red-400/30 bg-red-500/15 text-red-200",
+    neutral: "border-white/15 bg-white/10 text-white",
+  };
+  return variant === "card" ? card[tone] : pill[tone];
+}
+
+function MetricCard({
   icon: Icon,
   label,
   value,
   subValue,
+  tone = "neutral",
 }: {
-  icon: any;
+  icon: LucideIcon;
   label: string;
   value: string;
   subValue?: string;
+  tone?: Tone;
 }) {
-  const isUrlValue = /^https?:\/\//i.test(value);
-  const normalizedUrl = isUrlValue
-    ? value
-    : /^([a-z0-9-]+\.)+[a-z]{2,}/i.test(value)
-      ? `https://${value}`
-      : "";
-
   return (
-    <div className="bg-white/5 p-6 rounded-2xl border border-white/5 flex items-center gap-6 hover:bg-white/10 transition-colors">
-      <div className="p-3 bg-primary/10 rounded-xl">
-        <Icon className="w-6 h-6 text-primary" />
+    <div className={cn("rounded-3xl border p-5", toneClass(tone, "card"))}>
+      <div className="mb-4 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-[0.18em] opacity-65">{label}</span>
+        <Icon className="h-5 w-5 opacity-80" />
       </div>
-      <div className="flex-1">
-        <span className="text-sm text-white/40 block">{label}</span>
-        {normalizedUrl ? (
-          <a
-            href={normalizedUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="text-xl font-bold break-all whitespace-normal leading-snug text-primary hover:underline block"
-          >
-            {value}
-          </a>
-        ) : (
-          <span className="text-xl font-bold break-all whitespace-normal leading-snug block">
-            {value}
-          </span>
-        )}
-        {subValue && (
-          <span className="text-xs text-primary block mt-0.5">{subValue}</span>
-        )}
-      </div>
+      <p className="text-2xl font-bold capitalize">{value}</p>
+      {subValue && <p className="mt-2 text-sm opacity-65">{subValue}</p>}
     </div>
   );
 }
+

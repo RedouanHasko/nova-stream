@@ -39,7 +39,7 @@ export default function Activation() {
         focusNext("up");
       } else if (key === "down" || key === "right") {
         focusNext("down");
-      } else if (key === "enter") {
+      } else if (key === "enter" || key === "select") {
         const el = document.activeElement as HTMLElement | null;
         el?.click();
       }
@@ -178,6 +178,7 @@ export default function Activation() {
             </p>
 
             <button
+              data-tv-focusable
               onClick={() => startFreeTrial()}
               disabled={
                 isActivationLoading ||
@@ -192,6 +193,7 @@ export default function Activation() {
             </button>
 
             <button
+              data-tv-focusable
               onClick={openActivationPortal}
               className="activation-action-btn w-full rounded-2xl border border-white/15 bg-white/5 hover:bg-white/10 py-4 px-5 font-bold text-lg transition-colors flex items-center justify-center gap-3"
             >
@@ -200,7 +202,8 @@ export default function Activation() {
             </button>
 
             <button
-              onClick={() => refreshActivationStatus()}
+              data-tv-focusable
+              onClick={() => refreshActivationStatus(true)}
               disabled={isActivationLoading}
               className="activation-action-btn w-full rounded-2xl border border-white/10 bg-transparent hover:bg-white/5 disabled:opacity-50 py-4 px-5 font-semibold transition-colors flex items-center justify-center gap-3"
             >
