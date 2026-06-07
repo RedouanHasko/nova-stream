@@ -200,11 +200,19 @@ export default function Home() {
 
   // TV D-pad navigation for the home tiles (spatial, non-indexed).
   const homeFocusRootRef = useRef<HTMLDivElement | null>(null);
+  const openStreamModalRef = useRef<HTMLDivElement | null>(null);
+
+  const focusHomeDefault = () => {
+    const firstDeckCard =
+      homeFocusRootRef.current?.querySelector<HTMLElement>(".home-deck-grid [data-tv-focusable]") ||
+      homeFocusRootRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
+    firstDeckCard?.focus({ preventScroll: true });
+  };
 
   useEffect(() => {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
-      if (key === "back" && showOpenStreamModal) {
+      if ((key === "back" || key === "red") && showOpenStreamModal) {
         setShowOpenStreamModal(false);
         return;
       }
@@ -213,14 +221,19 @@ export default function Home() {
         return;
       }
       if (key === "left" || key === "right" || key === "up" || key === "down") {
-        focusNext(key, { root: homeFocusRootRef.current });
+        const root = showOpenStreamModal ? openStreamModalRef.current : homeFocusRootRef.current;
+        const active = document.activeElement as HTMLElement | null;
+        if (!showOpenStreamModal && (!active || active === document.body || !root?.contains(active))) {
+          focusHomeDefault();
+          return;
+        }
+        focusNext(key, { root });
       }
     };
     window.addEventListener("tv-remote-key", handler);
-    // Auto-focus the first tile so d-pad navigation is immediately responsive
+    // Auto-focus the main deck so d-pad navigation starts where users expect.
     requestAnimationFrame(() => {
-      const first = homeFocusRootRef.current?.querySelector<HTMLElement>("[data-tv-focusable]");
-      first?.focus();
+      focusHomeDefault();
     });
     return () => window.removeEventListener("tv-remote-key", handler);
   }, [showOpenStreamModal]);
@@ -407,7 +420,7 @@ export default function Home() {
 
         {showOpenStreamModal && (
           <div className="fixed inset-0 z-[140] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
-            <div className="w-full max-w-[720px] rounded-3xl border border-white/15 bg-[#0c111b] p-6 shadow-2xl">
+            <div ref={openStreamModalRef} className="w-full max-w-[720px] rounded-3xl border border-white/15 bg-[#0c111b] p-6 shadow-2xl">
               <div className="mb-5 flex items-center justify-between">
                 <div>
                   <h3 className="text-2xl font-semibold text-white">{t.openUrlFile}</h3>

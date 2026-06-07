@@ -279,9 +279,10 @@ export const webosGetTracks = async (): Promise<any[]> => {
             });
           } catch (e) { resolve(null); }
         });
-        if (res && (res.tracks || res.returnValue)) {
+        const payload = res as any;
+        if (payload && (payload.tracks || payload.returnValue)) {
           // Normalize
-          return res.tracks || res.items || res;
+          return payload.tracks || payload.items || payload;
         }
       } catch {}
     }
@@ -345,4 +346,81 @@ export const normalizePlatformTracks = (tracks: any[]): { audios: any[]; subtitl
     }
   } catch {}
   return { audios, subtitles };
+};
+
+export const readShakaTracks = (player: any): {
+  audios: Array<{ id: number; name: string; lang?: string }>;
+  subtitles: Array<{ id: number; name: string; lang?: string }>;
+  activeAudioIndex: number;
+  activeSubtitleIndex: number;
+} => {
+  const variants = Array.isArray(player?.getVariantTracks?.()) ? player.getVariantTracks() : [];
+  const textTracks = Array.isArray(player?.getTextTracks?.()) ? player.getTextTracks() : [];
+
+  const audios = variants.map((track: any, index: number) => ({
+    id: Number(track?.id ?? index),
+    name: track?.language || track?.label || `Audio ${index + 1}`,
+    lang: track?.language || "",
+  }));
+
+  const subtitles = textTracks.map((track: any, index: number) => ({
+    id: Number(track?.id ?? index),
+    name: track?.language || track?.label || `Subtitle ${index + 1}`,
+    lang: track?.language || "",
+  }));
+
+  const activeAudioIndex = Math.max(
+    0,
+    variants.findIndex((track: any) => Boolean(track?.active)),
+  );
+  const activeSubtitleIndex = Math.max(
+    -1,
+    textTracks.findIndex((track: any) => Boolean(track?.active)),
+  );
+
+  return { audios, subtitles, activeAudioIndex, activeSubtitleIndex };
+};
+
+export const trySelectShakaAudioTrack = (player: any, trackId: number): boolean => {
+  try {
+    const variants = Array.isArray(player?.getVariantTracks?.()) ? player.getVariantTracks() : [];
+    const target =
+      variants.find((track: any) => Number(track?.id) === Number(trackId)) ||
+      variants[trackId];
+    if (!target) return false;
+    player.selectVariantTrack(target, true);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const trySelectShakaSubtitleTrack = (player: any, trackId: number): boolean => {
+  try {
+    if (trackId < 0) {
+      player.setTextTrackVisibility(false);
+      return true;
+    }
+
+    const textTracks = Array.isArray(player?.getTextTracks?.()) ? player.getTextTracks() : [];
+    const target =
+      textTracks.find((track: any) => Number(track?.id) === Number(trackId)) ||
+      textTracks[trackId];
+    if (!target) return false;
+    player.selectTextTrack(target);
+    player.setTextTrackVisibility(true);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const destroyShakaPlayer = async (player: any): Promise<void> => {
+  if (!player) return;
+  try {
+    if (typeof player.destroy === "function") {
+      await player.destroy();
+      return;
+    }
+  } catch {}
 };

@@ -72,6 +72,16 @@ const getFocusable = (root: HTMLElement | Document = document): HTMLElement[] =>
   });
 };
 
+const scrollFocusedIntoView = (el: HTMLElement) => {
+  try {
+    el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+  } catch {
+    try {
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    } catch {}
+  }
+};
+
 export const focusNext = (direction: 'left' | 'right' | 'up' | 'down', opts?: { root?: HTMLElement | null }) => {
   const root = opts?.root ?? document;
   const focusables = getFocusable(root as HTMLElement | Document);
@@ -79,7 +89,8 @@ export const focusNext = (direction: 'left' | 'right' | 'up' | 'down', opts?: { 
 
   const active = document.activeElement as HTMLElement | null;
   if (!active || active === document.body || !focusables.includes(active)) {
-    focusables[0].focus();
+    focusables[0].focus({ preventScroll: true });
+    scrollFocusedIntoView(focusables[0]);
     return;
   }
 
@@ -115,7 +126,8 @@ export const focusNext = (direction: 'left' | 'right' | 'up' | 'down', opts?: { 
   });
 
   scored.sort((a, b) => a.score - b.score);
-  scored[0].el.focus();
+  scored[0].el.focus({ preventScroll: true });
+  scrollFocusedIntoView(scored[0].el);
 };
 
 /**
@@ -165,8 +177,18 @@ export const focusHeader = (): boolean => {
   return false;
 };
 
+const isEditableTarget = (target: EventTarget | null) => {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+};
+
 const mapKey = (ev: KeyboardEvent): RemoteKey => {
   const code = ev.code || ev.key || String(ev.keyCode);
+  const key = ev.key || '';
+  const editable = isEditableTarget(ev.target);
   switch (code) {
     case 'ArrowLeft':
     case 'Left':
@@ -205,17 +227,33 @@ const mapKey = (ev: KeyboardEvent): RemoteKey => {
     case 'XF86Back':
       return 'back';
     case 'F1':
+    case 'ColorF0Red':
     case '403':
       return 'red';
+    case 'Digit1':
+    case 'Numpad1':
+      return editable ? 'unknown' : 'red';
     case 'F2':
+    case 'ColorF1Green':
     case '404':
       return 'green';
+    case 'Digit2':
+    case 'Numpad2':
+      return editable ? 'unknown' : 'green';
     case 'F3':
+    case 'ColorF2Yellow':
     case '405':
       return 'yellow';
+    case 'Digit3':
+    case 'Numpad3':
+      return editable ? 'unknown' : 'yellow';
     case 'F4':
+    case 'ColorF3Blue':
     case '406':
       return 'blue';
+    case 'Digit4':
+    case 'Numpad4':
+      return editable ? 'unknown' : 'blue';
     case 'MediaPlayPause':
       return 'playpause';
     case 'MediaPlay':
@@ -261,6 +299,13 @@ const mapKey = (ev: KeyboardEvent): RemoteKey => {
     case 'XF86AudioFastForward':
       return 'fastforward';
     default:
+      if (!editable) {
+        const lower = key.toLowerCase();
+        if (lower === 'r') return 'red';
+        if (lower === 'g') return 'green';
+        if (lower === 'y') return 'yellow';
+        if (lower === 'b') return 'blue';
+      }
       return 'unknown';
   }
 };
@@ -270,6 +315,31 @@ let handler = (e: KeyboardEvent) => {};
 let lastDirectionalKey: RemoteKey | null = null;
 let lastDirectionalTs = 0;
 let lastSelectTs = 0;
+
+const registerSamsungRemoteKeys = () => {
+  try {
+    const inputDevice = (window as any)?.tizen?.tvinputdevice;
+    if (!inputDevice || typeof inputDevice.registerKey !== 'function') return;
+    [
+      'MediaPlayPause',
+      'MediaPlay',
+      'MediaPause',
+      'MediaStop',
+      'MediaRewind',
+      'MediaFastForward',
+      'ChannelUp',
+      'ChannelDown',
+      'ColorF0Red',
+      'ColorF1Green',
+      'ColorF2Yellow',
+      'ColorF3Blue',
+    ].forEach((keyName) => {
+      try {
+        inputDevice.registerKey(keyName);
+      } catch {}
+    });
+  } catch {}
+};
 
 const shouldThrottle = (key: RemoteKey, ev: KeyboardEvent) => {
   const now = Date.now();
@@ -297,9 +367,16 @@ const shouldThrottle = (key: RemoteKey, ev: KeyboardEvent) => {
 
 export const initTVRemote = () => {
   if (started) return;
+  registerSamsungRemoteKeys();
   handler = (e: KeyboardEvent) => {
     const k = mapKey(e);
     if (k === 'unknown') return;
+    if (isEditableTarget(e.target) && k === 'back' && (e.key === 'Backspace' || e.code === 'Backspace')) {
+      return;
+    }
+    if (isEditableTarget(e.target) && (k === 'enter' || k === 'select')) {
+      return;
+    }
     // Intercept the event BEFORE the browser's built-in sequential navigation
     // (webOS / Tizen apply their own spatial-nav on arrow keys unless we
     // prevent default AND stop immediate propagation here in the capture phase).
@@ -307,11 +384,8 @@ export const initTVRemote = () => {
     e.stopImmediatePropagation();
     if (shouldThrottle(k, e)) return;
     try {
-      const keys = k === 'enter' ? ['enter', 'select'] : [k];
-      for (const key of keys) {
-        const ev = new CustomEvent('tv-remote-key', { detail: { key }, bubbles: true });
-        window.dispatchEvent(ev);
-      }
+      const ev = new CustomEvent('tv-remote-key', { detail: { key: k }, bubbles: true });
+      window.dispatchEvent(ev);
     } catch {}
   };
   // capture:true so our handler runs before any other keydown listener

@@ -34,6 +34,17 @@
       })();
     </script>
     <script>
+      // Mark the document as TV so JS-side isWebOS checks (documentElement.dataset.tv)
+      // work correctly. The app also renders <div data-tv="true"> for CSS, but the
+      // HTML element attribute is needed for cross-component detection at module time.
+      (function () {
+        try {
+          if (typeof window.PalmSystem !== 'undefined' || typeof window.webOS !== 'undefined' || /WebOS/i.test(navigator.userAgent) || /SMART-TV/i.test(navigator.userAgent) || /Tizen/i.test(navigator.userAgent)) {
+            document.documentElement.setAttribute('data-tv', 'true');
+          }
+        } catch (e) {}
+      })();
+
       // Load platform-specific SDK libraries.
       (function () {
         try {

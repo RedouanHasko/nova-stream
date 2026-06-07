@@ -5,11 +5,13 @@
   "type": "web",
   "main": "index.html",
   "title": "Nova Player",
+  "enumerable": true,
+  "handlesRelaunch": true,
+  "resolution": "1920x1080",
+  "requiredPermissions": [
+    "media.operation"
+  ],
   "icon": "images/favicon.png",
   "requiredMemory": 256,
-  "largeIcon": "images/favicon.png",
-  "disableBackHistoryAPI": true,
-  "trustLevel": "default",
-  "transparent": false,
-  "accessibility": { "supportsAudioGuidance": false }
+  "largeIcon": "images/favicon.png"
 }

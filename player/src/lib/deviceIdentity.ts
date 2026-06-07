@@ -87,7 +87,8 @@ const tryGetPlatformId = async (): Promise<{ id: string | null; source: string |
           });
           if (res) {
             // Try common fields
-            const candidates = [res.macAddress, res.mac, res.serialNumber, res.deviceId, res.id, res.uuid, res.hardwareId, res.modelName, JSON.stringify(res)];
+            const info = res as any;
+            const candidates = [info.macAddress, info.mac, info.serialNumber, info.deviceId, info.id, info.uuid, info.hardwareId, info.modelName, JSON.stringify(info)];
             for (const c of candidates) {
               if (c && typeof c === 'string' && c.trim().length > 6) return { id: c.trim(), source: `${ep}#${method}` };
             }
@@ -318,8 +319,20 @@ function derivePseudoMac(hashHex: string): string {
 }
 
 function deriveDeviceKey(hashHex: string): string {
-  const numeric = BigInt(`0x${hashHex.slice(12, 28)}`) % 100000000n;
-  return numeric.toString().padStart(8, "0");
+  // Avoid BigInt syntax/runtime requirements for older TV web engines.
+  // Compute modulo directly from hex digits so startup parsing stays compatible.
+  const segment = hashHex.slice(12, 28);
+  let numeric = 0;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment.charCodeAt(i);
+    let value = -1;
+    if (ch >= 48 && ch <= 57) value = ch - 48;
+    else if (ch >= 65 && ch <= 70) value = ch - 55;
+    else if (ch >= 97 && ch <= 102) value = ch - 87;
+    if (value < 0) continue;
+    numeric = (numeric * 16 + value) % 100000000;
+  }
+  return String(numeric).padStart(8, "0");
 }
 
 function createFingerprintSource(platform: string): ResolvedIdentitySource {

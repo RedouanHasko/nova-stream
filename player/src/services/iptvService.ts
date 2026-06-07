@@ -1,3 +1,5 @@
+import { resolvePanelImageUrl } from "../lib/panelAssetUrl";
+
 export interface XtreamAccountInfo {
   username: string;
   status: string;
@@ -226,6 +228,28 @@ async function idbClear(): Promise<void> {
   }
 }
 
+async function idbDeleteKeys(keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  try {
+    const db = await openIDB();
+    await new Promise<void>((resolve) => {
+      try {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        const store = tx.objectStore(IDB_STORE);
+        for (const key of keys) {
+          store.delete(key);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
+  } catch {
+    // IndexedDB unavailable — silently skip.
+  }
+}
+
 // Batch-read multiple keys in a single IDB transaction — much faster than N separate reads.
 async function idbGetBatch(
   keys: string[],
@@ -276,6 +300,17 @@ export class IPTVService {
   private static readonly CACHE_TTL_SHORT = 5 * 60 * 1000; // 5 min (EPG, info)
   // How often a background refresh can check the server for new data
   private static readonly REFRESH_INTERVAL = 30 * 60 * 1000; // 30 min
+
+  // Limit memCache to prevent unbounded memory growth on constrained TVs
+  private static readonly MEMCACHE_MAX_SIZE = 50;
+
+  private static memCacheSet(key: string, entry: { data: any; ts: number }) {
+    if (this.memCache.size >= this.MEMCACHE_MAX_SIZE) {
+      const oldest = this.memCache.keys().next().value;
+      if (oldest) this.memCache.delete(oldest);
+    }
+    this.memCache.set(key, entry);
+  }
 
   private static dedupeByNumericKey<T extends Record<string, any>>(
     items: T[],
@@ -328,16 +363,44 @@ export class IPTVService {
   }
 
   // ── Low-level fetch (no cache) ─────────────────────────────────────
-  private static buildProxyUrl(url: string): string {
-    const mediaBase = getMediaApiBaseUrl() || "";
-    if (mediaBase) {
-      return `${mediaBase.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(url)}`;
+  private static getProxyUrls(url: string): string[] {
+    const encodedTarget = encodeURIComponent(url);
+    const candidates = new Set<string>();
+
+    if (typeof window !== "undefined") {
+      const { protocol, hostname, origin, port } = window.location;
+      if (protocol === "file:") {
+        const mediaBase = (getMediaApiBaseUrl() || "").trim();
+        if (mediaBase) candidates.add(mediaBase.replace(/\/$/, ""));
+        // Packaged mode still benefits from localhost fallbacks while debugging on desktop.
+        candidates.add("http://localhost:5000");
+        candidates.add("http://127.0.0.1:5000");
+        candidates.add("http://localhost:4000");
+        candidates.add("http://127.0.0.1:4000");
+      } else {
+        // Browser dev must stay same-origin only. Cross-port fallbacks such as
+        // localhost:5000 create noisy connection-refused errors when npm run dev
+        // is serving the proxy on localhost:4000.
+        candidates.add(origin.replace(/\/$/, ""));
+      }
+    } else {
+      const mediaBase = (getMediaApiBaseUrl() || "").trim();
+      if (mediaBase) candidates.add(mediaBase.replace(/\/$/, ""));
     }
+
+    const proxyUrls = Array.from(candidates)
+      .filter(Boolean)
+      .map((base) => `${base}/api/proxy?url=${encodedTarget}`);
+
     // Last-resort relative path for non-packaged browser mode.
-    return `/api/proxy?url=${encodeURIComponent(url)}`;
+    if (proxyUrls.length === 0) {
+      proxyUrls.push(`/api/proxy?url=${encodedTarget}`);
+    }
+
+    return proxyUrls;
   }
 
-  private static async fetchTextDirect(url: string, retries = 1): Promise<string> {
+  private static async fetchTextDirect(url: string, retries = 0): Promise<string> {
     // Build the list of URLs to try: original first, then HTTP downgrade if original is HTTPS.
     const urlsToTry = [url];
     if (url.startsWith("https://")) {
@@ -348,30 +411,33 @@ export class IPTVService {
     for (const tryUrl of urlsToTry) {
       for (let attempt = 0; attempt <= retries; attempt++) {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30_000);
+        const timeoutId = setTimeout(() => controller.abort(), 8_000); // 8s timeout — IPTV should be fast
         try {
           const response = await fetch(tryUrl, { signal: controller.signal });
+          clearTimeout(timeoutId);
           if (!response.ok) {
             if (response.status >= 500 && attempt < retries) {
-              await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+              await new Promise((r) => setTimeout(r, 200));
               continue;
             }
             throw new Error(`HTTP ${response.status}`);
           }
           return await response.text();
         } catch (err: any) {
+          clearTimeout(timeoutId);
           lastErr = err;
+          const isAbort = err?.name === "AbortError";
           const isNetwork =
+            isAbort ||
             err?.name === "TypeError" ||
-            /fetch|network|timeout|abort/i.test(String(err?.message || ""));
-          if (attempt < retries && isNetwork) {
-            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            /fetch|network|timeout/i.test(String(err?.message || ""));
+          // Don't retry timeout errors — they'll just timeout again
+          if (attempt < retries && isNetwork && !isAbort) {
+            await new Promise((r) => setTimeout(r, 200));
             continue;
           }
           // Non-network error or out of retries — break inner loop, try next URL.
           break;
-        } finally {
-          clearTimeout(timeoutId);
         }
       }
     }
@@ -379,52 +445,69 @@ export class IPTVService {
   }
 
   // Retry-capable fetch that prefers direct provider access and falls back to backend proxy.
-  private static async fetchTextWithProxy(url: string, retries = 2): Promise<string> {
+  private static async fetchTextWithProxy(url: string, retries = 0): Promise<string> {
     const forceProxy = String((import.meta as any)?.env?.VITE_FORCE_PROXY || "").toLowerCase() === "true";
+    const browserHttp =
+      typeof window !== "undefined" && window.location.protocol !== "file:";
     let directError: unknown = null;
 
-    if (!forceProxy) {
+    if (!forceProxy && !browserHttp) {
       try {
-        return await this.fetchTextDirect(url, 1);
+        return await this.fetchTextDirect(url, 0);
       } catch (err) {
         directError = err;
       }
     }
 
-    const proxyUrl = this.buildProxyUrl(url);
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60_000);
-      try {
-        const response = await fetch(proxyUrl, { signal: controller.signal });
-        if (!response.ok) {
-          if (response.status >= 500 && attempt < retries) {
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+    const proxyUrls = this.getProxyUrls(url);
+    let lastProxyError: unknown = null;
+
+    for (const proxyUrl of proxyUrls) {
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20_000); // 20s per attempt — fail faster to try next proxy
+        try {
+          const response = await fetch(proxyUrl, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (!response.ok) {
+            if (response.status >= 500 && attempt < retries) {
+              await new Promise((r) => setTimeout(r, 300));
+              continue;
+            }
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return await response.text();
+        } catch (err: any) {
+          clearTimeout(timeoutId);
+          lastProxyError = err;
+          const isAbort = err?.name === "AbortError";
+          // Don't retry timeout errors — they'll just timeout again
+          if (
+            attempt < retries &&
+            !isAbort &&
+            (err.name === "TypeError" || err.message?.includes("fetch"))
+          ) {
+            await new Promise((r) => setTimeout(r, 300));
             continue;
           }
-          throw new Error(`HTTP ${response.status}`);
+          break; // exit inner loop, try next proxy URL
         }
-        return await response.text();
-      } catch (err: any) {
-        if (
-          attempt < retries &&
-          (err.name === "TypeError" || err.message?.includes("fetch"))
-        ) {
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-          continue;
-        }
-        throw err;
-      } finally {
-        clearTimeout(timeoutId);
       }
     }
+
     const directMsg =
       directError instanceof Error
         ? directError.message
         : directError
           ? String(directError)
-          : "direct fetch skipped";
-    throw new Error(`Max retries reached (direct: ${directMsg})`);
+          : "skipped";
+    const proxyMsg =
+      lastProxyError instanceof Error
+        ? lastProxyError.message
+        : lastProxyError
+          ? String(lastProxyError)
+          : "failed";
+    throw new Error(`Fetch failed (direct: ${directMsg}; proxy: ${proxyMsg})`);
   }
 
   // JSON convenience wrapper around fetchTextWithProxy.
@@ -538,6 +621,27 @@ export class IPTVService {
     return [];
   }
 
+  /** Xtream panels often return relative logo/poster paths — make them absolute. */
+  private static absolutizeMediaRowIcons<T extends object>(
+    host: string,
+    rows: T[],
+  ): T[] {
+    if (!host || !rows.length) return rows;
+    return rows.map((row) => {
+      const next = { ...row } as T & {
+        stream_icon?: string;
+        cover?: string;
+      };
+      if (typeof next.stream_icon === "string" && next.stream_icon) {
+        next.stream_icon = resolvePanelImageUrl(host, next.stream_icon);
+      }
+      if (typeof next.cover === "string" && next.cover) {
+        next.cover = resolvePanelImageUrl(host, next.cover);
+      }
+      return next as T;
+    });
+  }
+
   /**
    * Return or create a per-server EPG support state entry.
    * Used to remember whether short/simple/XMLTV EPG endpoints work for a server.
@@ -572,7 +676,7 @@ export class IPTVService {
       xmlText = String(cached.data || "");
     } else {
       xmlText = await this.fetchTextWithProxy(url, 1);
-      this.memCache.set(cacheKey, { data: xmlText, ts: Date.now() });
+      this.memCacheSet(cacheKey, { data: xmlText, ts: Date.now() });
     }
 
     if (!xmlText || !xmlText.includes("<programme")) {
@@ -650,10 +754,12 @@ export class IPTVService {
   }
 
   // ── Cached + dedup'd fetch (memCache → IndexedDB → network) ────────
+  // Startup is cache-first so app restarts reuse persisted data instantly.
+  // When cached data is older than REFRESH_INTERVAL, trigger a background refresh.
   private static cachedFetch(url: string, ttl: number): Promise<any> {
     const cacheKey = url;
 
-    // 1) Memory-cache hit
+    // 1) Memory-cache hit (instant)
     const entry = this.memCache.get(cacheKey);
     if (entry && Date.now() - entry.ts < ttl) {
       return Promise.resolve(entry.data);
@@ -663,34 +769,64 @@ export class IPTVService {
     const existing = this.inFlight.get(cacheKey);
     if (existing) return existing;
 
-    // 3) New request — check IndexedDB first, then network
+    // 3) New request — reuse persistent cache first, then refresh as needed
     const promise = (async () => {
-      // Try IndexedDB (L2 cache)
-      const idbEntry = await idbGet(cacheKey);
-      if (idbEntry && Date.now() - idbEntry.ts < ttl) {
-        this.memCache.set(cacheKey, { data: idbEntry.data, ts: idbEntry.ts });
-        this.inFlight.delete(cacheKey);
-        return idbEntry.data;
+      let persistentEntry: { data: any; ts: number } | undefined;
+      try {
+        persistentEntry = await idbGet(cacheKey);
+      } catch {
+        persistentEntry = undefined;
       }
 
-      // Network fetch
-      const data = await this.fetchWithProxy(url);
-      this.memCache.set(cacheKey, { data, ts: Date.now() });
-      // Persist to IndexedDB (fire-and-forget)
-      idbSet(cacheKey, data).catch(() => {});
-      this.inFlight.delete(cacheKey);
-      return data;
-    })().catch((err) => {
-      this.inFlight.delete(cacheKey);
-      // If network fails but we have stale IDB data, return it
-      return idbGet(cacheKey).then((stale) => {
-        if (stale?.data) {
-          this.memCache.set(cacheKey, { data: stale.data, ts: stale.ts });
-          return stale.data;
+      if (persistentEntry?.data) {
+        this.memCacheSet(cacheKey, {
+          data: persistentEntry.data,
+          ts: persistentEntry.ts,
+        });
+
+        const age = Date.now() - persistentEntry.ts;
+        if (age < ttl) {
+          this.inFlight.delete(cacheKey);
+
+          // Keep UI instant on restart, then refresh in background if stale-ish.
+          if (age >= this.REFRESH_INTERVAL) {
+            void this.forceRefresh(cacheKey).catch(() => {});
+          }
+
+          return persistentEntry.data;
         }
+      }
+
+      try {
+        // No valid cache or cache expired: fetch from network.
+        const data = await this.fetchWithProxy(url);
+        this.memCacheSet(cacheKey, { data, ts: Date.now() });
+        this.inFlight.delete(cacheKey);
+        
+        // Persist to IndexedDB async in background (don't await)
+        idbSet(cacheKey, data).catch(() => {});
+        
+        return data;
+      } catch (err) {
+        this.inFlight.delete(cacheKey);
+
+        // Network failed — fallback to persistent cache if available.
+        if (persistentEntry?.data) {
+          return persistentEntry.data;
+        }
+
+        const idbEntry = await idbGet(cacheKey);
+        if (idbEntry?.data) {
+          this.memCacheSet(cacheKey, {
+            data: idbEntry.data,
+            ts: idbEntry.ts,
+          });
+          return idbEntry.data;
+        }
+
         throw err;
-      });
-    });
+      }
+    })();
 
     this.inFlight.set(cacheKey, promise);
     return promise;
@@ -700,7 +836,7 @@ export class IPTVService {
   private static async forceRefresh(url: string): Promise<any> {
     try {
       const data = await this.fetchWithProxy(url);
-      this.memCache.set(url, { data, ts: Date.now() });
+      this.memCacheSet(url, { data, ts: Date.now() });
       idbSet(url, data).catch(() => {});
       return data;
     } catch {
@@ -738,17 +874,14 @@ export class IPTVService {
     host: string,
     user: string,
     pass: string,
+    categoryId?: string | number,
   ): Promise<LiveStream[]> {
-    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams`;
+    const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_live_streams${
+      categoryId ? `&category_id=${encodeURIComponent(String(categoryId))}` : ""
+    }`;
     const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
-    const direct = this.normalizeListResponse(data) as LiveStream[];
-    if (direct.length > 0) return direct;
-
-    // Fallback for providers that briefly return empty data while cache is cold.
-    const refreshed = this.normalizeListResponse(
-      await this.forceRefresh(url),
-    ) as LiveStream[];
-    return refreshed.length > 0 ? refreshed : direct;
+    const rows = this.normalizeListResponse(data) as LiveStream[];
+    return this.absolutizeMediaRowIcons(host, rows);
   }
 
   static async getVodCategories(
@@ -771,7 +904,8 @@ export class IPTVService {
       categoryId ? `&category_id=${encodeURIComponent(String(categoryId))}` : ""
     }`;
     const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
-    return this.normalizeListResponse(data) as MovieStream[];
+    const rows = this.normalizeListResponse(data) as MovieStream[];
+    return this.absolutizeMediaRowIcons(host, rows);
   }
 
   static async getSeriesCategories(
@@ -794,7 +928,99 @@ export class IPTVService {
       categoryId ? `&category_id=${encodeURIComponent(String(categoryId))}` : ""
     }`;
     const data = await this.cachedFetch(url, this.CACHE_TTL_STREAMS);
-    return this.normalizeListResponse(data) as SeriesStream[];
+    const rows = this.normalizeListResponse(data) as SeriesStream[];
+    return this.absolutizeMediaRowIcons(host, rows);
+  }
+
+  /** Drop one API response from L1 so per-category count scans do not fill RAM. */
+  static evictCachedUrl(url: string): void {
+    this.memCache.delete(url);
+    this.inFlight.delete(url);
+  }
+
+  private static categoryCountUrl(
+    host: string,
+    user: string,
+    pass: string,
+    section: "live" | "vod" | "series",
+    categoryId: string,
+  ): string {
+    const action =
+      section === "live"
+        ? "get_live_streams"
+        : section === "vod"
+          ? "get_vod_streams"
+          : "get_series";
+    return `${host}/player_api.php?username=${user}&password=${pass}&action=${action}&category_id=${encodeURIComponent(categoryId)}`;
+  }
+
+  /**
+   * Count items in one category without caching the full JSON payload (TV-safe).
+   * Other IPTV apps show sidebar totals using the same per-category API calls.
+   */
+  static async countItemsInCategory(
+    host: string,
+    user: string,
+    pass: string,
+    section: "live" | "vod" | "series",
+    categoryId: string,
+  ): Promise<number> {
+    const url = this.categoryCountUrl(host, user, pass, section, categoryId);
+    try {
+      const data = await this.fetchWithProxy(url);
+      const list = this.normalizeListResponse(data);
+      return Array.isArray(list) ? list.length : 0;
+    } finally {
+      this.evictCachedUrl(url);
+    }
+  }
+
+  private static absolutizeDetailInfo(host: string, data: any): any {
+    if (!data || typeof data !== "object") return data;
+    const next = { ...data };
+    if (next.info && typeof next.info === "object") {
+      const info = { ...next.info };
+      if (info.movie_image) {
+        info.movie_image = resolvePanelImageUrl(host, info.movie_image);
+      }
+      if (info.cover) {
+        info.cover = resolvePanelImageUrl(host, info.cover);
+      }
+      if (Array.isArray(info.backdrop_path)) {
+        info.backdrop_path = info.backdrop_path.map((p: string) =>
+          resolvePanelImageUrl(host, p),
+        );
+      }
+      next.info = info;
+    }
+    if (next.episodes && typeof next.episodes === "object") {
+      const resolveEpisodeImage = (episode: unknown) => {
+        if (!episode || typeof episode !== "object") return episode;
+        const row = { ...(episode as Record<string, unknown>) };
+        const epInfo = row.info as Record<string, unknown> | undefined;
+        if (epInfo?.movie_image) {
+          row.info = {
+            ...epInfo,
+            movie_image: resolvePanelImageUrl(
+              host,
+              String(epInfo.movie_image),
+            ),
+          };
+        }
+        return row;
+      };
+
+      const episodes: Record<string, unknown> = {};
+      for (const [key, seasonEpisodes] of Object.entries(next.episodes)) {
+        // Xtream returns episodes grouped as season -> episode[]. Preserve arrays
+        // so Series.tsx can render and pass the season playlist to the player.
+        episodes[key] = Array.isArray(seasonEpisodes)
+          ? seasonEpisodes.map(resolveEpisodeImage)
+          : resolveEpisodeImage(seasonEpisodes);
+      }
+      next.episodes = episodes;
+    }
+    return next;
   }
 
   static async getVodInfo(
@@ -804,7 +1030,8 @@ export class IPTVService {
     streamId: number,
   ): Promise<any> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_vod_info&vod_id=${streamId}`;
-    return this.cachedFetch(url, this.CACHE_TTL_SHORT);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_SHORT);
+    return this.absolutizeDetailInfo(host, data);
   }
 
   static async getSeriesInfo(
@@ -814,7 +1041,8 @@ export class IPTVService {
     seriesId: number,
   ): Promise<any> {
     const url = `${host}/player_api.php?username=${user}&password=${pass}&action=get_series_info&series_id=${seriesId}`;
-    return this.cachedFetch(url, this.CACHE_TTL_SHORT);
+    const data = await this.cachedFetch(url, this.CACHE_TTL_SHORT);
+    return this.absolutizeDetailInfo(host, data);
   }
 
   static async getShortEpg(
@@ -824,10 +1052,16 @@ export class IPTVService {
     streamId: number,
     epgChannelId?: string,
     channelName?: string,
+    signal?: AbortSignal,
   ): Promise<ShortEpgResponse> {
+    const throwIfAborted = () => {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    };
+    throwIfAborted();
     const support = this.getEpgSupportState(host, user, pass);
 
     try {
+      throwIfAborted();
       const shortUrl = `${host}/player_api.php?username=${user}&password=${pass}&action=get_short_epg&stream_id=${streamId}&limit=8`;
       const shortData = await this.cachedFetch(shortUrl, this.CACHE_TTL_SHORT);
       const normalized = this.normalizeEpgResponse(shortData);
@@ -840,6 +1074,7 @@ export class IPTVService {
 
     if (support.simpleDataTable !== false) {
       try {
+        throwIfAborted();
         const tableUrl = `${host}/player_api.php?username=${user}&password=${pass}&action=get_simple_data_table&stream_id=${streamId}`;
         const tableData = await this.cachedFetch(
           tableUrl,
@@ -860,6 +1095,7 @@ export class IPTVService {
     }
 
     try {
+      throwIfAborted();
       return await this.getXmltvEpg(
         host,
         user,
@@ -912,7 +1148,7 @@ export class IPTVService {
       for (const [key, entry] of idbEntries) {
         merged.set(key, entry);
         if (!this.memCache.has(key)) {
-          this.memCache.set(key, entry);
+          this.memCacheSet(key, entry);
         }
       }
     }
@@ -962,7 +1198,7 @@ export class IPTVService {
     const batchEntries = await idbGetBatch(warmKeys);
     for (const [key, entry] of batchEntries) {
       if (!IPTVService.memCache.has(key)) {
-        IPTVService.memCache.set(key, entry);
+        IPTVService.memCacheSet(key, entry);
       }
     }
 
@@ -1007,6 +1243,146 @@ export class IPTVService {
       vodStreams: getVal<MovieStream[]>(results[3]),
       seriesCategories: getVal<Category[]>(results[4]),
       seriesStreams: getVal<SeriesStream[]>(results[5]),
+    };
+  }
+
+  /**
+   * Build the three Xtream "category list" API URLs (small JSON). Used on webOS TV
+   * to hydrate the sidebar without ever touching full stream catalogs in memory.
+   */
+  private static catalogCategoryUrls(host: string, user: string, pass: string) {
+    const base = `${host}/player_api.php?username=${user}&password=${pass}`;
+    return {
+      liveCategories: `${base}&action=get_live_categories`,
+      vodCategories: `${base}&action=get_vod_categories`,
+      seriesCategories: `${base}&action=get_series_categories`,
+    } as const;
+  }
+
+  /**
+   * Remove unscoped stream catalog entries from the in-memory L1 cache only.
+   * Full `get_*_streams` / `get_series` responses can be tens–hundreds of MB parsed;
+   * on webOS we never want those objects resident while browsing categories.
+   */
+  static evictGlobalStreamCatalogFromMemory(
+    host: string,
+    user: string,
+    pass: string,
+  ): void {
+    const base = `${host}/player_api.php?username=${user}&password=${pass}`;
+    for (const action of [
+      "get_live_streams",
+      "get_vod_streams",
+      "get_series",
+    ] as const) {
+      this.memCache.delete(`${base}&action=${action}`);
+    }
+  }
+
+  /**
+   * Remove huge full-catalog entries from persistent cache on TV startup.
+   * Category lists remain cached; VOD/Series/Live rows load per category.
+   */
+  static async evictGlobalStreamCatalogFromPersistentCache(
+    host: string,
+    user: string,
+    pass: string,
+  ): Promise<void> {
+    const base = `${host}/player_api.php?username=${user}&password=${pass}`;
+    await idbDeleteKeys(
+      [
+        "get_live_streams",
+        "get_vod_streams",
+        "get_series",
+      ].map((action) => `${base}&action=${action}`),
+    );
+  }
+
+  /**
+   * Cache-first read of **category lists only** (memory + IndexedDB). Never pulls
+   * full stream catalogs into JS — critical for low-RAM webOS TVs where IDB may
+   * still hold huge payloads from a previous desktop session.
+   */
+  static async getCachedCatalogCategoriesOnly(
+    host: string,
+    user: string,
+    pass: string,
+  ): Promise<{
+    liveCategories: Category[];
+    liveStreams: LiveStream[];
+    vodCategories: Category[];
+    vodStreams: MovieStream[];
+    seriesCategories: Category[];
+    seriesStreams: SeriesStream[];
+  }> {
+    await this.evictGlobalStreamCatalogFromPersistentCache(host, user, pass);
+    this.evictGlobalStreamCatalogFromMemory(host, user, pass);
+
+    const urls = this.catalogCategoryUrls(host, user, pass);
+    const keys = Object.values(urls);
+    const merged = new Map<string, { data: any; ts: number }>();
+
+    for (const key of keys) {
+      const mem = this.memCache.get(key);
+      if (mem) merged.set(key, mem);
+    }
+    const missing = keys.filter((k) => !merged.has(k));
+    if (missing.length > 0) {
+      const idbEntries = await idbGetBatch(missing);
+      for (const [key, entry] of idbEntries) {
+        merged.set(key, entry);
+        if (!this.memCache.has(key)) {
+          this.memCacheSet(key, entry);
+        }
+      }
+    }
+
+    const toList = (url: string) =>
+      this.normalizeListResponse(merged.get(url)?.data);
+
+    return {
+      liveCategories: toList(urls.liveCategories) as Category[],
+      liveStreams: [],
+      vodCategories: toList(urls.vodCategories) as Category[],
+      vodStreams: [],
+      seriesCategories: toList(urls.seriesCategories) as Category[],
+      seriesStreams: [],
+    };
+  }
+
+  /**
+   * Background refresh for **category metadata only** (webOS TV). Avoids the
+   * six-endpoint `backgroundRefresh` burst that pulls entire VOD/Series/Live
+   * catalogs into RAM and triggers OOM kills on consumer TVs.
+   */
+  static async backgroundRefreshCategoriesOnly(
+    host: string,
+    user: string,
+    pass: string,
+  ): Promise<{
+    liveCategories: Category[];
+    vodCategories: Category[];
+    seriesCategories: Category[];
+  } | null> {
+    const urls = this.catalogCategoryUrls(host, user, pass);
+    const liveKey = urls.liveCategories;
+    const entry = this.memCache.get(liveKey) || (await idbGet(liveKey));
+    if (entry && Date.now() - entry.ts < this.REFRESH_INTERVAL) {
+      return null;
+    }
+
+    const [liveCategories, vodCategories, seriesCategories] = await Promise.all([
+      this.forceRefresh(urls.liveCategories),
+      this.forceRefresh(urls.vodCategories),
+      this.forceRefresh(urls.seriesCategories),
+    ]);
+
+    if (!liveCategories) return null;
+
+    return {
+      liveCategories: this.normalizeListResponse(liveCategories) as Category[],
+      vodCategories: this.normalizeListResponse(vodCategories) as Category[],
+      seriesCategories: this.normalizeListResponse(seriesCategories) as Category[],
     };
   }
 

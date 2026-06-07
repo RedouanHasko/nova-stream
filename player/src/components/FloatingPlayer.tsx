@@ -3,9 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { X, Maximize2, Play, Pause } from "lucide-react";
 import Hls from "hls.js";
 import { useFloatingPlayer } from "../context/FloatingPlayerContext";
-import { getPlatformName, platformSupportsEngine, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack } from "../lib/platformPlayer";
-import { getMediaApiBaseUrl } from "../lib/activationApi";
+import { getPlatformName, startPlatformPlayback, webosRegisterTrack, webosUnregisterTrack } from "../lib/platformPlayer";
 import { useTVRemote, focusNext } from "../lib/remote";
+import { wrapProxyPlaybackUrl } from "../lib/streamPlaybackUrl";
 
 export default function FloatingPlayer() {
   const navigate = useNavigate();
@@ -33,9 +33,10 @@ export default function FloatingPlayer() {
     video.removeAttribute("src");
     video.load();
 
-    const base = getMediaApiBaseUrl() || window.location.origin;
-    const proxied = `${base.replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(floatingStream.url)}`;
     const startTime = miniCurrentTimeRef.current ?? 0;
+    const platform = getPlatformName();
+    const playbackUrl =
+      platform === "webos" ? floatingStream.url : wrapProxyPlaybackUrl(floatingStream.url);
 
     const onReady = () => {
       if (startTime > 1) {
@@ -53,8 +54,6 @@ export default function FloatingPlayer() {
       floatingStream.url.includes("/live/") ||
       floatingStream.url.includes("/hls/");
     const isMKV = ext === "mkv" || floatingStream.url.includes(".mkv");
-
-    const platform = getPlatformName();
 
     // If this is an MKV and the platform has native engines, try platform playback first.
     if (isMKV && platform === 'tizen') {
@@ -74,6 +73,45 @@ export default function FloatingPlayer() {
       } catch (e) {
         // fall through to HTML5/HLS fallback
       }
+    }
+
+    if (platform === "webos") {
+      // Packaged webOS apps do not have the local Node/ffmpeg proxy. Use the TV
+      // hardware decoder directly and let the full player handle rich track UI.
+      if (isMKV) {
+        (async () => {
+          try {
+            const trackId = await webosRegisterTrack("default");
+            if (trackId) {
+              platformPlayerRef.current = {
+                webosTrackId: trackId,
+                stop: async () => {
+                  try {
+                    await webosUnregisterTrack(trackId);
+                  } catch {}
+                },
+              };
+            }
+          } catch {}
+        })();
+      }
+
+      video.src = playbackUrl;
+      video.preload = "metadata";
+      video.addEventListener("loadedmetadata", onReady, { once: true });
+      return () => {
+        try {
+          video.pause();
+          video.removeAttribute("src");
+          video.load();
+        } catch {}
+        if (platformPlayerRef.current) {
+          try {
+            platformPlayerRef.current.stop?.();
+          } catch {}
+          platformPlayerRef.current = null;
+        }
+      };
     }
 
     if (isM3U8 && Hls.isSupported()) {
@@ -104,7 +142,7 @@ export default function FloatingPlayer() {
         levelLoadingTimeOut: 45_000,
       });
       hlsRef.current = hls;
-      hls.loadSource(proxied);
+      hls.loadSource(playbackUrl);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => onReady());
       hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -124,26 +162,12 @@ export default function FloatingPlayer() {
         hlsRef.current = null;
       });
     } else if (isM3U8 && video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = proxied;
+      video.src = playbackUrl;
       video.addEventListener("loadedmetadata", onReady, { once: true });
     } else {
       // Native video (mp4, mkv, ts, etc.)
 
-      // On webOS we can attempt to register an audio track so the platform
-      // can better manage routing/volume for in-band MKV tracks while still
-      // using HTML5 video for rendering.
-      if (isMKV && platform === 'webos') {
-        (async () => {
-          try {
-            const trackId = await webosRegisterTrack('default');
-            if (trackId) {
-              platformPlayerRef.current = { webosTrackId: trackId, stop: async () => { try { await webosUnregisterTrack(trackId); } catch {} } };
-            }
-          } catch {}
-        })();
-      }
-
-      video.src = proxied;
+      video.src = playbackUrl;
       video.addEventListener("loadedmetadata", onReady, { once: true });
     }
 
@@ -264,6 +288,12 @@ export default function FloatingPlayer() {
 
   if (!floatingStream) return null;
 
+  const posterSrc = floatingStream.poster
+    ? getPlatformName() === "webos"
+      ? floatingStream.poster
+      : wrapProxyPlaybackUrl(floatingStream.poster)
+    : undefined;
+
   return (
     <div
       ref={rootRef}
@@ -277,11 +307,7 @@ export default function FloatingPlayer() {
           className="absolute inset-0 w-full h-full object-contain"
           playsInline
           muted={false}
-          poster={
-            floatingStream.poster
-              ? `${(getMediaApiBaseUrl() || window.location.origin).replace(/\/$/, "")}/api/proxy?url=${encodeURIComponent(floatingStream.poster)}`
-              : undefined
-          }
+          poster={posterSrc}
         />
         {/* Play/pause overlay */}
         {!isPlaying && (

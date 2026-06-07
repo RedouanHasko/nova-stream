@@ -1,0 +1,14 @@
+C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\deps\serde-4d5d796faf1d599e.d: C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\build\serde-e3664b6d2fdd549f\out/private.rs
+
+C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\deps\libserde-4d5d796faf1d599e.rlib: C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\build\serde-e3664b6d2fdd549f\out/private.rs
+
+C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\deps\libserde-4d5d796faf1d599e.rmeta: C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\build\serde-e3664b6d2fdd549f\out/private.rs
+
+C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\red-h\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\red-h\Downloads\iptvpanel\player\src-tauri\target\release\build\serde-e3664b6d2fdd549f\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\red-h\\Downloads\\iptvpanel\\player\\src-tauri\\target\\release\\build\\serde-e3664b6d2fdd549f\\out

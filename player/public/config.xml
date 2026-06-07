@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget
+  xmlns="http://www.w3.org/ns/widgets"
+  xmlns:tizen="http://tizen.org/ns/widgets"
+  id="http://novaplayer.app"
+  version="0.2.5"
+  viewmodes="maximized">
+  <tizen:application
+    id="novaplayer.NovaPlayer"
+    package="novaplayer"
+    required_version="4.0" />
+  <content src="index.html" />
+  <name>Nova Player</name>
+  <description>IPTV player optimized for Samsung Tizen TV, webOS, and Android TV devices.</description>
+  <icon src="images/favicon.png" />
+
+  <!-- Required for remote media key registration on Samsung TV. -->
+  <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice" />
+
+  <!-- Allow IPTV providers, activation APIs, weather, and image/CDN resources. -->
+  <access origin="*" subdomains="true" />
+
+  <!-- Samsung requires hidden apps to be paused. Keep background support disabled. -->
+  <tizen:setting
+    background-support="disable"
+    encryption="disable"
+    hwkey-event="enable"
+    install-location="auto"
+    pointing-device-support="enable"
+    screen-orientation="landscape" />
+
+  <!-- Tizen 4+ matches the app's ES2017 TV browser target while keeping broad TV coverage. -->
+  <tizen:metadata key="http://samsung.com/tv/metadata/devel.api.version" value="4.0" />
+  <tizen:metadata key="http://samsung.com/tv/metadata/use.network" value="true" />
+</widget>

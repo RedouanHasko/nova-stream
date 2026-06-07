@@ -6,32 +6,66 @@ type DigitalClockProps = {
   variant?: 'default' | 'hero' | 'compact';
 };
 
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatClockTime(date: Date, is12Hour: boolean) {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: is12Hour,
+    }).format(date);
+  } catch {
+    let hours = date.getHours();
+    const minutes = pad2(date.getMinutes());
+    if (!is12Hour) return `${pad2(hours)}:${minutes}`;
+    const suffix = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12 || 12;
+    return `${pad2(hours)}:${minutes} ${suffix}`;
+  }
+}
+
+function formatClockDate(date: Date, full = false) {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: full ? 'long' : 'short',
+      month: full ? 'long' : 'short',
+      day: 'numeric',
+    }).format(date);
+  } catch {
+    const weekdays = full
+      ? ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+      : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const months = full
+      ? ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+      : ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${weekdays[date.getDay()]}, ${months[date.getMonth()]} ${date.getDate()}`;
+  }
+}
+
 export default function DigitalClock({ variant = 'default' }: DigitalClockProps) {
   const { settings } = usePlaylist();
   const [time, setTime] = useState(new Date());
 
   useEffect(() => {
-    const timer = setInterval(() => setTime(new Date()), 1000);
-    return () => clearInterval(timer);
+    const update = () => setTime(new Date());
+    update();
+    const timer = window.setInterval(update, 1000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') update();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, []);
 
-  const timeString = time.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: settings.timeFormat === '12h'
-  });
-
-  const dateString = time.toLocaleDateString([], {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric'
-  });
-
-  const fullDateString = time.toLocaleDateString([], {
-    weekday: 'long',
-    month: 'long',
-    day: 'numeric',
-  });
+  const timeString = formatClockTime(time, settings.timeFormat === '12h');
+  const dateString = formatClockDate(time);
+  const fullDateString = formatClockDate(time, true);
 
   if (variant === 'compact') {
     return (

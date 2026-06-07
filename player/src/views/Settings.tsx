@@ -22,7 +22,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import Logo from "../components/Logo";
@@ -85,6 +85,15 @@ export default function Settings() {
   const [categoryLockTab, setCategoryLockTab] = useState<"live" | "vod" | "series">("live");
 
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const focusFirstContentOption = () => {
+    const first = contentRef.current?.querySelector<HTMLElement>(
+      "[data-tv-focusable]:not([disabled]), button:not([disabled]):not([tabindex='-1']), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+    );
+    if (!first) return;
+    first.focus({ preventScroll: true });
+    first.scrollIntoView({ block: "nearest", inline: "nearest" });
+  };
 
   useEffect(() => {
     let active = true;
@@ -106,12 +115,12 @@ export default function Settings() {
   }, [location.state]);
 
   const groupList = [
-    { icon: User, label: "Account", id: "group-account" as const },
-    { icon: ListRestart, label: "Playlist", id: "group-playlist" as const },
-    { icon: Lock, label: "Security", id: "group-security" as const },
-    { icon: Palette, label: "Appearance", id: "group-appearance" as const },
-    { icon: MonitorPlay, label: "Playback", id: "group-playback" as const },
-    { icon: Trash2, label: "Data", id: "group-data" as const },
+    { icon: User, label: t.account, id: "group-account" as const },
+    { icon: ListRestart, label: t.changePlaylist, id: "group-playlist" as const },
+    { icon: Lock, label: t.security, id: "group-security" as const },
+    { icon: Palette, label: t.appearance, id: "group-appearance" as const },
+    { icon: MonitorPlay, label: t.playback, id: "group-playback" as const },
+    { icon: Trash2, label: t.data, id: "group-data" as const },
   ];
 
   const toSection = (id: string): Section | null => {
@@ -221,8 +230,9 @@ export default function Settings() {
     if (!section) return;
 
     const protectedSettings = ["parental", "hide-live", "hide-vod", "hide-series"] as const;
-    if (protectedSettings.includes(section) && settings.parentalPin && !isVerified) {
-      setPendingSection(section);
+    const protectedSection = protectedSettings.find((value) => value === section);
+    if (protectedSection && settings.parentalPin && !isVerified) {
+      setPendingSection(protectedSection);
       setActiveSection("pin-prompt");
       return;
     }
@@ -281,7 +291,7 @@ export default function Settings() {
   useEffect(() => {
     const handler = (e: Event) => {
       const key = (e as CustomEvent).detail?.key as string;
-      if (key === "back" || key === "backspace") {
+      if (key === "back" || key === "red") {
         goBack();
       }
     };
@@ -290,15 +300,36 @@ export default function Settings() {
   }, [activeSection, navigate]);
 
   useEffect(() => {
-    const first = rootRef.current?.querySelector<HTMLElement>(
-      "[data-tv-initial-focus='true'], [data-tv-focusable], button:not([tabindex='-1']), input, select, textarea, [tabindex]:not([tabindex='-1'])",
-    );
-    setTimeout(() => first?.focus(), 20);
+    const immediate = window.setTimeout(() => {
+      window.requestAnimationFrame(focusFirstContentOption);
+    }, 0);
+    // webOS/Tizen browsers can keep the exiting panel mounted until the motion
+    // transition completes, so run one delayed focus pass for the entered panel.
+    const afterTransition = window.setTimeout(focusFirstContentOption, 260);
+    return () => {
+      window.clearTimeout(immediate);
+      window.clearTimeout(afterTransition);
+    };
   }, [activeSection]);
 
   useTVRemote((key) => {
     const navRoot = rootRef.current;
     if (key === "left" || key === "right" || key === "up" || key === "down") {
+      if (activeSection === "playlists" && (key === "left" || key === "right")) {
+        const active = document.activeElement as HTMLElement | null;
+        const row = active?.closest<HTMLElement>("[data-playlist-row]");
+        if (row && key === "right" && active?.matches("[data-playlist-main]")) {
+          const deleteButton = row.querySelector<HTMLElement>("[data-playlist-delete]");
+          if (deleteButton) {
+            deleteButton.focus({ preventScroll: true });
+            return;
+          }
+        }
+        if (row && key === "left" && active?.matches("[data-playlist-delete]")) {
+          row.querySelector<HTMLElement>("[data-playlist-main]")?.focus({ preventScroll: true });
+          return;
+        }
+      }
       focusNext(key, { root: navRoot });
       return;
     }
@@ -310,12 +341,12 @@ export default function Settings() {
   });
 
   const sectionTitle = (() => {
-    if (activeSection === "group-account") return "Account";
-    if (activeSection === "group-playlist") return "Playlist";
-    if (activeSection === "group-security") return "Security";
-    if (activeSection === "group-appearance") return "Appearance";
-    if (activeSection === "group-playback") return "Playback";
-    if (activeSection === "group-data") return "Data";
+    if (activeSection === "group-account") return t.account;
+    if (activeSection === "group-playlist") return t.changePlaylist;
+    if (activeSection === "group-security") return t.security;
+    if (activeSection === "group-appearance") return t.appearance;
+    if (activeSection === "group-playback") return t.playback;
+    if (activeSection === "group-data") return t.data;
     if (activeSection === "account") return t.accountInfo;
     if (activeSection === "playlists") return t.managePlaylists;
     if (activeSection === "parental") return t.parentalControlTitle;
@@ -336,23 +367,23 @@ export default function Settings() {
   const sectionParentTitle = (() => {
     if (activeSection.startsWith("group-")) return t.settingsTitle;
     const parent = parentForSection(activeSection);
-    if (parent === "group-account") return "Account";
-    if (parent === "group-playlist") return "Playlist";
-    if (parent === "group-security") return "Security";
-    if (parent === "group-appearance") return "Appearance";
-    if (parent === "group-playback") return "Playback";
-    if (parent === "group-data") return "Data";
+    if (parent === "group-account") return t.account;
+    if (parent === "group-playlist") return t.changePlaylist;
+    if (parent === "group-security") return t.security;
+    if (parent === "group-appearance") return t.appearance;
+    if (parent === "group-playback") return t.playback;
+    if (parent === "group-data") return t.data;
     return t.settingsTitle;
   })();
 
   const sectionSubtitle = (() => {
-    if (activeSection === "group-account") return "Profile and session controls";
-    if (activeSection === "group-playlist") return "Source and playlist management";
-    if (activeSection === "group-security") return "Parental PIN and content restrictions";
-    if (activeSection === "group-appearance") return "Language, layout, and visual style";
-    if (activeSection === "group-playback") return "Format, sorting, and player behavior";
-    if (activeSection === "group-data") return "History and cache cleanup";
-    return "Adjust and save your preferences instantly";
+    if (activeSection === "group-account") return t.accountSectionDesc;
+    if (activeSection === "group-playlist") return t.playlistSectionDesc;
+    if (activeSection === "group-security") return t.securitySectionDesc;
+    if (activeSection === "group-appearance") return t.appearanceSectionDesc;
+    if (activeSection === "group-playback") return t.playbackSectionDesc;
+    if (activeSection === "group-data") return t.dataSectionDesc;
+    return t.preferencesSavedInstantly;
   })();
 
   return (
@@ -433,11 +464,13 @@ export default function Settings() {
 
           <AnimatePresence mode="wait" initial={false}>
             <motion.div
+              ref={contentRef}
               key={activeSection}
               initial={{ opacity: 0, y: 14, filter: "blur(4px)" }}
               animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
               exit={{ opacity: 0, y: -10, filter: "blur(3px)" }}
               transition={{ duration: 0.2, ease: "easeOut" }}
+              onAnimationComplete={focusFirstContentOption}
               className="space-y-4"
             >
             {activeSection === "group-account" && (
@@ -575,16 +608,17 @@ export default function Settings() {
             {activeSection === "playlists" && (
               <div className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.02] p-5">
                 {playlists.map((playlist) => (
-                  <div key={playlist.id} className={cn("flex items-center justify-between gap-4 rounded-2xl border p-5 transition-all", activePlaylist?.id === playlist.id ? "border-white/25 bg-white/[0.10] shadow-[0_8px_24px_rgba(0,0,0,0.25)]" : "border-white/10 bg-white/[0.045] hover:bg-white/[0.08]")}>  
+                  <div key={playlist.id} data-playlist-row className={cn("flex items-center justify-between gap-4 rounded-2xl border p-5 transition-all", activePlaylist?.id === playlist.id ? "border-white/25 bg-white/[0.10] shadow-[0_8px_24px_rgba(0,0,0,0.25)]" : "border-white/10 bg-white/[0.045] hover:bg-white/[0.08]")}>  
                     <button
                       data-tv-focusable
+                      data-playlist-main
                       onClick={() => {
                         if (activePlaylist?.id !== playlist.id) {
                           setActivePlaylist(playlist.id);
                           toast.success(`${t.playlistSwitched} ${playlist.name}`);
                         }
                       }}
-                      className="flex flex-1 items-center gap-4 text-left transition-all hover:-translate-y-0.5 focus:outline-none">
+                      className="flex flex-1 items-center gap-4 text-left transition-all hover:-translate-y-0.5 focus:outline-none focus:shadow-[0_0_0_2px_rgba(66,133,244,0.15),0_0_24px_rgba(66,133,244,0.35)]">
                       <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-white/15 bg-white/8">
                         <User className="h-6 w-6 text-white/80" />
                       </div>
@@ -596,12 +630,13 @@ export default function Settings() {
                     {!playlist.managedByBackend && (
                       <button
                         data-tv-focusable
+                        data-playlist-delete
                         onClick={(e) => {
                           e.stopPropagation();
                           removePlaylist(playlist.id);
                           toast.success(t.playlistRemovedMsg);
                         }}
-                        className="rounded-full border border-red-500/25 bg-red-500/10 p-3 text-red-400 transition-all hover:bg-red-500/20 hover:scale-110"
+                        className="rounded-full border border-red-500/25 bg-red-500/10 p-3 text-red-400 transition-all hover:bg-red-500/20 hover:scale-110 focus:outline-none focus:shadow-[0_0_0_2px_rgba(239,68,68,0.20),0_0_24px_rgba(239,68,68,0.35)]"
                         title="Remove Playlist"
                       >
                         <Trash2 className="h-4 w-4" />
