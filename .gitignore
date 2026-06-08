@@ -31,8 +31,19 @@ backend/whatsapp-session*
 backend/whatsapp-qr*
 backend/whatsapp-temp/
 
-# Player
+# Player — runtime caches, secrets, and build artifacts
 player/.nova-api-cache.json
+player/cache/
+player/hls-live/
+player/sub-cache/
+player/src-tauri/target/
+player/*.ipk
+player/*.wgt
+player/*.exe
+player/*.msi
+player/*.pdb
+player/dist/
+player/node_modules/
 
 # Ignore OS junk
 Thumbs.db

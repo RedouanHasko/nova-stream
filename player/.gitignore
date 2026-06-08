@@ -1,8 +1,46 @@
+# Dependencies
 node_modules/
-build/
+
+# Frontend / test build output
 dist/
+build/
 coverage/
-.DS_Store
-*.log
-.env*
+.vite/
+
+# Environment and secrets (keep .env.example if you add one)
+.env
+.env.*
 !.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local dev server caches (created by server.ts at runtime)
+cache/
+hls-live/
+sub-cache/
+.nova-api-cache.json
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+
+# Packaged app binaries (webOS, Tizen, Windows installers)
+*.ipk
+*.wgt
+*.exe
+*.msi
+*.pdb
+*.nsis.zip
+
+# Local AI Studio / tooling metadata
+metadata.json
+
+# Local proxy test script (use scripts/ for committed tooling)
+test-proxy.js
