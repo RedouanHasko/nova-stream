@@ -32,7 +32,7 @@
     "axios": "^1.15.0",
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "hls.js": "^1.6.15",
     "http-proxy-middleware": "^3.0.5",
     "lucide-react": "^0.546.0",
