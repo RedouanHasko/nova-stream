@@ -29,8 +29,8 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      // Target ES2017 for broad Smart TV WebView compatibility (WebOS 4+, Tizen 4+)
-      target: "es2017",
+      // Target chrome53 (webOS 4 floor; esbuild lowers async/await) for broad Smart TV WebView compatibility (WebOS 4+, Tizen 4+)
+      target: ["es2017", "chrome53"],
       rollupOptions: {
         output: {
           assetFileNames: (assetInfo) => {

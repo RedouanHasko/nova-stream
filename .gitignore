@@ -100,9 +100,6 @@ player/app/applet/src/test-proxy*
 # Ignore all metadata.json files
 **/metadata.json
 
-# Ignore all package-lock.json files
-**/package-lock.json
-
 # Ignore all .DS_Store and Thumbs.db
 **/.DS_Store
 **/Thumbs.db
