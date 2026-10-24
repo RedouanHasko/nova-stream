@@ -14,6 +14,10 @@
   <description>IPTV player optimized for Samsung Tizen TV, webOS, and Android TV devices.</description>
   <icon src="images/favicon.png" />
 
+  <!-- Required for network access (IPTV servers, APIs) and AVPlay playback on Samsung TV. -->
+  <tizen:privilege name="http://tizen.org/privilege/internet" />
+  <tizen:privilege name="http://developer.samsung.com/privilege/avplay" />
+
   <!-- Required for remote media key registration on Samsung TV. -->
   <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice" />
 
