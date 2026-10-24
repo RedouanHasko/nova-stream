@@ -7,6 +7,7 @@ import {
   startTransition,
   useCallback,
 } from "react";
+import { useTvWindow } from "../lib/useTvWindow";
 import {
   ArrowLeft,
   Search,
@@ -322,6 +323,15 @@ export default function Movies() {
 
     return filtered;
   }, [movies, normalizedSearch, deferredCategory, favoriteVodSet, sortBy]);
+
+  const tvListRef = useRef<HTMLDivElement | null>(null);
+  const tvWindow = useTvWindow(
+    listScrollRef,
+    tvListRef,
+    filteredMovies.length,
+    isWebOS,
+    `${deferredSearch}|${deferredCategory}|${sortBy}`,
+  );
 
   // Reset visible count when filters/search change
   useEffect(() => {
@@ -1050,11 +1060,15 @@ export default function Movies() {
               ) : (
                 <div ref={listScrollRef} className="flex-1 overflow-y-auto scrollbar-hide px-2 pb-10">
                   {isWebOS ? (
-                    <div className="flex flex-col gap-2">
-                      {filteredMovies.slice(0, visibleCount).map((movie, idx) => (
+                    <div
+                      ref={tvListRef}
+                      className="flex flex-col gap-2"
+                      style={{ paddingTop: tvWindow.padTop, paddingBottom: tvWindow.padBottom }}
+                    >
+                      {filteredMovies.slice(tvWindow.start, tvWindow.end).map((movie, idx) => (
                         <MovieCard
                           key={movie.stream_id}
-                          rowIndex={idx + 1}
+                          rowIndex={tvWindow.start + idx + 1}
                           mediaKind="movie"
                           title={movie.name}
                           poster={movie.stream_icon}
